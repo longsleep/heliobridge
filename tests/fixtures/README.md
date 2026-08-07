@@ -47,6 +47,29 @@ encoding, which every other frame here would pass.
 
 All four satisfy the derived-value rule `battery_charge_power == pv_power_total − |ac_power|`.
 
+## Server-originated frames
+
+Frames the **vendor server** sent to the device, used to check that the encoder produces byte-identical
+output. These carry the serial once, in the device ID field.
+
+| File | Octets | Command |
+|---|---|---|
+| `write-single-grid-power-allowed.bin` | 44 | `0x06`, register 326 = 1 |
+| `write-range-charge-limits.bin` | 48 | `0x10`, registers 250–251 = 100, 5 |
+| `write-range-default-output-power.bin` | 48 | `0x10`, registers **321–322** = 0, 1000 |
+| `write-range-slot1.bin` | 54 | `0x10`, registers 254–258 — a whole schedule slot |
+| `time-push.bin` | 67 | `0xFE18`, the server's clock as ASCII |
+
+`write-range-default-output-power.bin` is the most valuable of these. The vendor does not write
+`default_output_power` as itself: it writes a **range covering register 321**, whose meaning is unknown,
+with a zero in it. An encoder that writes register 322 alone produces a different frame, and only a
+comparison against a vendor-generated frame catches that. The same argument applies to `time-push.bin`,
+whose body begins with eight octets of which three pairs remain unexplained — reproducing them is only
+verifiable against the real thing.
+
+Byte equality against these is a stronger claim than any self-consistency check: it says the encoder
+agrees with the server it replaces, not merely with itself.
+
 ## Regenerating
 
 Produced by `tools/make_fixture.py` in the research repository, which is where the raw captures live.
