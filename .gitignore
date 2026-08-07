@@ -1,0 +1,38 @@
+# Build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is deliberately NOT ignored. This crate ships a binary, so the lock
+# file is part of what makes a build reproducible and must be committed.
+
+# Local configuration and runtime state
+.env
+.env.*
+/state/
+
+# TLS material. The bridge generates a self-signed certificate on first run;
+# nothing here should ever be committed.
+*.pem
+*.key
+*.crt
+*.der
+
+# Captures and dumps kept next to the code while debugging
+*.pcap
+*.pcapng
+*.log
+
+# Profiling
+perf.data
+perf.data.old
+flamegraph.svg
+
+# Editors and OS
+.idea/
+*.iml
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*~
+.DS_Store

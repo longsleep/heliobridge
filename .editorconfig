@@ -1,0 +1,28 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 4
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.rs]
+max_line_length = 120  # keep in step with max_width in rustfmt.toml
+
+[*.{toml,json,yaml,yml}]
+indent_size = 2
+
+[*.md]
+# Two trailing spaces are a hard line break in Markdown; stripping them silently
+# reflows the text.
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab
+
+[*.{diff,patch}]
+# Leading and trailing whitespace is significant in a patch.
+trim_trailing_whitespace = false
+insert_final_newline = false

@@ -1,0 +1,13 @@
+# Keep in step with rust-version in Cargo.toml so clippy does not suggest APIs
+# newer than the declared minimum.
+msrv = "1.97"
+
+# Pre-1.0, so restructuring public types is not a breaking change to warn about.
+avoid-breaking-exported-api = false
+
+# The strict panic/index lints are about the daemon's runtime behaviour. In tests,
+# unwrap and indexing are how you write a readable assertion.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

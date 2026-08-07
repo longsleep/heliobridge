@@ -1,0 +1,32 @@
+# Stable options only, so `cargo fmt` behaves identically for everyone and prints no warnings.
+edition = "2024"
+max_width = 120
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
+reorder_imports = true
+
+# Import grouping: std / external / crate, separated by blank lines, e.g.
+#
+#     use std::net::SocketAddr;
+#
+#     use tokio::net::TcpListener;
+#
+#     use crate::growatt::Frame;
+#
+# `group_imports` and `imports_granularity` are nightly-only — setting them here
+# would print "unstable features are only available in nightly channel" on every
+# run and change nothing. Verified against 1.97.1.
+#
+# What stable DOES do, and what makes the convention hold: `reorder_imports`
+# sorts within each blank-line-separated block and never merges blocks. So the
+# grouping above is preserved and tidied, just not enforced.
+#
+# To enforce it, format with nightly and pass the options on the command line —
+# no config change, no warnings on stable:
+#
+#     cargo +nightly fmt -- --config \
+#         group_imports=StdExternalCrate,imports_granularity=Module
+#
+# Also nightly-only, and deliberately not set here: wrap_comments, comment_width,
+# format_code_in_doc_comments.

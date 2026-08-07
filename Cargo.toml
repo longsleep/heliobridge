@@ -1,0 +1,97 @@
+[package]
+name = "heliobridge"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.97"
+description = "Local MQTT bridge for the Growatt Nexa 2000 — Home Assistant without the cloud"
+repository = "https://github.com/longsleep/heliobridge"
+license = "Apache-2.0"
+authors = ["Simon Eisenmann"]
+readme = "README.md"
+keywords = ["growatt", "nexa", "mqtt", "home-assistant", "solar"]
+categories = ["network-programming", "embedded"]
+
+[lib]
+name = "heliobridge"
+path = "src/lib.rs"
+
+# The binary is auto-discovered from src/bin/heliobridge/main.rs. A second binary
+# is a second directory next to it — no Cargo.toml change needed.
+
+[dependencies]
+# Intentionally empty at 0.0.1. The dependency set is chosen and version-checked
+# in the implementation plan; it lands with the code that needs it.
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# Deliberately NOT panic = "abort": a panicking tokio task should lose that task,
+# not take the whole daemon down with it.
+
+# ---------------------------------------------------------------------------
+# Lints
+#
+# Declared here rather than as crate-root attributes so they apply uniformly to
+# the library, the binary, tests and benches. Group lints carry priority = -1 so
+# the individual entries below can override them.
+# ---------------------------------------------------------------------------
+
+[lints.rust]
+unsafe_code = "forbid"
+
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+unused_lifetimes = "warn"
+unused_import_braces = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+let_underscore_drop = "warn"
+non_ascii_idents = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# --- Panics. This is a daemon that must stay up; a panic is lost telemetry. ---
+unwrap_used = "deny"
+expect_used = "warn"      # acceptable during startup, where failing loudly is right
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "deny"
+print_stdout = "warn"     # output goes through tracing, not println!
+print_stderr = "warn"
+
+# --- The decode path. Every one of these corresponds to a bug this protocol
+#     work actually hit by hand: a bad slice index, an inverted scale factor,
+#     a truncating cast. ---
+indexing_slicing = "deny"
+arithmetic_side_effects = "warn"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+cast_precision_loss = "warn"
+cast_lossless = "warn"
+integer_division = "warn"
+float_cmp = "deny"
+lossy_float_literal = "warn"
+
+# --- Hygiene ---
+mod_module_files = "warn"  # foo.rs + foo/ , never foo/mod.rs
+str_to_string = "warn"     # `string_to_string` was removed in 1.97; `implicit_clone` (pedantic) covers it
+verbose_file_reads = "warn"
+empty_enum_variants_with_brackets = "warn"
+
+# --- Pedantic/nursery lints that are noise rather than signal here. Each of
+#     these is allowed on purpose; the reason matters more than the entry. ---
+module_name_repetitions = "allow"  # heliobridge::bridge::* is the plan's taxonomy
+must_use_candidate = "allow"       # fires on almost every getter
+missing_const_for_fn = "allow"     # nursery; churns as the body changes
+option_if_let_else = "allow"       # nursery; frequently less readable than the original

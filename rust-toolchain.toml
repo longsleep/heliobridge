@@ -1,0 +1,6 @@
+# Pinned exactly so every build — local, CI, release — uses one compiler.
+# Bumping is a deliberate commit, not a side effect of someone running `rustup update`.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
