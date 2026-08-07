@@ -11,3 +11,29 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
+
+# Protocol acronyms that appear throughout the documentation. Without these, `doc_markdown` demands
+# backticks around every one of them, which makes prose about a protocol unreadable. `".."` extends
+# clippy's own list rather than replacing it.
+doc-valid-idents = [
+    "..",
+    "QoS",
+    "MQTT",
+    "CONNECT",
+    "CONNACK",
+    "SUBSCRIBE",
+    "SUBACK",
+    "PUBLISH",
+    "PUBACK",
+    "PINGREQ",
+    "PINGRESP",
+    "DISCONNECT",
+    "TLS",
+    "SNI",
+    "CRC",
+    "DNS",
+    "EEPROM",
+    "Modbus",
+    "Growatt",
+    "NEXA",
+]

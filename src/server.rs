@@ -1,0 +1,28 @@
+//! The device-facing server: the thing the Nexa 2000 connects to instead of the vendor cloud.
+//!
+//! # The bridge *is* the MQTT server
+//!
+//! Existing bridges are MQTT clients, which obliges an operator to run a TLS-enabled broker for the
+//! device to connect to and then subscribe to it. Eliminating that broker means being the server the
+//! device talks to — and this is affordable because the device is a single client using nine packet
+//! types with fully specified behaviour. No retained messages, no wildcards, no multi-client routing,
+//! no QoS 2, no persistent sessions.
+//!
+//! Everything here is device-facing. The outbound side — publishing to the operator's own broker for
+//! Home Assistant, and the optional relay to the vendor cloud — belongs to a future `bridge` module and
+//! uses a client library rather than this code.
+//!
+//! - [`mqtt`] — MQTT 3.1.1 packet codec, the subset the device uses.
+//! - [`session`] — the per-connection state machine.
+//! - [`listener`] — accept loop, one session per connection.
+//! - [`tls`] — server TLS, including first-run certificate generation.
+
+pub mod listener;
+pub mod mqtt;
+pub mod session;
+pub mod tls;
+
+pub use listener::{ListenerError, serve};
+pub use mqtt::{CodecError, Packet, QoS};
+pub use session::{Session, SessionError, SessionStats};
+pub use tls::{CertificateOrigin, TlsError, server_config};

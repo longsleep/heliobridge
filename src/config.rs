@@ -1,0 +1,133 @@
+//! Configuration, entirely from the environment.
+//!
+//! `clap` derive gives the environment variables, `--help`, validation and defaults from one
+//! definition. Every variable is prefixed `HELIOBRIDGE_`.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use clap::Parser;
+
+/// Default device-facing listener address.
+pub const DEFAULT_LISTEN: &str = "0.0.0.0:7006";
+
+/// Default state directory.
+pub const DEFAULT_STATE_DIR: &str = "/var/lib/heliobridge";
+
+/// A local MQTT bridge for the Growatt Nexa 2000.
+#[derive(Debug, Clone, Parser)]
+#[command(version, about, long_about = None)]
+pub struct Config {
+    /// Device-facing TLS listener.
+    ///
+    /// Port 7006 is where the device connects; changing it only makes sense alongside a destination
+    /// NAT rule that rewrites the port.
+    #[arg(long, env = "HELIOBRIDGE_LISTEN", default_value = DEFAULT_LISTEN)]
+    pub listen: SocketAddr,
+
+    /// PEM certificate to present to the device. Generated on first run if unset.
+    #[arg(long, env = "HELIOBRIDGE_TLS_CERT")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// PEM private key matching `--tls-cert`.
+    #[arg(long, env = "HELIOBRIDGE_TLS_KEY")]
+    pub tls_key: Option<PathBuf>,
+
+    /// Where to keep the generated certificate and cached state.
+    #[arg(long, env = "HELIOBRIDGE_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
+    pub state_dir: PathBuf,
+
+    /// Record every frame here for later analysis. Off unless set.
+    #[arg(long, env = "HELIOBRIDGE_RECORD_DIR")]
+    pub record_dir: Option<PathBuf>,
+
+    /// Tracing filter, per subsystem. Falls back to `RUST_LOG`.
+    #[arg(long, env = "HELIOBRIDGE_LOG", default_value = "info")]
+    pub log: String,
+
+    /// Log format.
+    #[arg(long, env = "HELIOBRIDGE_LOG_FORMAT", default_value = "text")]
+    pub log_format: LogFormat,
+}
+
+/// How log records are rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum LogFormat {
+    /// Human-readable single lines.
+    Text,
+    /// One JSON object per record, so typed fields survive to a log aggregator.
+    Json,
+}
+
+impl Config {
+    /// Parse from the environment and the command line.
+    pub fn from_env() -> Self {
+        Self::parse()
+    }
+
+    /// Whether both halves of a supplied certificate are present.
+    ///
+    /// Supplying only one is a configuration mistake worth naming rather than silently falling back to
+    /// a generated certificate, which would look like the supplied one being ignored.
+    ///
+    /// # Errors
+    ///
+    /// A message naming which half is missing, suitable for printing as-is.
+    pub const fn tls_pair(&self) -> Result<Option<(&PathBuf, &PathBuf)>, &'static str> {
+        match (self.tls_cert.as_ref(), self.tls_key.as_ref()) {
+            (Some(cert), Some(key)) => Ok(Some((cert, key))),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err("HELIOBRIDGE_TLS_CERT is set but HELIOBRIDGE_TLS_KEY is not"),
+            (None, Some(_)) => Err("HELIOBRIDGE_TLS_KEY is set but HELIOBRIDGE_TLS_CERT is not"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, DEFAULT_LISTEN, LogFormat};
+    use clap::Parser as _;
+
+    fn parse(flags: &[&str]) -> Config {
+        let mut command_line = vec!["heliobridge"];
+        command_line.extend_from_slice(flags);
+        Config::try_parse_from(command_line).expect("parse")
+    }
+
+    #[test]
+    fn defaults_listen_on_the_device_port() {
+        let config = parse(&[]);
+        assert_eq!(config.listen.to_string(), DEFAULT_LISTEN);
+        assert_eq!(config.listen.port(), 7006);
+        assert_eq!(config.log_format, LogFormat::Text);
+        assert!(config.record_dir.is_none(), "recording is off by default");
+        assert!(config.tls_cert.is_none());
+    }
+
+    #[test]
+    fn an_incomplete_tls_pair_is_an_error_not_a_silent_fallback() {
+        let config = parse(&["--tls-cert", "/tmp/a.crt"]);
+        assert!(config.tls_pair().is_err());
+
+        let config = parse(&["--tls-key", "/tmp/a.key"]);
+        assert!(config.tls_pair().is_err());
+
+        let config = parse(&["--tls-cert", "/tmp/a.crt", "--tls-key", "/tmp/a.key"]);
+        assert!(config.tls_pair().expect("valid").is_some());
+
+        assert!(parse(&[]).tls_pair().expect("valid").is_none());
+    }
+
+    #[test]
+    fn the_listener_address_is_validated_at_parse_time() {
+        assert!(Config::try_parse_from(["heliobridge", "--listen", "not-an-address"]).is_err());
+        let config = parse(&["--listen", "127.0.0.1:17006"]);
+        assert_eq!(config.listen.port(), 17006);
+    }
+
+    #[test]
+    fn log_format_accepts_only_known_values() {
+        assert_eq!(parse(&["--log-format", "json"]).log_format, LogFormat::Json);
+        assert!(Config::try_parse_from(["heliobridge", "--log-format", "yaml"]).is_err());
+    }
+}
