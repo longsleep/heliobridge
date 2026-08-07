@@ -51,6 +51,60 @@ impl fmt::Display for Raw {
     }
 }
 
+/// A wall-clock time, as a device reports it or as a server sends one.
+///
+/// Deliberately not a date-time type from a calendar crate. On the way in these are six octets from an
+/// untrusted device that must survive being nonsensical without a conversion failing; on the way out the
+/// only requirement is to render the fields a protocol asks for. Neither needs arithmetic on calendars.
+///
+/// Vendor-neutral on purpose: the clock that feeds a server time push should not have to depend on a
+/// particular protocol generation's decoder to express what time it is.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct Timestamp {
+    /// Full year.
+    pub year: u16,
+    /// Month, 1–12.
+    pub month: u8,
+    /// Day of month.
+    pub day: u8,
+    /// Hour.
+    pub hour: u8,
+    /// Minute.
+    pub minute: u8,
+    /// Second.
+    pub second: u8,
+}
+
+impl Timestamp {
+    /// Whether the values form a plausible calendar time.
+    ///
+    /// A frame that fails this is still decoded — the device sends an all-zero timestamp occasionally,
+    /// and rejecting the frame over it would discard good telemetry.
+    pub const fn is_plausible(self) -> bool {
+        self.month >= 1
+            && self.month <= 12
+            && self.day >= 1
+            && self.day <= 31
+            && self.hour < 24
+            && self.minute < 60
+            && self.second < 60
+    }
+}
+
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        } = *self;
+        write!(f, "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+    }
+}
+
 /// How well a field's meaning is established.
 ///
 /// Carried through from decoding to publication on purpose. A field whose meaning is inferred should

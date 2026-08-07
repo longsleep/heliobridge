@@ -15,11 +15,15 @@ use core::time::Duration;
 
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::Instant;
 
 use crate::growatt::v7::decode::{FromFrame, Telemetry};
+use crate::growatt::v7::encode::{Command, EncodeError};
 use crate::growatt::v7::frame::{Frame, MessageType};
 use crate::growatt::{Codec, peek_version};
-use crate::server::mqtt::{CodecError, Packet, QoS};
+use crate::model::Timestamp;
+use crate::server::clock::{self, Clock};
+use crate::server::mqtt::{CodecError, Packet, Publish, QoS};
 use crate::{TARGET_VALUES, TARGET_WIRE};
 
 /// Keepalive the device asks for: seven minutes.
@@ -37,6 +41,13 @@ pub const MAX_PACKET_LEN: usize = 64 * 1024;
 
 /// QoS granted in every SUBACK. See the module documentation.
 pub const GRANTED_QOS: u8 = 0x01;
+
+/// How long after connect to send the server time push.
+///
+/// The vendor server waits about this long. Copying the delay is useful rather than merely faithful: by
+/// then the device has published its first telemetry, so its own clock can be compared with ours before
+/// ours replaces it.
+pub const TIME_PUSH_DELAY: Duration = Duration::from_millis(4_500);
 
 /// Why a session ended.
 #[derive(Debug, Snafu)]
@@ -82,6 +93,13 @@ pub enum SessionError {
         /// Level offered.
         level: u8,
     },
+
+    /// A frame this server wanted to send could not be built.
+    #[snafu(display("could not build a frame to send"))]
+    Encode {
+        /// What the encoder said.
+        source: EncodeError,
+    },
 }
 
 /// What a session did, reported when it ends.
@@ -110,21 +128,47 @@ pub struct Session<S> {
     device_id: Option<String>,
     subscribed: bool,
     stats: SessionStats,
+    clock: Clock,
+    send_time_push: bool,
+    time_push_due: Option<Instant>,
+    next_packet_id: u16,
+    device_time: Option<Timestamp>,
+    warned_about_skew: bool,
 }
 
 impl<S> Session<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Wrap a connected stream.
+    /// Wrap a connected stream, using the host's local clock for the time push.
     pub fn new(stream: S) -> Self {
+        Self::with_clock(stream, clock::system_local)
+    }
+
+    /// Wrap a connected stream with an explicit clock.
+    ///
+    /// Tests pass a fixed clock; nothing else should need this.
+    pub fn with_clock(stream: S, clock: Clock) -> Self {
         Self {
             stream,
             buf: Vec::with_capacity(1024),
             device_id: None,
             subscribed: false,
             stats: SessionStats::default(),
+            clock,
+            send_time_push: true,
+            time_push_due: None,
+            next_packet_id: 1,
+            device_time: None,
+            warned_about_skew: false,
         }
+    }
+
+    /// Whether to send the time push after connect. On by default, because the vendor server does.
+    #[must_use]
+    pub const fn with_time_push(mut self, enabled: bool) -> Self {
+        self.send_time_push = enabled;
+        self
     }
 
     /// The device serial, once CONNECT has been seen.
@@ -137,6 +181,11 @@ where
         self.stats
     }
 
+    /// The most recent wall-clock time the device reported, if any.
+    pub const fn device_time(&self) -> Option<Timestamp> {
+        self.device_time
+    }
+
     /// Run until the peer disconnects or something fails.
     ///
     /// # Errors
@@ -146,9 +195,29 @@ where
     #[tracing::instrument(skip(self), fields(device_id))]
     pub async fn run(&mut self) -> Result<SessionStats, SessionError> {
         loop {
-            let Some(packet) = self.next_packet().await? else {
-                tracing::info!(?self.stats, "peer closed the connection");
-                return Ok(self.stats);
+            // The time push is the one thing the server originates unprompted, so the loop has to be
+            // able to wake on a timer as well as on a packet. The sleep branch borrows nothing, which
+            // is what lets it sit next to a read that borrows `self` mutably.
+            let woke = match self.time_push_due {
+                Some(due) => tokio::select! {
+                    biased;
+                    () = tokio::time::sleep_until(due) => Woke::TimePushDue,
+                    packet = self.next_packet() => Woke::Packet(packet?),
+                },
+                None => Woke::Packet(self.next_packet().await?),
+            };
+
+            let packet = match woke {
+                Woke::TimePushDue => {
+                    self.time_push_due = None;
+                    self.push_time().await?;
+                    continue;
+                }
+                Woke::Packet(None) => {
+                    tracing::info!(?self.stats, "peer closed the connection");
+                    return Ok(self.stats);
+                }
+                Woke::Packet(Some(packet)) => packet,
             };
 
             tracing::trace!(kind = packet.kind(), "received");
@@ -176,6 +245,14 @@ where
                         code: 0,
                     })
                     .await?;
+
+                    if self.send_time_push {
+                        // The vendor server sends its push about 4.5 s after connect. Matching that
+                        // delay rather than firing immediately is not superstition: by then the device
+                        // has published its first telemetry, so its own clock is known and can be
+                        // cross-checked before ours is imposed on it.
+                        self.time_push_due = Instant::now().checked_add(TIME_PUSH_DELAY);
+                    }
                 }
 
                 Packet::Subscribe(subscribe) => {
@@ -281,6 +358,11 @@ where
             MessageType::Telemetry => match Telemetry::from_frame(&frame) {
                 Ok(telemetry) => {
                     self.stats.telemetry = self.stats.telemetry.saturating_add(1);
+                    // Kept as the only independent reference for our own clock. A zero timestamp is
+                    // reported occasionally and must not overwrite a good reading with nothing.
+                    if let Some(stamp) = telemetry.timestamp.filter(|t| t.is_plausible()) {
+                        self.device_time = Some(stamp);
+                    }
                     log_telemetry(&telemetry);
                 }
                 Err(error) => {
@@ -319,6 +401,86 @@ where
         }
     }
 
+    /// Publish the server's wall-clock time to the device.
+    ///
+    /// This is the only message the vendor server sends unprompted, and the only reason to send it is
+    /// to behave like the server being replaced. The device maintains its own clock and kept working
+    /// normally when the push was absent — but its clock is what drives time-slot scheduling, so
+    /// leaving it to drift indefinitely is not a plan either.
+    ///
+    /// Sent on `s/<serial>` at QoS 1, matching the capture. The device's own subscription is
+    /// `s/33/<serial>`, yet every observed server command arrived on `s/<serial>` and the device acted
+    /// on all of them; the relationship between the two forms was never determined, so this follows
+    /// what was observed rather than what would be tidy.
+    async fn push_time(&mut self) -> Result<(), SessionError> {
+        let Some(device_id) = self.device_id.clone() else {
+            // Nothing to address it to. Cannot happen: the push is only scheduled from CONNECT.
+            return Ok(());
+        };
+
+        let now = (self.clock)();
+        self.check_clock_against_device(now);
+
+        let command = Command::time_push(now).context(EncodeSnafu)?;
+        let frame = command.to_frame(&device_id).context(EncodeSnafu)?;
+        let wire = frame.to_wire();
+
+        tracing::trace!(
+            target: TARGET_WIRE,
+            direction = "tx",
+            len = wire.len(),
+            "{}",
+            hex(&wire)
+        );
+
+        let packet_id = self.take_packet_id();
+        tracing::info!(time = %now, packet_id, "pushing server time");
+
+        self.send(&Packet::Publish(Publish {
+            topic: format!("s/{device_id}"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            dup: false,
+            packet_id: Some(packet_id),
+            payload: wire,
+        }))
+        .await
+    }
+
+    /// Compare our clock with the device's and complain if they disagree materially.
+    ///
+    /// The device accepts whatever time it is told, so a misconfigured host would silently set it wrong
+    /// and nothing in the protocol would reveal it. The device's own reported timestamp is the only
+    /// independent reference available, so it is worth using before overwriting the thing it came from.
+    fn check_clock_against_device(&mut self, ours: Timestamp) {
+        let Some(theirs) = self.device_time else {
+            return;
+        };
+        let Some(skew) = clock::skew_seconds(ours, theirs) else {
+            return;
+        };
+        if skew.abs() <= clock::SKEW_WARN_SECONDS || self.warned_about_skew {
+            return;
+        }
+
+        self.warned_about_skew = true;
+        let diagnosis = clock::timezone_error_hint(skew)
+            .unwrap_or_else(|| "the device's clock has probably drifted, which this push will correct".to_owned());
+        tracing::warn!(
+            skew_s = skew,
+            ours = %ours,
+            device = %theirs,
+            "about to set the device clock, but it disagrees with ours: {diagnosis}"
+        );
+    }
+
+    /// Next packet identifier for a QoS-1 publish, wrapping and never zero.
+    fn take_packet_id(&mut self) -> u16 {
+        let current = self.next_packet_id;
+        self.next_packet_id = self.next_packet_id.checked_add(1).unwrap_or(1);
+        current
+    }
+
     /// Read octets until a whole packet is buffered, or the peer closes.
     async fn next_packet(&mut self) -> Result<Option<Packet>, SessionError> {
         loop {
@@ -351,6 +513,17 @@ where
         self.stream.write_all(&wire).await.context(IoSnafu)?;
         self.stream.flush().await.context(IoSnafu)
     }
+}
+
+/// What woke the session loop.
+///
+/// A small enum rather than acting inside the `select!` arms: doing the work there would need `self`
+/// while the other arm's future still borrows it.
+enum Woke {
+    /// A packet arrived, or the peer closed.
+    Packet(Option<Packet>),
+    /// The time push became due.
+    TimePushDue,
 }
 
 /// Emit a decoded telemetry frame: a short line at `info`, every field at `trace`.
@@ -396,7 +569,7 @@ fn hex(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{GRANTED_QOS, Session};
+    use super::{Frame, GRANTED_QOS, MessageType, Session, TIME_PUSH_DELAY, Timestamp};
     use crate::server::mqtt::{Packet, Publish, QoS, write_varint};
 
     const SERIAL: &str = "0EXAMPLE00000001";
@@ -560,6 +733,90 @@ mod tests {
         script.extend_from_slice(&[0xE0, 0x00]);
         let (_, stats) = drive(&script).await;
         assert_eq!(stats.frames, 0);
+    }
+
+    /// A fixed clock, so the pushed timestamp is predictable.
+    fn fixed_clock() -> Timestamp {
+        Timestamp {
+            year: 2026,
+            month: 8,
+            day: 6,
+            hour: 23,
+            minute: 43,
+            second: 2,
+        }
+    }
+
+    /// Drive a session with a fixed clock and time pushes enabled, letting the timer fire.
+    async fn drive_with_time_push(script: &[u8], enabled: bool) -> Vec<Packet> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client.write_all(script).await.expect("buffered");
+
+        let mut session = Session::with_clock(server, fixed_clock).with_time_push(enabled);
+
+        // Run until the session ends. The script has no DISCONNECT, so it ends on the read timeout —
+        // which tokio's paused clock reaches instantly once the time push has fired.
+        let run = tokio::spawn(async move {
+            let outcome = session.run().await;
+            drop(session);
+            outcome
+        });
+
+        // With the test clock paused, tokio advances to the earliest pending timer whenever everything
+        // is idle. Sleeping *longer* than the push delay is what makes the ordering deterministic: the
+        // push timer is the earlier of the two, so it fires first and the DISCONNECT follows.
+        tokio::time::sleep(TIME_PUSH_DELAY.saturating_add(core::time::Duration::from_millis(500))).await;
+        client.write_all(&[0xE0, 0x00]).await.expect("send DISCONNECT");
+
+        drop(run.await.expect("join"));
+
+        let mut replies = Vec::new();
+        client.read_to_end(&mut replies).await.expect("read replies");
+        packets(&replies)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_time_push_goes_out_after_connect() {
+        let replies = drive_with_time_push(&connect_packet(), true).await;
+
+        let push = replies
+            .iter()
+            .find_map(|packet| match packet {
+                Packet::Publish(publish) => Some(publish),
+                _ => None,
+            })
+            .expect("a publish should have been sent");
+
+        // Topic and QoS follow the capture: the device subscribes to s/33/<serial> but every observed
+        // server command arrived on s/<serial>, and the time push specifically used QoS 1.
+        assert_eq!(push.topic, format!("s/{SERIAL}"));
+        assert_eq!(push.qos, QoS::AtLeastOnce);
+        assert_eq!(push.packet_id, Some(1));
+
+        // The payload is a real 0xFE18 frame carrying the fixed clock's time.
+        let frame = Frame::parse(&push.payload).expect("the payload must be a valid frame");
+        assert_eq!(frame.message_type(), MessageType::TimePush);
+        assert_eq!(frame.wire_len(), 67);
+        assert_eq!(frame.device_id(), SERIAL);
+        let body = frame.body();
+        assert_eq!(
+            body.get(8..).map(String::from_utf8_lossy).as_deref(),
+            Some("2026-08-06 23:43:02")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_time_push_when_disabled() {
+        // What happens when relaying: the cloud is the clock authority and we must not be a second one.
+        let replies = drive_with_time_push(&connect_packet(), false).await;
+        assert!(
+            !replies.iter().any(|packet| matches!(packet, Packet::Publish(_))),
+            "nothing should be published when the time push is off"
+        );
+        // The rest of the session still works.
+        assert!(replies.iter().any(|p| matches!(p, Packet::ConnAck { .. })));
     }
 
     #[tokio::test]

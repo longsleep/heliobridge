@@ -56,54 +56,10 @@ pub enum DecodeError {
 
 /// A device-reported wall-clock time.
 ///
-/// Deliberately not a date-time type from a calendar crate: this is six octets from an untrusted
-/// device, which need to survive being nonsensical without a conversion failing. Interpreting them is
-/// the caller's business.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct Timestamp {
-    /// Full year, i.e. the octet plus 2000.
-    pub year: u16,
-    /// Month, 1–12 as reported.
-    pub month: u8,
-    /// Day of month, as reported.
-    pub day: u8,
-    /// Hour, as reported.
-    pub hour: u8,
-    /// Minute, as reported.
-    pub minute: u8,
-    /// Second, as reported.
-    pub second: u8,
-}
-
-impl Timestamp {
-    /// Whether the values form a plausible calendar time.
-    ///
-    /// A frame that fails this is still decoded — the device sends an all-zero timestamp
-    /// occasionally, and rejecting the frame over it would discard good telemetry.
-    pub const fn is_plausible(self) -> bool {
-        self.month >= 1
-            && self.month <= 12
-            && self.day >= 1
-            && self.day <= 31
-            && self.hour < 24
-            && self.minute < 60
-            && self.second < 60
-    }
-}
-
-impl core::fmt::Display for Timestamp {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let Self {
-            year,
-            month,
-            day,
-            hour,
-            minute,
-            second,
-        } = *self;
-        write!(f, "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
-    }
-}
+/// Re-exported from [`crate::model`] rather than defined here: a wall-clock time is not specific to a
+/// protocol generation, and anything that produces or consumes one — the clock that feeds the time
+/// push, most obviously — must not have to depend on this module to do it.
+pub use crate::model::Timestamp;
 
 /// A decoded telemetry frame.
 #[derive(Debug, Clone, PartialEq)]

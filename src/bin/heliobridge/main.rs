@@ -52,6 +52,26 @@ fn run(config: &Config) -> Result<(), String> {
         .build()
         .map_err(|error| format!("could not start the async runtime: {error}"))?;
 
+    if config.cloud_relay {
+        tracing::warn!("cloud relay is configured but not implemented in this build; ignoring");
+    }
+
+    let options = server::SessionOptions {
+        time_push: config.should_push_time(),
+    };
+    if options.time_push {
+        // The device is sent *local* time, so an operator whose host runs UTC — a container default —
+        // would set the device's clock wrong by the zone offset, and nothing in the protocol would say
+        // so. Naming the zone at startup makes the assumption visible before it matters.
+        tracing::info!(
+            local_time = %server::clock::system_local(),
+            tz = std::env::var("TZ").unwrap_or_else(|_| "<unset, using the system zone>".to_owned()),
+            "will push this server's time to the device after it connects"
+        );
+    } else {
+        tracing::info!("not pushing server time: the cloud relay is the clock authority");
+    }
+
     let listen = config.listen;
     runtime.block_on(async move {
         let shutdown = async {
@@ -61,7 +81,7 @@ fn run(config: &Config) -> Result<(), String> {
             }
         };
 
-        server::serve(listen, tls_config, shutdown)
+        server::serve(listen, tls_config, options, shutdown)
             .await
             .map_err(|error| format!("listener failed: {}", chain(&error)))
     })?;

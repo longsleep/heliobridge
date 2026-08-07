@@ -16,13 +16,16 @@
 //! - [`session`] — the per-connection state machine.
 //! - [`listener`] — accept loop, one session per connection.
 //! - [`tls`] — server TLS, including first-run certificate generation.
+//! - [`clock`] — wall-clock time for the server time push, and the skew check that goes with it.
 
+pub mod clock;
 pub mod listener;
 pub mod mqtt;
 pub mod session;
 pub mod tls;
 
-pub use listener::{ListenerError, serve};
+pub use clock::Clock;
+pub use listener::{ListenerError, SessionOptions, serve};
 pub use mqtt::{CodecError, Packet, QoS};
 pub use session::{Session, SessionError, SessionStats};
 pub use tls::{CertificateOrigin, TlsError, server_config};

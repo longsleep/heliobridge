@@ -36,6 +36,22 @@ pub enum ListenerError {
     },
 }
 
+/// How each session should behave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionOptions {
+    /// Whether to push the server's wall-clock time after the device connects.
+    ///
+    /// Off when relaying to the cloud, which sends its own — two servers setting one clock would set it
+    /// twice per connect, to values differing by whatever skew exists between them.
+    pub time_push: bool,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self { time_push: true }
+    }
+}
+
 /// Serve until the shutdown signal fires.
 ///
 /// # Errors
@@ -45,12 +61,13 @@ pub enum ListenerError {
 pub async fn serve(
     address: std::net::SocketAddr,
     tls: Arc<ServerConfig>,
+    options: SessionOptions,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), ListenerError> {
     let listener = TcpListener::bind(address).await.context(BindSnafu { address })?;
     let acceptor = TlsAcceptor::from(tls);
 
-    tracing::info!(%address, "listening for the device");
+    tracing::info!(%address, time_push = options.time_push, "listening for the device");
 
     let mut shutdown = pin!(shutdown);
 
@@ -72,7 +89,7 @@ pub async fn serve(
                 };
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
-                    handle(stream, peer, acceptor).await;
+                    handle(stream, peer, acceptor, options).await;
                 });
             }
         }
@@ -80,8 +97,8 @@ pub async fn serve(
 }
 
 /// Complete the TLS handshake and run one session.
-#[tracing::instrument(skip(stream, acceptor), fields(%peer))]
-async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcceptor) {
+#[tracing::instrument(skip(stream, acceptor, options), fields(%peer))]
+async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcceptor, options: SessionOptions) {
     // Nagle off: the device waits for small acknowledgements, and delaying a PUBACK to coalesce it with
     // nothing costs latency for no benefit.
     if let Err(error) = stream.set_nodelay(true) {
@@ -104,7 +121,7 @@ async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcce
 
     tracing::info!("TLS established");
 
-    let mut session = Session::new(stream);
+    let mut session = Session::new(stream).with_time_push(options.time_push);
     match session.run().await {
         Ok(stats) => tracing::info!(
             frames = stats.frames,

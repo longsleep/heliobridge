@@ -41,6 +41,14 @@ pub struct Config {
     #[arg(long, env = "HELIOBRIDGE_RECORD_DIR")]
     pub record_dir: Option<PathBuf>,
 
+    /// Relay device traffic to the Growatt cloud, so the vendor app keeps working.
+    ///
+    /// Also decides who sets the device's clock. The server time push is sent unless this is on: the
+    /// cloud sends its own, and two servers setting one clock is one too many — the device would be set
+    /// twice per connect, to values differing by whatever skew exists between them.
+    #[arg(long, env = "HELIOBRIDGE_CLOUD_RELAY", default_value_t = false)]
+    pub cloud_relay: bool,
+
     /// Tracing filter, per subsystem. Falls back to `RUST_LOG`.
     #[arg(long, env = "HELIOBRIDGE_LOG", default_value = "info")]
     pub log: String,
@@ -63,6 +71,14 @@ impl Config {
     /// Parse from the environment and the command line.
     pub fn from_env() -> Self {
         Self::parse()
+    }
+
+    /// Whether this server should push its wall-clock time to the device.
+    ///
+    /// Always, unless relaying — in which case the cloud does it and we would be a second authority on
+    /// the same clock.
+    pub const fn should_push_time(&self) -> bool {
+        !self.cloud_relay
     }
 
     /// Whether both halves of a supplied certificate are present.
