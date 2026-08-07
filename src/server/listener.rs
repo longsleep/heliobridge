@@ -3,6 +3,13 @@
 //! Accepts connections, wraps them in TLS and hands each to a [`crate::server::Session`]. One device is
 //! expected, but connections are handled concurrently anyway: the device reconnects aggressively, and a
 //! stale socket must not be able to lock out the live one.
+//!
+//! # Failures are per-connection
+//!
+//! Nothing a session does takes the listener down. The device has nowhere else to publish, so a failed
+//! handshake, a dropped connection or a malformed packet are logged and forgotten — availability outranks
+//! strictness here. Even the cloud relay disappearing only ends its session: the relay is built per
+//! session, so the device's reconnect a couple of seconds later brings up a fresh one.
 
 use core::future::Future;
 use core::pin::pin;
@@ -13,6 +20,7 @@ use snafu::{ResultExt, Snafu};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
+use crate::growatt::cloud::CloudConfig;
 use crate::server::session::Session;
 
 /// Why the listener stopped.
@@ -27,28 +35,27 @@ pub enum ListenerError {
         /// The underlying error.
         source: std::io::Error,
     },
-
-    /// Accepting a connection failed.
-    #[snafu(display("could not accept a connection"))]
-    Accept {
-        /// The underlying error.
-        source: std::io::Error,
-    },
 }
 
 /// How each session should behave.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOptions {
     /// Whether to push the server's wall-clock time after the device connects.
     ///
     /// Off when relaying to the cloud, which sends its own — two servers setting one clock would set it
     /// twice per connect, to values differing by whatever skew exists between them.
     pub time_push: bool,
+
+    /// Relay traffic to the vendor cloud, so the phone app keeps working.
+    pub cloud: Option<CloudConfig>,
 }
 
 impl Default for SessionOptions {
     fn default() -> Self {
-        Self { time_push: true }
+        Self {
+            time_push: true,
+            cloud: None,
+        }
     }
 }
 
@@ -57,7 +64,7 @@ impl Default for SessionOptions {
 /// # Errors
 ///
 /// [`ListenerError::Bind`] if the address is unavailable. Per-connection failures are logged and do not
-/// stop the listener: the device has nowhere else to publish, so availability outranks strictness.
+/// stop the listener.
 pub async fn serve(
     address: std::net::SocketAddr,
     tls: Arc<ServerConfig>,
@@ -67,7 +74,12 @@ pub async fn serve(
     let listener = TcpListener::bind(address).await.context(BindSnafu { address })?;
     let acceptor = TlsAcceptor::from(tls);
 
-    tracing::info!(%address, time_push = options.time_push, "listening for the device");
+    tracing::info!(
+        %address,
+        time_push = options.time_push,
+        cloud_relay = options.cloud.is_some(),
+        "listening for the device"
+    );
 
     let mut shutdown = pin!(shutdown);
 
@@ -77,6 +89,7 @@ pub async fn serve(
                 tracing::info!("shutting down the listener");
                 return Ok(());
             }
+
             accepted = listener.accept() => {
                 let (stream, peer) = match accepted {
                     Ok(pair) => pair,
@@ -88,6 +101,7 @@ pub async fn serve(
                     }
                 };
                 let acceptor = acceptor.clone();
+                let options = options.clone();
                 tokio::spawn(async move {
                     handle(stream, peer, acceptor, options).await;
                 });
@@ -109,8 +123,7 @@ async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcce
         Ok(stream) => stream,
         Err(error) => {
             // The most likely cause is a certificate the device rejects, which is worth saying plainly
-            // because the alternative reading — a network fault — sends people looking in the wrong
-            // place.
+            // because the alternative reading — a network fault — sends people looking in the wrong place.
             tracing::warn!(
                 %error,
                 "TLS handshake failed; if this repeats, suspect the certificate rather than the network"
@@ -121,7 +134,10 @@ async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcce
 
     tracing::info!("TLS established");
 
-    let mut session = Session::new(stream).with_time_push(options.time_push);
+    let mut session = Session::new(stream)
+        .with_time_push(options.time_push)
+        .with_cloud(options.cloud);
+
     match session.run().await {
         Ok(stats) => tracing::info!(
             frames = stats.frames,
@@ -129,16 +145,66 @@ async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcce
             rejected = stats.rejected,
             undecoded = stats.undecoded,
             pings = stats.pings,
+            relay_received = stats.relay_received,
+            relay_dropped = stats.relay_dropped,
             "session ended"
         ),
-        Err(error) => {
-            let mut chain = vec![error.to_string()];
-            let mut source = std::error::Error::source(&error);
-            while let Some(cause) = source {
-                chain.push(cause.to_string());
-                source = cause.source();
-            }
-            tracing::warn!(error = %chain.join(": "), "session failed");
-        }
+        Err(error) => tracing::warn!(reason = %flatten(&error), "session failed"),
+    }
+}
+
+/// Flatten an error and its sources into one line.
+///
+/// The point of choosing `snafu` was that context survives to the log; a bare `Display` prints only the
+/// outermost layer and discards it.
+fn flatten(error: &dyn std::error::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        parts.push(cause.to_string());
+        source = cause.source();
+    }
+    parts.join(": ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionOptions;
+    use crate::growatt::cloud::CloudConfig;
+
+    #[test]
+    fn defaults_relay_nothing_and_push_time() {
+        let options = SessionOptions::default();
+        assert!(options.time_push, "the vendor server pushes time, so we do too");
+        assert!(options.cloud.is_none(), "relaying is opt-in");
+    }
+
+    #[test]
+    fn the_two_settings_are_independent_but_conventionally_opposed() {
+        // Relaying means the cloud owns the clock, so the wiring in `main` turns the push off. Nothing
+        // here enforces that — it is a policy decision, and this type only carries it.
+        let options = SessionOptions {
+            time_push: false,
+            cloud: Some(CloudConfig::default()),
+        };
+        assert!(options.cloud.is_some());
+        assert!(!options.time_push);
+    }
+
+    #[test]
+    fn a_flattened_error_keeps_every_layer() {
+        use crate::server::session::SessionError;
+
+        // Two layers: the session's own message and the stream's underneath it. A bare Display would
+        // print only the first, discarding the part that says what actually went wrong.
+        let error = SessionError::Stream {
+            source: crate::mqtt::StreamError::TooLarge {
+                len: 99_999,
+                limit: 65_536,
+            },
+        };
+        let flat = super::flatten(&error);
+        assert!(flat.contains("connection failed"), "{flat}");
+        assert!(flat.contains("99999"), "{flat}");
     }
 }

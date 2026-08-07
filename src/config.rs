@@ -8,6 +8,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use crate::growatt::cloud::{self, CloudConfig};
+
 /// Default device-facing listener address.
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:7006";
 
@@ -49,6 +51,16 @@ pub struct Config {
     #[arg(long, env = "HELIOBRIDGE_CLOUD_RELAY", default_value_t = false)]
     pub cloud_relay: bool,
 
+    /// Cloud endpoint to relay to, as `host:port`.
+    ///
+    /// The host is also the TLS server name, so it must be a name rather than an address.
+    #[arg(long, env = "HELIOBRIDGE_CLOUD_HOST", default_value = cloud::DEFAULT_HOST)]
+    pub cloud_host: String,
+
+    /// Cloud port.
+    #[arg(long, env = "HELIOBRIDGE_CLOUD_PORT", default_value_t = cloud::DEFAULT_PORT)]
+    pub cloud_port: u16,
+
     /// Tracing filter, per subsystem. Falls back to `RUST_LOG`.
     #[arg(long, env = "HELIOBRIDGE_LOG", default_value = "info")]
     pub log: String,
@@ -79,6 +91,14 @@ impl Config {
     /// the same clock.
     pub const fn should_push_time(&self) -> bool {
         !self.cloud_relay
+    }
+
+    /// The cloud endpoint to relay to, or `None` when relaying is off.
+    pub fn cloud(&self) -> Option<CloudConfig> {
+        self.cloud_relay.then(|| CloudConfig {
+            host: self.cloud_host.clone(),
+            port: self.cloud_port,
+        })
     }
 
     /// Whether both halves of a supplied certificate are present.

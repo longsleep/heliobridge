@@ -22,6 +22,13 @@
 //! Nothing above this module needs to change, because the vendor-neutral types a decoder produces
 //! live in [`crate::model`].
 //!
+//! # The one part that is not pure decoding
+//!
+//! [`cloud`] is the optional relay to Growatt's own servers. It speaks MQTT and does I/O, which the rest
+//! of this module deliberately does not — but the endpoint, the credentials and the topics are all
+//! Growatt's, so it belongs to the vendor rather than to the transport. Everything below [`v7`] stays a
+//! pure `bytes → values` library.
+//!
 //! # Adding a different vendor
 //!
 //! A different vendor's protocol would be a sibling of this module — `src/<vendor>.rs` — producing
@@ -33,6 +40,7 @@
 //! implementor is a guess about the second one. [`Codec`] exists only because version dispatch is a
 //! real, observed requirement.
 
+pub mod cloud;
 pub mod header;
 pub mod v7;
 

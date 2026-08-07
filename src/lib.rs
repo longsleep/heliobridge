@@ -16,8 +16,10 @@
 //! - [`model`] — vendor-neutral data model: register and value newtypes, units, scaling, readings.
 //! - [`growatt`] — the Growatt protocol family, with a module per protocol generation. Pure
 //!   `bytes → values`, no I/O and no MQTT types.
-//! - [`server`] — everything device-facing: the MQTT server the device connects to, its packet codec,
-//!   the session state machine, the accept loop and server TLS.
+//! - [`mqtt`] — MQTT 3.1.1 packet codec. Transport, and direction-agnostic: the device-facing server
+//!   and the vendor cloud client both speak it, which is why it sits here rather than inside either.
+//! - [`server`] — everything device-facing: the session state machine, the accept loop, server TLS and
+//!   the clock behind the time push.
 //! - [`config`] — environment configuration, all of it prefixed `HELIOBRIDGE_`.
 //!
 //! Still to come: `bridge` (cached state, Home Assistant, optional cloud relay).
@@ -27,6 +29,7 @@
 pub mod config;
 pub mod growatt;
 pub mod model;
+pub mod mqtt;
 pub mod server;
 
 /// The crate version, as published.

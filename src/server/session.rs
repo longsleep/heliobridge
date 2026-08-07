@@ -14,16 +14,17 @@
 use core::time::Duration;
 
 use snafu::{ResultExt, Snafu};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Instant;
 
+use crate::growatt::cloud::{CloudConfig, Message as CloudMessage, Relay};
 use crate::growatt::v7::decode::{FromFrame, Telemetry};
 use crate::growatt::v7::encode::{Command, EncodeError};
 use crate::growatt::v7::frame::{Frame, MessageType};
 use crate::growatt::{Codec, peek_version};
-use crate::model::Timestamp;
-use crate::server::clock::{self, Clock};
-use crate::server::mqtt::{CodecError, Packet, Publish, QoS};
+use crate::model::{Hex, Timestamp};
+use crate::mqtt::{Packet, PacketStream, Publish, QoS, StreamError};
+use crate::server::clock::{Clock, Skew};
 use crate::{TARGET_VALUES, TARGET_WIRE};
 
 /// Keepalive the device asks for: seven minutes.
@@ -53,27 +54,11 @@ pub const TIME_PUSH_DELAY: Duration = Duration::from_millis(4_500);
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum SessionError {
-    /// The socket failed.
-    #[snafu(display("connection i/o failed"))]
-    Io {
-        /// The underlying error.
-        source: std::io::Error,
-    },
-
-    /// The peer sent octets that are not a valid packet.
-    ///
-    /// Fatal: once framing is lost there is no way to resynchronise on a stream.
-    #[snafu(display("could not decode an MQTT packet"))]
-    Codec {
-        /// What the codec said.
-        source: CodecError,
-    },
-
-    /// A packet larger than [`MAX_PACKET_LEN`].
-    #[snafu(display("peer announced a {len}-octet packet, above the {MAX_PACKET_LEN} limit"))]
-    PacketTooLarge {
-        /// Length announced.
-        len: usize,
+    /// The framed connection failed: transport error, malformed packet, or an oversized one.
+    #[snafu(display("connection failed"))]
+    Stream {
+        /// What the stream said.
+        source: StreamError,
     },
 
     /// Nothing arrived within [`READ_TIMEOUT`].
@@ -115,6 +100,10 @@ pub struct SessionStats {
     pub undecoded: u64,
     /// Keepalive exchanges.
     pub pings: u64,
+    /// Messages the cloud sent for the device, when relaying.
+    pub relay_received: u64,
+    /// Frames that could not be handed to the cloud because it was not keeping up.
+    pub relay_dropped: u64,
 }
 
 /// A device session over an established, already-encrypted stream.
@@ -123,8 +112,7 @@ pub struct SessionStats {
 /// tests, with no TLS, no sockets and no device.
 #[derive(Debug)]
 pub struct Session<S> {
-    stream: S,
-    buf: Vec<u8>,
+    stream: PacketStream<S>,
     device_id: Option<String>,
     subscribed: bool,
     stats: SessionStats,
@@ -134,6 +122,8 @@ pub struct Session<S> {
     next_packet_id: u16,
     device_time: Option<Timestamp>,
     warned_about_skew: bool,
+    cloud: Option<CloudConfig>,
+    relay: Option<Relay>,
 }
 
 impl<S> Session<S>
@@ -142,7 +132,7 @@ where
 {
     /// Wrap a connected stream, using the host's local clock for the time push.
     pub fn new(stream: S) -> Self {
-        Self::with_clock(stream, clock::system_local)
+        Self::with_clock(stream, Clock::system())
     }
 
     /// Wrap a connected stream with an explicit clock.
@@ -150,8 +140,7 @@ where
     /// Tests pass a fixed clock; nothing else should need this.
     pub fn with_clock(stream: S, clock: Clock) -> Self {
         Self {
-            stream,
-            buf: Vec::with_capacity(1024),
+            stream: PacketStream::new(stream, MAX_PACKET_LEN),
             device_id: None,
             subscribed: false,
             stats: SessionStats::default(),
@@ -161,6 +150,8 @@ where
             next_packet_id: 1,
             device_time: None,
             warned_about_skew: false,
+            cloud: None,
+            relay: None,
         }
     }
 
@@ -168,6 +159,16 @@ where
     #[must_use]
     pub const fn with_time_push(mut self, enabled: bool) -> Self {
         self.send_time_push = enabled;
+        self
+    }
+
+    /// Relay this session's traffic to the vendor cloud.
+    ///
+    /// The relay cannot start until the device's serial is known, so this stores the configuration and the
+    /// connection is made from CONNECT.
+    #[must_use]
+    pub fn with_cloud(mut self, cloud: Option<CloudConfig>) -> Self {
+        self.cloud = cloud;
         self
     }
 
@@ -195,23 +196,27 @@ where
     #[tracing::instrument(skip(self), fields(device_id))]
     pub async fn run(&mut self) -> Result<SessionStats, SessionError> {
         loop {
-            // The time push is the one thing the server originates unprompted, so the loop has to be
-            // able to wake on a timer as well as on a packet. The sleep branch borrows nothing, which
-            // is what lets it sit next to a read that borrows `self` mutably.
-            let woke = match self.time_push_due {
-                Some(due) => tokio::select! {
-                    biased;
-                    () = tokio::time::sleep_until(due) => Woke::TimePushDue,
-                    packet = self.next_packet() => Woke::Packet(packet?),
-                },
-                None => Woke::Packet(self.next_packet().await?),
-            };
-
-            let packet = match woke {
+            let packet = match self.wait().await? {
                 Woke::TimePushDue => {
                     self.time_push_due = None;
                     self.push_time().await?;
                     continue;
+                }
+                Woke::FromCloud(Some(message)) => {
+                    self.forward_to_device(message).await?;
+                    continue;
+                }
+                Woke::FromCloud(None) => {
+                    // Not a cloud outage — those are retried internally and never reach here. The relay
+                    // task itself is gone, and a relay is built per session, so ending this session is
+                    // what recreates it: the device reconnects within a couple of seconds and gets a fresh
+                    // one. Cheaper and more surgical than taking the process down, and local operation is
+                    // interrupted only for the length of a reconnect.
+                    tracing::warn!(
+                        ?self.stats,
+                        "the cloud relay stopped; ending the session so a reconnect rebuilds it"
+                    );
+                    return Ok(self.stats);
                 }
                 Woke::Packet(None) => {
                     tracing::info!(?self.stats, "peer closed the connection");
@@ -224,7 +229,7 @@ where
 
             match packet {
                 Packet::Connect(connect) => {
-                    if connect.protocol_level != crate::server::mqtt::PROTOCOL_LEVEL {
+                    if connect.protocol_level != crate::mqtt::PROTOCOL_LEVEL {
                         return Err(SessionError::UnsupportedLevel {
                             level: connect.protocol_level,
                         });
@@ -245,6 +250,9 @@ where
                         code: 0,
                     })
                     .await?;
+
+                    // The relay connects as the device, so it cannot start until the serial is known.
+                    self.start_relay();
 
                     if self.send_time_push {
                         // The vendor server sends its push about 4.5 s after connect. Matching that
@@ -276,6 +284,11 @@ where
                     if let (QoS::AtLeastOnce, Some(packet_id)) = (publish.qos, publish.packet_id) {
                         self.send(&Packet::PubAck { packet_id }).await?;
                     }
+
+                    // Relay before decoding, and regardless of whether decoding succeeds: the cloud
+                    // understands frames this build does not, so what reaches Growatt must not depend on
+                    // what this program can parse.
+                    self.forward_to_cloud(&publish);
                     self.handle_frame(&publish.topic, &publish.payload);
                 }
 
@@ -312,7 +325,7 @@ where
             topic,
             len = payload.len(),
             "{}",
-            hex(payload)
+            Hex(payload)
         );
 
         // Discover the generation before committing to a parser, so an unimplemented one is reported
@@ -344,7 +357,7 @@ where
                 tracing::warn!(
                     %error,
                     len = payload.len(),
-                    dump = %hex(payload),
+                    dump = %Hex(payload),
                     "rejected a frame"
                 );
                 return;
@@ -363,7 +376,7 @@ where
                     if let Some(stamp) = telemetry.timestamp.filter(|t| t.is_plausible()) {
                         self.device_time = Some(stamp);
                     }
-                    log_telemetry(&telemetry);
+                    self.log_telemetry(&telemetry);
                 }
                 Err(error) => {
                     self.stats.rejected = self.stats.rejected.saturating_add(1);
@@ -394,7 +407,7 @@ where
                     address = format_args!("{address:#04x}"),
                     function = format_args!("{function:#04x}"),
                     len = frame.wire_len(),
-                    dump = %hex(payload),
+                    dump = %Hex(payload),
                     "unrecognised message type"
                 );
             }
@@ -418,7 +431,7 @@ where
             return Ok(());
         };
 
-        let now = (self.clock)();
+        let now = self.clock.now();
         self.check_clock_against_device(now);
 
         let command = Command::time_push(now).context(EncodeSnafu)?;
@@ -430,7 +443,7 @@ where
             direction = "tx",
             len = wire.len(),
             "{}",
-            hex(&wire)
+            Hex(&wire)
         );
 
         let packet_id = self.take_packet_id();
@@ -456,21 +469,20 @@ where
         let Some(theirs) = self.device_time else {
             return;
         };
-        let Some(skew) = clock::skew_seconds(ours, theirs) else {
+        let Some(skew) = Skew::between(ours, theirs) else {
             return;
         };
-        if skew.abs() <= clock::SKEW_WARN_SECONDS || self.warned_about_skew {
+        if !skew.is_significant() || self.warned_about_skew {
             return;
         }
 
         self.warned_about_skew = true;
-        let diagnosis = clock::timezone_error_hint(skew)
-            .unwrap_or_else(|| "the device's clock has probably drifted, which this push will correct".to_owned());
         tracing::warn!(
-            skew_s = skew,
+            skew = %skew,
             ours = %ours,
             device = %theirs,
-            "about to set the device clock, but it disagrees with ours: {diagnosis}"
+            "about to set the device clock, but it disagrees with ours: {}",
+            skew.diagnosis()
         );
     }
 
@@ -481,37 +493,159 @@ where
         current
     }
 
-    /// Read octets until a whole packet is buffered, or the peer closes.
-    async fn next_packet(&mut self) -> Result<Option<Packet>, SessionError> {
-        loop {
-            if let Some((packet, used)) = Packet::decode_from_device(&self.buf).context(CodecSnafu)? {
-                self.buf.drain(..used);
-                return Ok(Some(packet));
-            }
-
-            if self.buf.len() > MAX_PACKET_LEN {
-                return Err(SessionError::PacketTooLarge { len: self.buf.len() });
-            }
-
-            let mut chunk = [0u8; 4096];
-            let read = tokio::time::timeout(READ_TIMEOUT, self.stream.read(&mut chunk))
-                .await
-                .map_err(|_| SessionError::Idle)?
-                .context(IoSnafu)?;
-
-            if read == 0 {
-                return Ok(None);
-            }
-            self.buf.extend_from_slice(chunk.get(..read).unwrap_or_default());
+    /// Wait for whichever of the three things happens first.
+    ///
+    /// Split out of the loop because each branch needs `self` afterwards, and doing the work inside a
+    /// `select!` arm would hold a borrow taken by another arm's future. The branches that only need
+    /// `Copy` state — the timer deadline — are set up before the `select!` for the same reason.
+    async fn wait(&mut self) -> Result<Woke, SessionError> {
+        match (self.time_push_due, self.relay.as_mut()) {
+            (Some(due), Some(relay)) => Ok(tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(due) => Woke::TimePushDue,
+                message = relay.next_from_cloud() => Woke::FromCloud(message),
+                packet = Self::read(&mut self.stream) => Woke::Packet(packet?),
+            }),
+            (Some(due), None) => Ok(tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(due) => Woke::TimePushDue,
+                packet = Self::read(&mut self.stream) => Woke::Packet(packet?),
+            }),
+            (None, Some(relay)) => Ok(tokio::select! {
+                biased;
+                message = relay.next_from_cloud() => Woke::FromCloud(message),
+                packet = Self::read(&mut self.stream) => Woke::Packet(packet?),
+            }),
+            (None, None) => Ok(Woke::Packet(Self::read(&mut self.stream).await?)),
         }
+    }
+
+    /// Read the next packet from the device, bounded by the idle timeout.
+    ///
+    /// The framing itself belongs to [`PacketStream`]; what is added here is the timeout, which is a
+    /// property of *this* session rather than of MQTT. Takes the stream rather than `&mut self` so it can
+    /// sit in a `select!` beside branches that borrow other fields.
+    async fn read(stream: &mut PacketStream<S>) -> Result<Option<Packet>, SessionError> {
+        tokio::time::timeout(READ_TIMEOUT, stream.next_packet_from_device())
+            .await
+            .map_err(|_| SessionError::Idle)?
+            .context(StreamSnafu)
     }
 
     /// Write one packet.
     async fn send(&mut self, packet: &Packet) -> Result<(), SessionError> {
-        let wire = packet.encode().context(CodecSnafu)?;
-        tracing::trace!(kind = packet.kind(), len = wire.len(), "sending");
-        self.stream.write_all(&wire).await.context(IoSnafu)?;
-        self.stream.flush().await.context(IoSnafu)
+        self.stream.send(packet).await.context(StreamSnafu)
+    }
+
+    /// Start the cloud relay, now that the serial is known.
+    fn start_relay(&mut self) {
+        let (Some(cloud), Some(device_id)) = (self.cloud.clone(), self.device_id.clone()) else {
+            return;
+        };
+        match Relay::start(&device_id, cloud) {
+            Ok(relay) => self.relay = Some(relay),
+            // Not fatal. The device is served either way, which is the whole point of the relay being
+            // optional.
+            Err(error) => tracing::warn!(%error, "could not start the cloud relay; continuing without it"),
+        }
+    }
+
+    /// Hand a frame the device published to the cloud, if relaying.
+    fn forward_to_cloud(&mut self, publish: &Publish) {
+        let Some(relay) = self.relay.as_mut() else {
+            return;
+        };
+        let message = CloudMessage {
+            topic: publish.topic.clone(),
+            qos: publish.qos,
+            payload: publish.payload.clone(),
+        };
+        if !relay.try_forward(message) {
+            self.stats.relay_dropped = self.stats.relay_dropped.saturating_add(1);
+            tracing::warn!(
+                dropped = self.stats.relay_dropped,
+                "dropped a frame for the cloud; it is not keeping up"
+            );
+        }
+    }
+
+    /// Pass a message the cloud sent on to the device.
+    ///
+    /// The frame is forwarded untouched. It is not decoded first, and deliberately so: a command this
+    /// build cannot parse is still a command the device understands, and dropping it would make the relay
+    /// less capable than the thing it relays.
+    async fn forward_to_device(&mut self, message: CloudMessage) -> Result<(), SessionError> {
+        self.stats.relay_received = self.stats.relay_received.saturating_add(1);
+
+        tracing::trace!(
+            target: TARGET_WIRE,
+            direction = "cloud-rx",
+            topic = %message.topic,
+            len = message.payload.len(),
+            "{}",
+            Hex(&message.payload)
+        );
+
+        // Name what it is, when that is knowable, without depending on it.
+        match Frame::parse(&message.payload) {
+            Ok(frame) => tracing::info!(
+                message_type = %frame.message_type(),
+                topic = %message.topic,
+                "relaying a cloud command to the device"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                topic = %message.topic,
+                len = message.payload.len(),
+                "relaying a cloud message this build cannot parse"
+            ),
+        }
+
+        let packet_id = if message.qos == QoS::AtMostOnce {
+            None
+        } else {
+            Some(self.take_packet_id())
+        };
+
+        self.send(&Packet::Publish(Publish {
+            topic: message.topic,
+            qos: message.qos,
+            retain: false,
+            dup: false,
+            packet_id,
+            payload: message.payload,
+        }))
+        .await
+    }
+
+    /// Emit a decoded telemetry frame: a short line at `info`, every field at `trace`.
+    fn log_telemetry(&self, telemetry: &Telemetry) {
+        let field = |name: &str| telemetry.value(name).unwrap_or(f64::NAN);
+        tracing::info!(
+            timestamp = telemetry
+                .timestamp
+                .map_or_else(|| "none".to_owned(), |stamp| stamp.to_string()),
+            pv_w = field("pv_power_total"),
+            ac_w = field("ac_power"),
+            battery_w = field("battery_charge_power"),
+            soc_pct = field("battery_soc_total"),
+            relayed = self.relay.is_some(),
+            "telemetry"
+        );
+
+        if tracing::enabled!(target: TARGET_VALUES, tracing::Level::TRACE) {
+            for reading in &telemetry.readings {
+                tracing::trace!(
+                    target: TARGET_VALUES,
+                    register = reading.register.number(),
+                    name = reading.name,
+                    raw = reading.raw.get(),
+                    value = %reading.value,
+                    unit = reading.unit.symbol(),
+                    "register"
+                );
+            }
+        }
     }
 }
 
@@ -520,90 +654,46 @@ where
 /// A small enum rather than acting inside the `select!` arms: doing the work there would need `self`
 /// while the other arm's future still borrows it.
 enum Woke {
-    /// A packet arrived, or the peer closed.
+    /// A packet arrived from the device, or it closed the connection.
     Packet(Option<Packet>),
     /// The time push became due.
     TimePushDue,
-}
-
-/// Emit a decoded telemetry frame: a short line at `info`, every field at `trace`.
-fn log_telemetry(telemetry: &Telemetry) {
-    let field = |name: &str| telemetry.value(name).unwrap_or(f64::NAN);
-    tracing::info!(
-        timestamp = telemetry
-            .timestamp
-            .map_or_else(|| "none".to_owned(), |stamp| stamp.to_string()),
-        pv_w = field("pv_power_total"),
-        ac_w = field("ac_power"),
-        battery_w = field("battery_charge_power"),
-        soc_pct = field("battery_soc_total"),
-        "telemetry"
-    );
-
-    if tracing::enabled!(target: TARGET_VALUES, tracing::Level::TRACE) {
-        for reading in &telemetry.readings {
-            tracing::trace!(
-                target: TARGET_VALUES,
-                register = reading.register.number(),
-                name = reading.name,
-                raw = reading.raw.get(),
-                value = %reading.value,
-                unit = reading.unit.symbol(),
-                "register"
-            );
-        }
-    }
-}
-
-/// Hex-encode for a diagnostic dump.
-///
-/// Called inside the `trace!` argument list so it only runs when the level is enabled.
-fn hex(data: &[u8]) -> String {
-    use core::fmt::Write as _;
-    let mut out = String::with_capacity(data.len().saturating_mul(2));
-    for byte in data {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    /// The cloud sent something for the device, or the relay stopped.
+    FromCloud(Option<CloudMessage>),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, GRANTED_QOS, MessageType, Session, TIME_PUSH_DELAY, Timestamp};
-    use crate::server::mqtt::{Packet, Publish, QoS, write_varint};
+    use super::{Clock, Frame, GRANTED_QOS, MessageType, Session, TIME_PUSH_DELAY, Timestamp};
+    use crate::mqtt::{Connect, Packet, Publish, QoS, Subscribe};
 
     const SERIAL: &str = "0EXAMPLE00000001";
 
-    /// Build the CONNECT the device sends.
+    /// The CONNECT the device sends: flags 0xC0, keepalive 420, password `Growatt`.
+    ///
+    /// Built through the encoder rather than by hand. The reference octets are checked against a
+    /// hand-built copy in the codec's own tests, which is the right place for that; here what matters is
+    /// exercising the session, and hand-rolling packets in two places invites them to drift apart.
     fn connect_packet() -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&[0x00, 0x04]);
-        body.extend_from_slice(b"MQTT");
-        body.push(0x04);
-        body.push(0xC0);
-        body.extend_from_slice(&420u16.to_be_bytes());
-        for _ in 0..2 {
-            body.extend_from_slice(&u16::try_from(SERIAL.len()).unwrap().to_be_bytes());
-            body.extend_from_slice(SERIAL.as_bytes());
-        }
-        body.extend_from_slice(&7u16.to_be_bytes());
-        body.extend_from_slice(b"Growatt");
-        let mut packet = vec![0x10];
-        write_varint(&mut packet, body.len());
-        packet.extend_from_slice(&body);
-        packet
+        Packet::Connect(Connect {
+            protocol_level: crate::mqtt::PROTOCOL_LEVEL,
+            client_id: SERIAL.to_owned(),
+            username: Some(SERIAL.to_owned()),
+            password: Some(b"Growatt".to_vec()),
+            keepalive: 420,
+            clean_session: false,
+        })
+        .encode()
+        .expect("encode")
     }
 
     fn subscribe_packet() -> Vec<u8> {
-        let filter = format!("s/33/{SERIAL}");
-        let mut body = 1u16.to_be_bytes().to_vec();
-        body.extend_from_slice(&u16::try_from(filter.len()).unwrap().to_be_bytes());
-        body.extend_from_slice(filter.as_bytes());
-        body.push(0x01);
-        let mut packet = vec![0x82];
-        write_varint(&mut packet, body.len());
-        packet.extend_from_slice(&body);
-        packet
+        Packet::Subscribe(Subscribe {
+            packet_id: 1,
+            filters: vec![(format!("s/33/{SERIAL}"), 1)],
+        })
+        .encode()
+        .expect("encode")
     }
 
     fn publish_packet(payload: &[u8], packet_id: u16) -> Vec<u8> {
@@ -754,7 +844,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         client.write_all(script).await.expect("buffered");
 
-        let mut session = Session::with_clock(server, fixed_clock).with_time_push(enabled);
+        let mut session = Session::with_clock(server, Clock::from_fn(fixed_clock)).with_time_push(enabled);
 
         // Run until the session ends. The script has no DISCONNECT, so it ends on the read timeout —
         // which tokio's paused clock reaches instantly once the time push has fired.

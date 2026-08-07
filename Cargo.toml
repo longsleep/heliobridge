@@ -44,6 +44,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json",
 rustls = { version = "0.23", features = ["tls12"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2.2"
+# Trust anchors for the cloud relay. The device verifies nothing; this program is a proper client and
+# has no reason to be as lax.
+webpki-roots = "1.0.9"
 # Certificate generation. RSA rather than the default ECDSA: the device is known to accept an
 # RSA-2048 self-signed certificate with CN `*.growatt.com`, and matching what is known to work
 # keeps TLS from being a variable when something else goes wrong.

@@ -51,6 +51,24 @@ impl fmt::Display for Raw {
     }
 }
 
+/// Hex-encodes a byte slice when it is formatted, and not before.
+///
+/// A newtype with a [`fmt::Display`] impl rather than a function returning `String`, because the
+/// difference matters here: passed as `%Hex(frame)` inside a `trace!`, no encoding happens at all unless
+/// the level is enabled. Frames are 585 octets and arrive every five seconds, so eagerly formatting a
+/// dump that is usually discarded is not free.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct Hex<'a>(pub &'a [u8]);
+
+impl fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// A wall-clock time, as a device reports it or as a server sends one.
 ///
 /// Deliberately not a date-time type from a calendar crate. On the way in these are six octets from an
@@ -88,6 +106,30 @@ impl Timestamp {
             && self.hour < 24
             && self.minute < 60
             && self.second < 60
+    }
+
+    /// Seconds by which `self` is ahead of `other`, treating both as the same timezone.
+    ///
+    /// Deliberately crude: a calendar-correct difference would need a date library, and the only question
+    /// asked of it is "are these roughly the same moment". `None` when either side is implausible, or
+    /// when the two fall on different dates — in which case the answer is "very far apart" rather than a
+    /// number worth computing.
+    pub const fn skew_from(self, other: Self) -> Option<i64> {
+        if !self.is_plausible() || !other.is_plausible() {
+            return None;
+        }
+        if self.year != other.year || self.month != other.month || self.day != other.day {
+            return None;
+        }
+        Some(self.seconds_into_day().saturating_sub(other.seconds_into_day()))
+    }
+
+    /// Seconds elapsed since midnight.
+    const fn seconds_into_day(self) -> i64 {
+        (self.hour as i64)
+            .saturating_mul(3600)
+            .saturating_add((self.minute as i64).saturating_mul(60))
+            .saturating_add(self.second as i64)
     }
 }
 
@@ -364,5 +406,30 @@ mod tests {
     fn time_of_day_formats_with_leading_zeros() {
         let value = Value::TimeOfDay { hour: 7, minute: 5 };
         assert_eq!(value.to_string(), "07:05");
+    }
+
+    #[test]
+    fn hex_pads_each_octet_to_two_digits() {
+        use super::Hex;
+        assert_eq!(Hex(&[0x00, 0x0F, 0xA5, 0xFF]).to_string(), "000fa5ff");
+        assert_eq!(Hex(&[]).to_string(), "");
+    }
+
+    #[test]
+    fn timestamps_report_their_own_plausibility_and_skew() {
+        let base = super::Timestamp {
+            year: 2026,
+            month: 8,
+            day: 8,
+            hour: 12,
+            minute: 0,
+            second: 0,
+        };
+        assert!(base.is_plausible());
+        assert_eq!(base.to_string(), "2026-08-08 12:00:00");
+
+        let later = super::Timestamp { second: 30, ..base };
+        assert_eq!(later.skew_from(base), Some(30));
+        assert_eq!(base.skew_from(later), Some(-30));
     }
 }

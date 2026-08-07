@@ -217,17 +217,18 @@ impl Packet {
     /// [`CodecError`] if the octets present are malformed or describe a packet type outside MQTT 3.1.1.
     /// A decode error is fatal for a connection: once framing is lost there is no resynchronising.
     pub fn decode(buf: &[u8]) -> Result<Option<(Self, usize)>, CodecError> {
-        let Some(first) = buf.first().copied() else {
+        let mut header = Reader::new(buf);
+        let Some(first) = header.u8() else {
             return Ok(None);
         };
         let kind = first >> 4;
         let flags = first & 0x0F;
 
-        let Some((remaining, varint_len)) = decode_varint(buf.get(1..).unwrap_or_default())? else {
+        let Some(remaining) = header.varint()? else {
             return Ok(None);
         };
 
-        let header_len = 1usize.saturating_add(varint_len);
+        let header_len = header.position();
         let total = header_len.saturating_add(remaining);
         if buf.len() < total {
             return Ok(None);
@@ -235,14 +236,14 @@ impl Packet {
         let body = buf.get(header_len..total).unwrap_or_default();
 
         let packet_id_of = |kind: &'static str| {
-            read_u16(body, 0).ok_or(CodecError::Truncated {
+            Reader::new(body).u16().ok_or(CodecError::Truncated {
                 kind,
                 field: "packet identifier",
             })
         };
 
         let packet = match kind {
-            1 => Self::Connect(decode_connect(body)?),
+            1 => Self::Connect(Connect::decode(body)?),
             2 => Self::ConnAck {
                 session_present: body.first().copied().unwrap_or(0) & 0x01 != 0,
                 code: body.get(1).copied().ok_or(CodecError::Truncated {
@@ -250,11 +251,11 @@ impl Packet {
                     field: "return code",
                 })?,
             },
-            3 => Self::Publish(decode_publish(body, flags)?),
+            3 => Self::Publish(Publish::decode(body, flags)?),
             4 => Self::PubAck {
                 packet_id: packet_id_of("PUBACK")?,
             },
-            8 => Self::Subscribe(decode_subscribe(body)?),
+            8 => Self::Subscribe(Subscribe::decode(body)?),
             9 => Self::SubAck {
                 packet_id: packet_id_of("SUBACK")?,
                 granted: body.get(2..).unwrap_or_default().to_vec(),
@@ -310,206 +311,221 @@ impl Packet {
 
             Self::PingResp => (0xD0, Vec::new()),
 
-            Self::Publish(publish) => {
-                let mut first = 0x30 | (publish.qos.bits() << 1);
-                if publish.retain {
-                    first |= 0x01;
-                }
-                if publish.dup {
-                    first |= 0x08;
-                }
-                let mut body = Vec::new();
-                write_string(&mut body, &publish.topic);
-                if publish.qos != QoS::AtMostOnce {
-                    body.extend_from_slice(&publish.packet_id.unwrap_or(1).to_be_bytes());
-                }
-                body.extend_from_slice(&publish.payload);
-                (first, body)
-            }
+            Self::Publish(publish) => (0x30 | publish.flags(), publish.encode_body()),
 
             Self::Disconnect => (0xE0, Vec::new()),
             Self::PingReq => (0xC0, Vec::new()),
 
-            // Device-to-server packets. Encoding one would mean this program is impersonating the
-            // device, which it never does.
-            Self::Connect(_) | Self::Subscribe(_) => {
-                return Err(CodecError::UnsupportedType { kind: 0 });
-            }
+            // Device-to-server packets. Encoded only by the cloud relay, which connects upstream *as*
+            // the device — that is the whole point of a relay, and the cloud is a third party that may
+            // care about the details, so they are reproduced exactly rather than approximated.
+            Self::Connect(connect) => (0x10, connect.encode_body()),
+
+            // Bit 1 of the flags nibble is mandatory for SUBSCRIBE.
+            Self::Subscribe(subscribe) => (0x82, subscribe.encode_body()),
         };
 
         if body.len() > MAX_REMAINING_LEN {
             return Err(CodecError::TooLong { len: body.len() });
         }
 
-        let mut out = Vec::with_capacity(body.len().saturating_add(5));
-        out.push(first_octet);
-        write_varint(&mut out, body.len());
-        out.extend_from_slice(&body);
-        Ok(out)
+        let mut out = Writer::new();
+        out.u8(first_octet);
+        out.varint(body.len());
+        out.raw(&body);
+        Ok(out.finish())
     }
 }
 
-// --- decoding helpers -----------------------------------------------------------------------------
-
-fn decode_connect(body: &[u8]) -> Result<Connect, CodecError> {
-    let mut reader = Reader::new(body);
-    let name = reader.string().ok_or(CodecError::Truncated {
-        kind: "CONNECT",
-        field: "protocol name",
-    })?;
-    let name = core::str::from_utf8(name).map_err(|_| CodecError::NotUtf8 { field: "protocol name" })?;
-    if name != PROTOCOL_NAME {
-        // Not fatal to decode, but the session layer refuses it. Recorded rather than rejected here so
-        // the log can say what was actually offered.
-        tracing::warn!(protocol_name = name, "CONNECT carried an unexpected protocol name");
-    }
-
-    let protocol_level = reader.u8().ok_or(CodecError::Truncated {
-        kind: "CONNECT",
-        field: "protocol level",
-    })?;
-    let flags = reader.u8().ok_or(CodecError::Truncated {
-        kind: "CONNECT",
-        field: "connect flags",
-    })?;
-    let keepalive = reader.u16().ok_or(CodecError::Truncated {
-        kind: "CONNECT",
-        field: "keepalive",
-    })?;
-
-    let client_id = reader.utf8_string("client identifier")?;
-
-    let has_will = flags & 0x04 != 0;
-    if has_will {
-        // The device sets no will. Skip the fields rather than fail, so a future firmware that does
-        // set one still connects.
-        let _topic = reader.string();
-        let _message = reader.string();
-    }
-
-    let username = if flags & 0x80 == 0 {
-        None
-    } else {
-        Some(reader.utf8_string("username")?)
-    };
-
-    let password = if flags & 0x40 == 0 {
-        None
-    } else {
-        Some(
-            reader
-                .string()
-                .ok_or(CodecError::Truncated {
-                    kind: "CONNECT",
-                    field: "password",
-                })?
-                .to_vec(),
-        )
-    };
-
-    Ok(Connect {
-        protocol_level,
-        client_id,
-        username,
-        password,
-        keepalive,
-        clean_session: flags & 0x02 != 0,
-    })
-}
-
-fn decode_publish(body: &[u8], flags: u8) -> Result<Publish, CodecError> {
-    let qos = QoS::from_bits((flags >> 1) & 0x03)?;
-    let mut reader = Reader::new(body);
-    let topic = reader.utf8_string("topic")?;
-
-    let packet_id = if qos == QoS::AtMostOnce {
-        None
-    } else {
-        Some(reader.u16().ok_or(CodecError::Truncated {
-            kind: "PUBLISH",
-            field: "packet identifier",
-        })?)
-    };
-
-    Ok(Publish {
-        topic,
-        qos,
-        retain: flags & 0x01 != 0,
-        dup: flags & 0x08 != 0,
-        packet_id,
-        payload: reader.rest().to_vec(),
-    })
-}
-
-fn decode_subscribe(body: &[u8]) -> Result<Subscribe, CodecError> {
-    let mut reader = Reader::new(body);
-    let packet_id = reader.u16().ok_or(CodecError::Truncated {
-        kind: "SUBSCRIBE",
-        field: "packet identifier",
-    })?;
-
-    let mut filters = Vec::new();
-    while reader.remaining() > 0 {
-        let filter = reader.utf8_string("topic filter")?;
-        let qos = reader.u8().ok_or(CodecError::Truncated {
-            kind: "SUBSCRIBE",
-            field: "requested QoS",
+impl Connect {
+    /// Decode from a CONNECT body, i.e. the octets after the fixed header.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`] or [`CodecError::NotUtf8`], naming the field that failed.
+    pub fn decode(body: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(body);
+        let name = reader.string().ok_or(CodecError::Truncated {
+            kind: "CONNECT",
+            field: "protocol name",
         })?;
-        filters.push((filter, qos));
-    }
+        let name = core::str::from_utf8(name).map_err(|_| CodecError::NotUtf8 { field: "protocol name" })?;
+        if name != PROTOCOL_NAME {
+            // Not fatal to decode, but the session layer refuses it. Recorded rather than rejected here
+            // so the log can say what was actually offered.
+            tracing::warn!(protocol_name = name, "CONNECT carried an unexpected protocol name");
+        }
 
-    Ok(Subscribe { packet_id, filters })
-}
+        let protocol_level = reader.u8().ok_or(CodecError::Truncated {
+            kind: "CONNECT",
+            field: "protocol level",
+        })?;
+        let flags = reader.u8().ok_or(CodecError::Truncated {
+            kind: "CONNECT",
+            field: "connect flags",
+        })?;
+        let keepalive = reader.u16().ok_or(CodecError::Truncated {
+            kind: "CONNECT",
+            field: "keepalive",
+        })?;
 
-/// Decode a remaining-length varint, returning the value and how many octets it used.
-fn decode_varint(buf: &[u8]) -> Result<Option<(usize, usize)>, CodecError> {
-    let mut value = 0usize;
-    let mut multiplier = 1usize;
+        let client_id = reader.utf8_string("client identifier")?;
 
-    for index in 0..4usize {
-        let Some(octet) = buf.get(index).copied() else {
-            return Ok(None);
+        if flags & 0x04 != 0 {
+            // The device sets no will. Skip the fields rather than fail, so a future firmware that does
+            // set one still connects. The reads are for their side effect on the cursor.
+            let _will_topic = reader.string();
+            let _will_message = reader.string();
+        }
+
+        let username = if flags & 0x80 == 0 {
+            None
+        } else {
+            Some(reader.utf8_string("username")?)
         };
-        value = value.saturating_add(usize::from(octet & 0x7F).saturating_mul(multiplier));
-        if octet & 0x80 == 0 {
-            return Ok(Some((value, index.saturating_add(1))));
-        }
-        multiplier = multiplier.saturating_mul(128);
+
+        let password = if flags & 0x40 == 0 {
+            None
+        } else {
+            Some(
+                reader
+                    .string()
+                    .ok_or(CodecError::Truncated {
+                        kind: "CONNECT",
+                        field: "password",
+                    })?
+                    .to_vec(),
+            )
+        };
+
+        Ok(Self {
+            protocol_level,
+            client_id,
+            username,
+            password,
+            keepalive,
+            clean_session: flags & 0x02 != 0,
+        })
     }
 
-    Err(CodecError::MalformedLength)
-}
+    /// Encode the body, without the fixed header.
+    fn encode_body(&self) -> Vec<u8> {
+        let mut flags = 0x00u8;
+        if self.username.is_some() {
+            flags |= 0x80;
+        }
+        if self.password.is_some() {
+            flags |= 0x40;
+        }
+        if self.clean_session {
+            flags |= 0x02;
+        }
 
-/// Append a remaining-length varint.
-///
-/// Visible to the crate so the session tests can build device packets by hand.
-pub(crate) fn write_varint(out: &mut Vec<u8>, mut value: usize) {
-    loop {
-        let mut octet = u8::try_from(value % 128).unwrap_or(0);
-        value /= 128;
-        if value > 0 {
-            octet |= 0x80;
+        let mut writer = Writer::new();
+        writer.string(PROTOCOL_NAME);
+        writer.u8(self.protocol_level);
+        writer.u8(flags);
+        writer.u16(self.keepalive);
+        writer.string(&self.client_id);
+        if let Some(username) = self.username.as_deref() {
+            writer.string(username);
         }
-        out.push(octet);
-        if value == 0 {
-            break;
+        if let Some(password) = self.password.as_deref() {
+            writer.bytes(password);
         }
+        writer.finish()
     }
 }
 
-/// Append a length-prefixed UTF-8 string.
-fn write_string(out: &mut Vec<u8>, value: &str) {
-    let len = u16::try_from(value.len()).unwrap_or(u16::MAX);
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(value.as_bytes());
+impl Publish {
+    /// Decode from a PUBLISH body and the flags nibble of its fixed header.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::UnsupportedQoS`] for QoS 2, or [`CodecError::Truncated`] / [`CodecError::NotUtf8`].
+    pub fn decode(body: &[u8], flags: u8) -> Result<Self, CodecError> {
+        let qos = QoS::from_bits((flags >> 1) & 0x03)?;
+        let mut reader = Reader::new(body);
+        let topic = reader.utf8_string("topic")?;
+
+        let packet_id = if qos == QoS::AtMostOnce {
+            None
+        } else {
+            Some(reader.u16().ok_or(CodecError::Truncated {
+                kind: "PUBLISH",
+                field: "packet identifier",
+            })?)
+        };
+
+        Ok(Self {
+            topic,
+            qos,
+            retain: flags & 0x01 != 0,
+            dup: flags & 0x08 != 0,
+            packet_id,
+            payload: reader.rest().to_vec(),
+        })
+    }
+
+    /// The flags nibble this publish needs in its fixed header.
+    const fn flags(&self) -> u8 {
+        let mut flags = self.qos.bits() << 1;
+        if self.retain {
+            flags |= 0x01;
+        }
+        if self.dup {
+            flags |= 0x08;
+        }
+        flags
+    }
+
+    /// Encode the body, without the fixed header.
+    fn encode_body(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.string(&self.topic);
+        if self.qos != QoS::AtMostOnce {
+            writer.u16(self.packet_id.unwrap_or(1));
+        }
+        writer.raw(&self.payload);
+        writer.finish()
+    }
 }
 
-/// Read a big-endian `u16` at an offset.
-fn read_u16(buf: &[u8], offset: usize) -> Option<u16> {
-    let end = offset.checked_add(2)?;
-    match *buf.get(offset..end)? {
-        [hi, lo] => Some(u16::from_be_bytes([hi, lo])),
-        _ => None,
+impl Subscribe {
+    /// Decode from a SUBSCRIBE body.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`] or [`CodecError::NotUtf8`], naming the field that failed.
+    pub fn decode(body: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(body);
+        let packet_id = reader.u16().ok_or(CodecError::Truncated {
+            kind: "SUBSCRIBE",
+            field: "packet identifier",
+        })?;
+
+        let mut filters = Vec::new();
+        while reader.remaining() > 0 {
+            let filter = reader.utf8_string("topic filter")?;
+            let qos = reader.u8().ok_or(CodecError::Truncated {
+                kind: "SUBSCRIBE",
+                field: "requested QoS",
+            })?;
+            filters.push((filter, qos));
+        }
+
+        Ok(Self { packet_id, filters })
+    }
+
+    /// Encode the body, without the fixed header.
+    fn encode_body(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.u16(self.packet_id);
+        for (filter, qos) in &self.filters {
+            writer.string(filter);
+            writer.u8(*qos);
+        }
+        writer.finish()
     }
 }
 
@@ -531,17 +547,20 @@ impl<'a> Reader<'a> {
     }
 
     fn u16(&mut self) -> Option<u16> {
-        let value = read_u16(self.buf, self.pos)?;
-        self.pos = self.pos.saturating_add(2);
+        let end = self.pos.checked_add(2)?;
+        let value = match *self.buf.get(self.pos..end)? {
+            [hi, lo] => u16::from_be_bytes([hi, lo]),
+            _ => return None,
+        };
+        self.pos = end;
         Some(value)
     }
 
     /// A length-prefixed byte string.
     fn string(&mut self) -> Option<&'a [u8]> {
-        let len = usize::from(read_u16(self.buf, self.pos)?);
-        let start = self.pos.saturating_add(2);
-        let end = start.checked_add(len)?;
-        let value = self.buf.get(start..end)?;
+        let len = usize::from(self.u16()?);
+        let end = self.pos.checked_add(len)?;
+        let value = self.buf.get(self.pos..end)?;
         self.pos = end;
         Some(value)
     }
@@ -561,11 +580,233 @@ impl<'a> Reader<'a> {
     const fn remaining(&self) -> usize {
         self.buf.len().saturating_sub(self.pos)
     }
+
+    /// A remaining-length varint.
+    ///
+    /// `Ok(None)` means the octets present are a valid prefix but the varint is incomplete — the normal
+    /// case at the head of a stream.
+    fn varint(&mut self) -> Result<Option<usize>, CodecError> {
+        let mut value = 0usize;
+        let mut multiplier = 1usize;
+
+        for _ in 0..4u8 {
+            let Some(octet) = self.u8() else {
+                return Ok(None);
+            };
+            value = value.saturating_add(usize::from(octet & 0x7F).saturating_mul(multiplier));
+            if octet & 0x80 == 0 {
+                return Ok(Some(value));
+            }
+            multiplier = multiplier.saturating_mul(128);
+        }
+
+        Err(CodecError::MalformedLength)
+    }
+
+    /// How many octets have been consumed.
+    const fn position(&self) -> usize {
+        self.pos
+    }
+}
+
+/// The counterpart to [`Reader`]: accumulates the octets of a packet.
+///
+/// Exists so that encoding reads as the mirror of decoding, and so the length-prefix rule lives in one
+/// place instead of at each call site.
+struct Writer {
+    buf: Vec<u8>,
+}
+
+impl Writer {
+    const fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.buf.push(value);
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.buf.extend_from_slice(&value.to_be_bytes());
+    }
+
+    /// A length-prefixed UTF-8 string.
+    fn string(&mut self, value: &str) {
+        self.bytes(value.as_bytes());
+    }
+
+    /// A length-prefixed byte string.
+    ///
+    /// The CONNECT password is a binary field in MQTT 3.1.1, even though this device sends ASCII in it.
+    fn bytes(&mut self, value: &[u8]) {
+        self.u16(u16::try_from(value.len()).unwrap_or(u16::MAX));
+        self.raw(value);
+    }
+
+    /// Octets with no length prefix, e.g. a publish payload.
+    fn raw(&mut self, value: &[u8]) {
+        self.buf.extend_from_slice(value);
+    }
+
+    /// A remaining-length varint.
+    fn varint(&mut self, mut value: usize) {
+        loop {
+            let mut octet = u8::try_from(value % 128).unwrap_or(0);
+            value /= 128;
+            if value > 0 {
+                octet |= 0x80;
+            }
+            self.buf.push(octet);
+            if value == 0 {
+                return;
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+/// A stream framed into MQTT packets.
+///
+/// Owns the read buffer, which is what turns a pair of free functions taking `(&mut stream, &mut buf)`
+/// into two methods. Both directions of the program use it: the device-facing session and the cloud
+/// relay had the same loop before this existed.
+///
+/// Generic over the transport, so the whole thing can be driven over an in-memory duplex with no TLS
+/// and no sockets.
+#[derive(Debug)]
+pub struct PacketStream<S> {
+    stream: S,
+    buf: Vec<u8>,
+    limit: usize,
+}
+
+/// Why a framed read or write failed.
+#[derive(Debug, thiserror::Error)]
+pub enum StreamError {
+    /// The transport failed.
+    #[error("stream i/o failed: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// The octets are not a valid packet. Fatal: framing cannot be resynchronised on a stream.
+    #[error("{0}")]
+    Codec(#[from] CodecError),
+
+    /// The peer announced more octets than this stream will buffer.
+    #[error("peer announced a {len}-octet packet, above the {limit}-octet limit")]
+    TooLarge {
+        /// Octets buffered so far.
+        len: usize,
+        /// The configured limit.
+        limit: usize,
+    },
+}
+
+impl<S> PacketStream<S> {
+    /// Wrap a transport, buffering at most `limit` octets for one packet.
+    pub fn new(stream: S, limit: usize) -> Self {
+        Self {
+            stream,
+            buf: Vec::with_capacity(1024),
+            limit,
+        }
+    }
+
+    /// The wrapped transport.
+    pub const fn get_ref(&self) -> &S {
+        &self.stream
+    }
+}
+
+impl<S> PacketStream<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    /// Read the next whole packet, or `None` when the peer closes.
+    ///
+    /// Cancel-safe: partial octets stay buffered, so this can sit in a `select!` arm that loses.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError`] on transport failure, a malformed packet, or one above the size limit.
+    pub async fn next_packet(&mut self) -> Result<Option<Packet>, StreamError> {
+        use tokio::io::AsyncReadExt as _;
+
+        loop {
+            if let Some((packet, used)) = Packet::decode(&self.buf)? {
+                self.buf.drain(..used);
+                return Ok(Some(packet));
+            }
+
+            if self.buf.len() > self.limit {
+                return Err(StreamError::TooLarge {
+                    len: self.buf.len(),
+                    limit: self.limit,
+                });
+            }
+
+            let mut chunk = [0u8; 4096];
+            let read = self.stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Ok(None);
+            }
+            self.buf.extend_from_slice(chunk.get(..read).unwrap_or_default());
+        }
+    }
+
+    /// Read the next packet, refusing the three server-to-device types.
+    ///
+    /// For the device-facing side, where a device sending CONNACK is either broken or not the device.
+    ///
+    /// # Errors
+    ///
+    /// As [`PacketStream::next_packet`], plus a codec error for a server-to-device packet.
+    pub async fn next_packet_from_device(&mut self) -> Result<Option<Packet>, StreamError> {
+        use tokio::io::AsyncReadExt as _;
+
+        loop {
+            if let Some((packet, used)) = Packet::decode_from_device(&self.buf)? {
+                self.buf.drain(..used);
+                return Ok(Some(packet));
+            }
+
+            if self.buf.len() > self.limit {
+                return Err(StreamError::TooLarge {
+                    len: self.buf.len(),
+                    limit: self.limit,
+                });
+            }
+
+            let mut chunk = [0u8; 4096];
+            let read = self.stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Ok(None);
+            }
+            self.buf.extend_from_slice(chunk.get(..read).unwrap_or_default());
+        }
+    }
+
+    /// Write one packet and flush it.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError`] if the packet cannot be encoded or the transport fails.
+    pub async fn send(&mut self, packet: &Packet) -> Result<(), StreamError> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let wire = packet.encode()?;
+        tracing::trace!(kind = packet.kind(), len = wire.len(), "sending");
+        self.stream.write_all(&wire).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CodecError, Connect, Packet, Publish, QoS, Subscribe, decode_varint, write_varint};
+    use super::{CodecError, Connect, Packet, PacketStream, Publish, QoS, Reader, Subscribe, Writer};
 
     const SERIAL: &str = "0EXAMPLE00000001";
 
@@ -575,6 +816,18 @@ mod tests {
     /// with `try_from` rather than `as` keeps the truncating-cast lint meaningful everywhere else.
     fn len16(value: &str) -> u16 {
         u16::try_from(value.len()).expect("test strings are short")
+    }
+
+    /// Wrap a hand-built body in a fixed header.
+    ///
+    /// These tests build bodies by hand on purpose: they are the reference octets the encoder is checked
+    /// against, so going through the encoder to produce them would be checking it against itself.
+    fn framed(first_octet: u8, body: &[u8]) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.u8(first_octet);
+        writer.varint(body.len());
+        writer.raw(body);
+        writer.finish()
     }
 
     /// A CONNECT exactly as the device sends it: flags 0xC0, keepalive 420, password `Growatt`.
@@ -591,11 +844,7 @@ mod tests {
         body.extend_from_slice(SERIAL.as_bytes());
         body.extend_from_slice(&7u16.to_be_bytes());
         body.extend_from_slice(b"Growatt");
-
-        let mut packet = vec![0x10];
-        write_varint(&mut packet, body.len());
-        packet.extend_from_slice(&body);
-        packet
+        framed(0x10, &body)
     }
 
     #[test]
@@ -646,9 +895,7 @@ mod tests {
         body.extend_from_slice(topic.as_bytes());
         body.extend_from_slice(&7u16.to_be_bytes());
         body.extend_from_slice(&payload);
-        let mut wire = vec![0x32]; // PUBLISH, QoS 1
-        write_varint(&mut wire, body.len());
-        wire.extend_from_slice(&body);
+        let wire = framed(0x32, &body); // PUBLISH, QoS 1
 
         let (packet, used) = Packet::decode(&wire).expect("decode").expect("complete");
         assert_eq!(used, wire.len());
@@ -679,9 +926,7 @@ mod tests {
         body.extend_from_slice(&len16(&filter).to_be_bytes());
         body.extend_from_slice(filter.as_bytes());
         body.push(0x01); // requested QoS 1
-        let mut wire = vec![0x82];
-        write_varint(&mut wire, body.len());
-        wire.extend_from_slice(&body);
+        let wire = framed(0x82, &body);
 
         let (packet, _) = Packet::decode(&wire).expect("decode").expect("complete");
         match packet {
@@ -804,6 +1049,39 @@ mod tests {
     }
 
     #[test]
+    fn the_device_connect_survives_a_re_encode_byte_for_byte() {
+        // What the relay depends on: decode the device's CONNECT, encode it again for the cloud, and get
+        // the same octets. Anything less means the cloud sees a subtly different client than the device.
+        let original = device_connect();
+        let (packet, used) = Packet::decode(&original).expect("decode").expect("complete");
+        assert_eq!(used, original.len());
+        assert_eq!(packet.encode().expect("re-encode"), original);
+    }
+
+    #[test]
+    fn a_re_encoded_connect_keeps_the_flags_the_device_set() {
+        let (packet, _) = Packet::decode(&device_connect()).expect("d").expect("complete");
+        let wire = packet.encode().expect("encode");
+        // Flags octet sits after the protocol name and level: 2 + 4 + 1.
+        let flags = wire.get(2 + 2 + 4 + 1).copied().expect("flags octet");
+        assert_eq!(flags, 0xC0, "username and password set, clean session not");
+        assert_eq!(flags & 0x02, 0, "clean session must stay unset");
+    }
+
+    #[test]
+    fn subscribe_round_trips() {
+        let original = Subscribe {
+            packet_id: 1,
+            filters: vec![(format!("s/33/{SERIAL}"), 1), (format!("s/{SERIAL}"), 1)],
+        };
+        let wire = Packet::Subscribe(original.clone()).encode().expect("encode");
+        assert_eq!(wire.first(), Some(&0x82), "SUBSCRIBE needs flags 0x02");
+        let (decoded, used) = Packet::decode(&wire).expect("decode").expect("complete");
+        assert_eq!(used, wire.len());
+        assert_eq!(decoded, Packet::Subscribe(original));
+    }
+
+    #[test]
     fn server_replies_round_trip_through_the_general_decoder() {
         for original in [
             Packet::ConnAck {
@@ -838,9 +1116,7 @@ mod tests {
     #[test]
     fn qos_two_is_refused() {
         // 0x34 is PUBLISH with QoS 2.
-        let mut wire = vec![0x34];
-        write_varint(&mut wire, 5);
-        wire.extend_from_slice(&[0x00, 0x01, b'x', 0x00, 0x01]);
+        let wire = framed(0x34, &[0x00, 0x01, b'x', 0x00, 0x01]);
         assert!(matches!(
             Packet::decode(&wire),
             Err(CodecError::UnsupportedQoS { qos: 2 })
@@ -850,20 +1126,28 @@ mod tests {
     #[test]
     fn varints_round_trip_across_their_boundaries() {
         for value in [0usize, 1, 127, 128, 16_383, 16_384, 2_097_151, 2_097_152] {
-            let mut out = Vec::new();
-            write_varint(&mut out, value);
-            let (decoded, len) = decode_varint(&out).expect("decode").expect("complete");
+            let mut writer = Writer::new();
+            writer.varint(value);
+            let out = writer.finish();
+
+            let mut reader = Reader::new(&out);
+            let decoded = reader.varint().expect("decode").expect("complete");
             assert_eq!(decoded, value, "value {value}");
-            assert_eq!(len, out.len(), "value {value}");
+            assert_eq!(reader.position(), out.len(), "value {value}");
         }
     }
 
     #[test]
+    fn an_incomplete_varint_asks_for_more() {
+        // A continuation bit with nothing after it is a prefix, not a malformed packet.
+        let mut reader = Reader::new(&[0x80]);
+        assert_eq!(reader.varint().expect("no error"), None);
+    }
+
+    #[test]
     fn an_overlong_varint_is_rejected() {
-        assert_eq!(
-            decode_varint(&[0xFF, 0xFF, 0xFF, 0xFF, 0x7F]),
-            Err(CodecError::MalformedLength)
-        );
+        let mut reader = Reader::new(&[0xFF, 0xFF, 0xFF, 0xFF, 0x7F]);
+        assert_eq!(reader.varint(), Err(CodecError::MalformedLength));
     }
 
     #[test]
@@ -876,9 +1160,7 @@ mod tests {
         body.extend_from_slice(topic.as_bytes());
         body.extend_from_slice(&1u16.to_be_bytes());
         body.extend_from_slice(&[0x5A; 585]);
-        let mut wire = vec![0x32];
-        write_varint(&mut wire, body.len());
-        wire.extend_from_slice(&body);
+        let wire = framed(0x32, &body);
 
         assert!(body.len() > 127, "the length must need two octets");
         let (packet, used) = Packet::decode(&wire).expect("decode").expect("complete");
@@ -887,6 +1169,72 @@ mod tests {
             Packet::Publish(p) => assert_eq!(p.payload.len(), 585),
             other => panic!("expected PUBLISH, got {}", other.kind()),
         }
+    }
+
+    #[tokio::test]
+    async fn a_packet_stream_frames_across_read_boundaries() {
+        use tokio::io::AsyncWriteExt as _;
+
+        // The case that breaks a naive reader: several packets arriving in one read, and one packet
+        // split across two.
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut wire = Packet::PingReq.encode().expect("encode");
+        wire.extend_from_slice(&Packet::PubAck { packet_id: 5 }.encode().expect("encode"));
+        let big = Packet::Publish(Publish {
+            topic: format!("c/33/{SERIAL}"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            dup: false,
+            packet_id: Some(9),
+            payload: vec![0x5A; 585],
+        })
+        .encode()
+        .expect("encode");
+
+        let split = big.len().wrapping_div(2);
+        client.write_all(&wire).await.expect("write");
+        client
+            .write_all(big.get(..split).expect("head"))
+            .await
+            .expect("write head");
+
+        let mut stream = PacketStream::new(server, 64 * 1024);
+        assert_eq!(stream.next_packet().await.expect("read"), Some(Packet::PingReq));
+        assert_eq!(
+            stream.next_packet().await.expect("read"),
+            Some(Packet::PubAck { packet_id: 5 })
+        );
+
+        // The third packet is incomplete; finish it and the same call resolves.
+        client
+            .write_all(big.get(split..).expect("tail"))
+            .await
+            .expect("write tail");
+        match stream.next_packet().await.expect("read") {
+            Some(Packet::Publish(publish)) => assert_eq!(publish.payload.len(), 585),
+            other => panic!("expected PUBLISH, got {other:?}"),
+        }
+
+        // Closing the far end reports end of stream rather than an error.
+        drop(client);
+        assert_eq!(stream.next_packet().await.expect("read"), None);
+    }
+
+    #[tokio::test]
+    async fn a_packet_stream_refuses_server_packets_from_a_device() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let connack = Packet::ConnAck {
+            session_present: false,
+            code: 0,
+        }
+        .encode()
+        .expect("encode");
+        client.write_all(&connack).await.expect("write");
+
+        let mut stream = PacketStream::new(server, 4096);
+        assert!(stream.next_packet_from_device().await.is_err());
     }
 
     #[test]

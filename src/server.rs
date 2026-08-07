@@ -12,20 +12,20 @@
 //! Home Assistant, and the optional relay to the vendor cloud — belongs to a future `bridge` module and
 //! uses a client library rather than this code.
 //!
-//! - [`mqtt`] — MQTT 3.1.1 packet codec, the subset the device uses.
 //! - [`session`] — the per-connection state machine.
 //! - [`listener`] — accept loop, one session per connection.
 //! - [`tls`] — server TLS, including first-run certificate generation.
 //! - [`clock`] — wall-clock time for the server time push, and the skew check that goes with it.
+//!
+//! The MQTT packet codec lives in [`crate::mqtt`], not here: the vendor cloud client speaks the same
+//! protocol, and a codec owned by one of its two users would be in the wrong place.
 
 pub mod clock;
 pub mod listener;
-pub mod mqtt;
 pub mod session;
 pub mod tls;
 
 pub use clock::Clock;
 pub use listener::{ListenerError, SessionOptions, serve};
-pub use mqtt::{CodecError, Packet, QoS};
 pub use session::{Session, SessionError, SessionStats};
 pub use tls::{CertificateOrigin, TlsError, server_config};
