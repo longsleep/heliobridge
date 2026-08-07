@@ -7,18 +7,24 @@
 //!
 //! # Status
 //!
-//! Version 0.0.1 is a placeholder: the wire protocol has been reverse engineered and specified,
-//! but no implementation is published yet. Nothing here is usable, and the API will change without
-//! regard for compatibility until 0.1.0.
+//! Early. The wire protocol is reverse engineered and specified, and the offline codec is
+//! implemented; none of the networking exists yet. The API will change without regard for
+//! compatibility until 0.1.0.
 //!
-//! # Planned layout
+//! # Layout
 //!
-//! - `mqtt` — the MQTT server the device connects to, and its packet codec.
-//! - `growatt` — pure protocol: framing, obfuscation, CRC, registers. No I/O, no MQTT types.
-//! - `bridge` — what connects the two: cached state, Home Assistant, optional cloud relay.
-//! - `config` — environment-variable configuration, all of it prefixed `HELIOBRIDGE_`.
+//! - [`model`] — vendor-neutral data model: register and value newtypes, units, scaling, readings.
+//! - [`growatt`] — the Growatt protocol family, with a module per protocol generation. Pure
+//!   `bytes → values`, no I/O and no MQTT types.
+//!
+//! Still to come: `mqtt` (the MQTT server the device connects to, and its packet codec), `bridge`
+//! (cached state, Home Assistant, optional cloud relay) and `config` (environment configuration,
+//! all of it prefixed `HELIOBRIDGE_`).
 //!
 //! Module paths double as tracing targets, so that layout is also the logging control surface.
+
+pub mod growatt;
+pub mod model;
 
 /// The crate version, as published.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

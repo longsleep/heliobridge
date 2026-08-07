@@ -19,8 +19,11 @@ path = "src/lib.rs"
 # is a second directory next to it — no Cargo.toml change needed.
 
 [dependencies]
-# Intentionally empty at 0.0.1. The dependency set is chosen and version-checked
-# in the implementation plan; it lands with the code that needs it.
+# Step 1 is the offline codec, so only what the codec needs. The networking and
+# Home Assistant crates land with the code that uses them.
+crc = "3.4"        # CRC_16_MODBUS predefined; hand-rolling this is a known trap
+snafu = "0.9.2"    # errors that cross a module boundary, with typed context
+thiserror = "2.0"  # leaf error types
 
 [profile.release]
 lto = "thin"
@@ -82,6 +85,12 @@ cast_lossless = "warn"
 integer_division = "warn"
 float_cmp = "deny"
 lossy_float_literal = "warn"
+
+# --- Not actionable here ---
+# `snafu` and `thiserror` pull different major versions of `syn` through their proc-macro
+# dependencies. Nothing in this crate can resolve that, and the lint would otherwise fail the
+# build on a transitive fact. Revisit if the dependency tree converges.
+multiple_crate_versions = "allow"
 
 # --- Hygiene ---
 mod_module_files = "warn"  # foo.rs + foo/ , never foo/mod.rs
