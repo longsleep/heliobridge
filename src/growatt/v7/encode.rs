@@ -451,7 +451,7 @@ impl Command {
             Self::WriteSingle { .. } => MessageType::WriteSingleRegister,
             Self::WriteRange { .. } => MessageType::WriteRegisterRange,
             Self::ReadSingle { .. } => MessageType::ReadSingleRegister,
-            Self::TimePush { .. } => MessageType::TimePush,
+            Self::TimePush { .. } => MessageType::ConfigWrite,
         }
     }
 
@@ -948,7 +948,7 @@ mod tests {
         let frame = command.to_frame(SERIAL).expect("build");
         assert_eq!(frame.wire_len(), 67);
         assert_eq!(frame.header().length, 59);
-        assert_eq!(frame.message_type(), MessageType::TimePush);
+        assert_eq!(frame.message_type(), MessageType::ConfigWrite);
         assert_eq!(frame.header().address, 0xFE);
 
         let body = frame.body();

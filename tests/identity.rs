@@ -165,13 +165,15 @@ fn unrecognised_keys_are_carried_rather_than_rejected() {
 }
 
 #[test]
-fn the_restart_register_is_not_reported_by_this_device() {
+fn the_report_does_not_enumerate_every_writable_register() {
     let frame = Frame::parse(FULL_REPORT).expect("the fixture parses");
     let report = Identity::from_frame(&frame).expect("the identity report decodes");
-    assert!(
-        !report.reports(Register(32)),
-        "register 32 is absent, so a restart action keyed to it must not be offered for this model"
-    );
+
+    // Registers 32 (restart) and 35 (clear log) are absent from the report, and both were later captured
+    // being written by the vendor's own web interface. So absence here says nothing about writability, and
+    // gating an action on its register appearing would refuse a command that works.
+    assert!(!report.reports(Register(32)));
+    assert!(!report.reports(Register(35)));
 }
 
 #[test]
@@ -187,4 +189,99 @@ fn every_documented_config_register_is_either_reported_or_deliberately_absent() 
         missing.is_empty(),
         "the map documents registers this device does not report: {missing:?}"
     );
+}
+
+/// The four commands the vendor's web interface issued, captured while being refused.
+///
+/// Each is a `0x18` config write under address `0x01`, which this build classified as unrecognised until it
+/// learned that the address distinguishes the originator rather than the scope. Bytes are the deobfuscated
+/// bodies as captured; the serial they arrived with is not part of what is asserted.
+#[test]
+fn config_writes_arrive_under_either_address() {
+    use heliobridge::growatt::policy::{Direction, Intent};
+    use heliobridge::growatt::v7::frame::MessageType;
+
+    // register 32 = "1" (restart), 35 = "1" (clear log), 19 = the domain, 18 = the port.
+    let cases: [(u8, &[u8], u16, &str); 5] = [
+        (0x01, &[0x00, 0x01, 0x00, 0x05, 0x00, 0x20, 0x00, 0x01, b'1'], 32, "1"),
+        (0x01, &[0x00, 0x01, 0x00, 0x05, 0x00, 0x23, 0x00, 0x01, b'1'], 35, "1"),
+        (
+            0x01,
+            b"\x00\x01\x00\x14\x00\x13\x00\x10mqtt.growatt.com",
+            19,
+            "mqtt.growatt.com",
+        ),
+        (0x01, b"\x00\x01\x00\x08\x00\x12\x00\x047006", 18, "7006"),
+        // And the vendor's own clock push, which arrives under the other address.
+        (
+            0xFE,
+            b"\x00\x01\x00\x17\x00\x1f\x00\x132026-08-08 19:09:24",
+            31,
+            "2026-08-08 19:09:24",
+        ),
+    ];
+
+    for (address, body, register, value) in cases {
+        let wire = frame_with(address, 0x18, body);
+        let frame = Frame::parse(&wire).expect("a captured frame parses");
+        assert_eq!(
+            frame.message_type(),
+            MessageType::ConfigWrite,
+            "address {address:#04x} was not recognised as a config write"
+        );
+        assert_eq!(
+            frame.intent(Direction::ToDevice),
+            Intent::WriteConfig {
+                register: Register(register)
+            },
+            "address {address:#04x}, register {register}"
+        );
+
+        // The entry layout the specification states, on octets nobody wrote by hand.
+        let entry_len = u16::from_be_bytes([body[2], body[3]]);
+        let value_len = u16::from_be_bytes([body[6], body[7]]);
+        assert_eq!(entry_len, value_len + 4, "register {register}");
+        assert_eq!(&body[8..], value.as_bytes(), "register {register}");
+    }
+}
+
+/// Build a frame with an arbitrary address, which `Frame::new` cannot do — it derives the address from the
+/// message type, and the point here is a message type arriving under an address this program never sends.
+fn frame_with(address: u8, function: u8, body: &[u8]) -> Vec<u8> {
+    const SERIAL: &[u8] = b"0EXAMPLE00000001";
+    const KEY: &[u8; 7] = b"Growatt";
+
+    let mut plain = Vec::new();
+    plain.extend_from_slice(&1u16.to_be_bytes());
+    plain.extend_from_slice(&7u16.to_be_bytes());
+    // Length counts everything after itself except the CRC: address, function, device ID, body.
+    let length = u16::try_from(body.len().saturating_add(32)).unwrap_or(u16::MAX);
+    plain.extend_from_slice(&length.to_be_bytes());
+    plain.push(address);
+    plain.push(function);
+    plain.extend_from_slice(SERIAL);
+    plain.extend_from_slice(&[0; 14]);
+    plain.extend_from_slice(body);
+
+    // Obfuscate from offset 8, with the key phase restarting there. `zip` over a cycling key rather than an
+    // index, so there is no subtraction to get wrong and nothing to index out of range.
+    let mut wire = plain;
+    for (octet, key) in wire.iter_mut().skip(8).zip(KEY.iter().cycle()) {
+        *octet ^= *key;
+    }
+    let crc = crc16_modbus(&wire);
+    wire.extend_from_slice(&crc.to_be_bytes());
+    wire
+}
+
+/// CRC-16/MODBUS, so the hand-built frames above validate like any other.
+fn crc16_modbus(data: &[u8]) -> u16 {
+    let mut crc = 0xFFFF_u16;
+    for octet in data {
+        crc ^= u16::from(*octet);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 { (crc >> 1) ^ 0xA001 } else { crc >> 1 };
+        }
+    }
+    crc
 }

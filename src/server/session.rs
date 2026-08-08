@@ -638,7 +638,7 @@ where
                 }
             },
 
-            MessageType::SettingsSnapshot | MessageType::ExtendedTelemetry | MessageType::TimePush => {
+            MessageType::SettingsSnapshot | MessageType::ExtendedTelemetry | MessageType::ConfigWrite => {
                 self.stats.undecoded = self.stats.undecoded.saturating_add(1);
                 tracing::info!(
                     %message_type,
@@ -1715,7 +1715,12 @@ mod tests {
 
         // The payload is a real 0xFE18 frame carrying the fixed clock's time.
         let frame = Frame::parse(&push.payload).expect("the payload must be a valid frame");
-        assert_eq!(frame.message_type(), MessageType::TimePush);
+        assert_eq!(frame.message_type(), MessageType::ConfigWrite);
+        assert_eq!(
+            frame.header().address,
+            0xFE,
+            "sent under the address the vendor's clock push uses"
+        );
         assert_eq!(frame.wire_len(), 67);
         assert_eq!(frame.device_id(), SERIAL);
         let body = frame.body();

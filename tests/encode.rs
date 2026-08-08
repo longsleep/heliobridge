@@ -145,7 +145,7 @@ fn the_time_push_is_datalogger_scoped() {
     // which is what makes address+function worth reading as one message type.
     let frame = Frame::parse(TIME_PUSH).expect("parse");
     assert_eq!(frame.header().address, 0xFE);
-    assert_eq!(frame.message_type(), MessageType::TimePush);
+    assert_eq!(frame.message_type(), MessageType::ConfigWrite);
     assert_eq!(frame.message_type().as_u16(), 0xFE18);
 }
 

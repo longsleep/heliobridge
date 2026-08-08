@@ -665,7 +665,7 @@ impl ConfigRegister {
 /// Not exhaustive by construction — one device reported these, and a parser must carry an unrecognised key
 /// rather than reject the frame. Absent here does not mean absent from the protocol.
 pub const CONFIG_REGISTERS: &[ConfigRegister] = {
-    use Confidence::{Inferred, Observed, Verified};
+    use Confidence::{Observed, Verified};
     use ConfigRegister as Entry;
     use Role::{Dynamic, Endpoint, Identity, Inert, Metadata};
 
@@ -690,7 +690,9 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         Entry::new(26, "default_gateway", Inert, Observed),
         Entry::new(30, "timezone", Metadata, Verified),
         Entry::new(31, "datetime", Dynamic, Verified),
-        Entry::new(76, "wifi_signal", Dynamic, Inferred),
+        // Verified against the vendor's own web interface, which showed "Good(-72)" while this register read
+        // -72: the unit is dBm and the sign is as sent.
+        Entry::new(76, "wifi_signal", Dynamic, Verified),
     ]
 };
 

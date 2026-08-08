@@ -132,8 +132,11 @@ pub enum MessageType {
     WriteRegisterRange,
     /// `0x0150` — extended telemetry, device to server.
     ExtendedTelemetry,
-    /// `0xFE18` — server time push, server to device.
-    TimePush,
+    /// `0x18` under either address — write to a config register, server to device.
+    ///
+    /// The periodic clock push is one instance of it and arrives as `0xFE18`; commands issued from the
+    /// vendor's web interface arrive as `0x0118`.
+    ConfigWrite,
     /// `0xFE19` — datalogger identity report, device to server.
     IdentityReport,
     /// Anything else. Log it with a hex dump rather than dropping it: that is how the next unknown
@@ -156,7 +159,10 @@ impl MessageType {
             (0x01, 0x06) => Self::WriteSingleRegister,
             (0x01, 0x10) => Self::WriteRegisterRange,
             (0x01, 0x50) => Self::ExtendedTelemetry,
-            (0xFE, 0x18) => Self::TimePush,
+            // Either address. The vendor's periodic clock push arrives as 0xFE18 and every command issued
+            // from its web interface as 0x0118 — same message, same body layout, and dispatching on the pair
+            // would silently miss four of the five known config writes.
+            (_, 0x18) => Self::ConfigWrite,
             (0xFE, 0x19) => Self::IdentityReport,
             (address, function) => Self::Unrecognised { address, function },
         }
@@ -171,7 +177,11 @@ impl MessageType {
             | Self::WriteSingleRegister
             | Self::WriteRegisterRange
             | Self::ExtendedTelemetry => 0x01,
-            Self::TimePush | Self::IdentityReport => 0xFE,
+            // The address this program *sends* a config write under. Both are accepted on receipt, and a
+            // parsed frame keeps whichever octet it arrived with, since `to_wire` re-obfuscates the stored
+            // bytes rather than rebuilding the header. 0xFE is what the vendor's own clock push uses, and the
+            // byte-exactness test against it is worth keeping.
+            Self::ConfigWrite | Self::IdentityReport => 0xFE,
             Self::Unrecognised { address, .. } => address,
         }
     }
@@ -185,7 +195,7 @@ impl MessageType {
             Self::WriteSingleRegister => 0x06,
             Self::WriteRegisterRange => 0x10,
             Self::ExtendedTelemetry => 0x50,
-            Self::TimePush => 0x18,
+            Self::ConfigWrite => 0x18,
             Self::IdentityReport => 0x19,
             Self::Unrecognised { function, .. } => function,
         }
@@ -206,7 +216,7 @@ impl core::fmt::Display for MessageType {
             Self::WriteSingleRegister => "write-single",
             Self::WriteRegisterRange => "write-range",
             Self::ExtendedTelemetry => "extended-telemetry",
-            Self::TimePush => "time-push",
+            Self::ConfigWrite => "config-write",
             Self::IdentityReport => "identity",
             Self::Unrecognised { .. } => "unrecognised",
         };
@@ -592,7 +602,7 @@ mod tests {
             MessageType::WriteSingleRegister,
             MessageType::WriteRegisterRange,
             MessageType::ExtendedTelemetry,
-            MessageType::TimePush,
+            MessageType::ConfigWrite,
             MessageType::IdentityReport,
         ] {
             let parsed = MessageType::from_parts(expected.address(), expected.function());
@@ -600,6 +610,18 @@ mod tests {
         }
         assert_eq!(MessageType::Telemetry.as_u16(), 0x0104);
         assert_eq!(MessageType::IdentityReport.as_u16(), 0xFE19);
+    }
+
+    #[test]
+    fn a_config_write_is_recognised_under_either_address() {
+        // Captured from the vendor: 0xFE18 carries its periodic clock push, 0x0118 every command issued from
+        // its web interface — a datalogger restart among them. Recognising only the first left four of five
+        // known config writes unclassified, which the relay then refused for the wrong reason.
+        assert_eq!(MessageType::from_parts(0xFE, 0x18), MessageType::ConfigWrite);
+        assert_eq!(MessageType::from_parts(0x01, 0x18), MessageType::ConfigWrite);
+        // Any other address too: the octet distinguishes what originated the write, and this build has no
+        // reason to trust an enumeration of originators it has not seen.
+        assert_eq!(MessageType::from_parts(0x7F, 0x18), MessageType::ConfigWrite);
     }
 
     #[test]

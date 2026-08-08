@@ -31,7 +31,7 @@ impl Frame {
 
             // The config write carries its register inside the first TLV entry: count, entry length,
             // then the register.
-            MessageType::TimePush => match self.register_at(4) {
+            MessageType::ConfigWrite => match self.register_at(4) {
                 Some(register) => Intent::WriteConfig { register },
                 None => Intent::Unrecognised,
             },
