@@ -35,6 +35,9 @@ const COMPANION_OF_DEFAULT_OUTPUT_POWER: u16 = 321;
 /// Register carrying `default_output_power`.
 const DEFAULT_OUTPUT_POWER: u16 = 322;
 
+/// Register carrying `power_plus`, which gates the ceiling on [`DEFAULT_OUTPUT_POWER`].
+const POWER_PLUS: u16 = 325;
+
 /// Fixed prefix of the time push body, ahead of the ASCII timestamp.
 ///
 /// The trailing `00 13` is 19, the length of the string that follows. The preceding pairs are
@@ -429,6 +432,53 @@ impl Command {
             Self::ReadSingle { .. } => MessageType::ReadSingleRegister,
             Self::TimePush { .. } => MessageType::TimePush,
         }
+    }
+
+    /// Which registers should be read back after this command, and what each was asked to hold.
+    ///
+    /// A write is never self-confirming on this device: range writes are acknowledged with the register
+    /// range and nothing else, single-register writes are not acknowledged at all, and out-of-range values
+    /// are silently clamped rather than refused. So the only way to know what was stored is to ask.
+    ///
+    /// Two cases are not simply "the registers written":
+    ///
+    /// - **321 is excluded.** The composite `default_output_power` write covers it, but it has no known
+    ///   meaning, so there is nothing to compare a read against.
+    /// - **325 adds 322.** Setting `power_plus` changes `default_output_power` with no write to it —
+    ///   clearing the flag drops a stored 1000 W to 800 W on its own. Verifying only what was written would
+    ///   miss that, and a cached power value would then be wrong until something else disturbed it.
+    ///
+    /// The value is `None` where there is nothing to compare against — only something to learn.
+    pub fn registers_to_verify(&self) -> Vec<(Register, Option<Raw>)> {
+        let mut out: Vec<(Register, Option<Raw>)> = match self {
+            Self::WriteSingle { register, value } => vec![(register.register(), Some(*value))],
+
+            Self::WriteRange { start, values } => values
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, value)| {
+                    let number = start.number().checked_add(u16::try_from(offset).ok()?)?;
+                    let register = Register(number);
+                    // Only registers with a documented meaning; the rest have nothing to compare.
+                    HoldingRegister::lookup(register).map(|_| (register, Some(*value)))
+                })
+                .collect(),
+
+            // Reads and the time push change nothing.
+            Self::ReadSingle { .. } | Self::TimePush { .. } => Vec::new(),
+        };
+
+        let touches_power_plus = out.iter().any(|(register, _)| register.number() == POWER_PLUS);
+        let already_verifying_power = out
+            .iter()
+            .any(|(register, _)| register.number() == DEFAULT_OUTPUT_POWER);
+        if touches_power_plus && !already_verifying_power {
+            // What 322 ends up holding depends on what was there before as well as on the new flag, so
+            // there is no expected value — only a stale one to replace.
+            out.push((Register(DEFAULT_OUTPUT_POWER), None));
+        }
+
+        out
     }
 
     /// Whether the device acknowledges this command.

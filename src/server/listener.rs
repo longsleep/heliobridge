@@ -20,6 +20,7 @@ use snafu::{ResultExt, Snafu};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
+use crate::control::Registry;
 use crate::growatt::cloud::CloudConfig;
 use crate::record::Recorder;
 use crate::server::session::Session;
@@ -58,6 +59,9 @@ pub struct SessionOptions {
 
     /// How many schedule slots to read back at startup.
     pub slots: u16,
+
+    /// Where sessions announce themselves so the control API can address them by device.
+    pub registry: Option<Registry>,
 }
 
 impl Default for SessionOptions {
@@ -67,6 +71,7 @@ impl Default for SessionOptions {
             cloud: None,
             recorder: None,
             slots: 1,
+            registry: None,
         }
     }
 }
@@ -151,7 +156,8 @@ async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcce
         .with_time_push(options.time_push)
         .with_cloud(options.cloud)
         .with_recorder(options.recorder)
-        .with_slots(options.slots);
+        .with_slots(options.slots)
+        .with_registry(options.registry);
 
     match session.run().await {
         Ok(stats) => tracing::info!(
@@ -205,6 +211,7 @@ mod tests {
             cloud: Some(CloudConfig::default()),
             recorder: None,
             slots: 1,
+            registry: None,
         };
         assert!(options.cloud.is_some());
         assert!(!options.time_push);

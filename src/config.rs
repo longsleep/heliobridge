@@ -47,6 +47,13 @@ pub struct Config {
     #[arg(long, env = "HELIOBRIDGE_RECORD_DIR")]
     pub record_dir: Option<PathBuf>,
 
+    /// Serve the control API on this Unix socket. Off unless set.
+    ///
+    /// HTTP, so it is reachable with `curl --unix-socket`. Routes are scoped by device, e.g.
+    /// `/devices/<serial>/settings/slot1_output_power`. Created mode 0600; there is no network listener.
+    #[arg(long, env = "HELIOBRIDGE_CONTROL_SOCKET")]
+    pub control_socket: Option<PathBuf>,
+
     /// Cap per recording stream, in bytes.
     ///
     /// On reaching it the file rotates once to `.1`, keeping the most recent window rather than stopping

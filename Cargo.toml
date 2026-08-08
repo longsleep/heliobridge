@@ -45,6 +45,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json",
 rustls = { version = "0.23", features = ["tls12"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2.2"
+
+# The control API: HTTP over a Unix socket, so it is reachable with curl and unreachable from the
+# network. Unlike the device-facing MQTT, nothing here is impersonating anything, so a well-maintained
+# library is simply the right answer.
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # Trust anchors for the cloud relay. The device verifies nothing; this program is a proper client and
 # has no reason to be as lax.
 webpki-roots = "1.0.9"

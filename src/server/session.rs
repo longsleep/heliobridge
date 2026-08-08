@@ -16,15 +16,20 @@ use std::collections::{BTreeMap, VecDeque};
 
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+use crate::control::{
+    Action as ControlAction, Outcome, QUEUE_DEPTH as CONTROL_QUEUE_DEPTH, Registration, Registry,
+    Request as ControlRequest, SessionHandle, SettingView,
+};
 use crate::growatt::cloud::{CloudConfig, Message as CloudMessage, Relay};
 use crate::growatt::v7::decode::{FromFrame, ReadResponse, Telemetry};
 use crate::growatt::v7::encode::{Command, EncodeError};
 use crate::growatt::v7::frame::{Frame, MessageType};
 use crate::growatt::v7::registers::HoldingRegister;
 use crate::growatt::{Codec, peek_version};
-use crate::model::{Hex, Raw, Register, Timestamp};
+use crate::model::{Confidence, Hex, Raw, Register, Timestamp, Unit};
 use crate::mqtt::{Packet, PacketStream, Publish, QoS, StreamError};
 use crate::record::{Recorder, Stream as RecordStream};
 use crate::server::clock::{Clock, Skew};
@@ -146,6 +151,26 @@ pub struct Session<S> {
     pending_read: Option<Register>,
     read_deadline: Option<Instant>,
     settings: BTreeMap<Register, Raw>,
+    registry: Option<Registry>,
+    /// Requests from the control API, once this session has registered itself.
+    requests: Option<mpsc::Receiver<ControlRequest>>,
+    /// Where to publish settings so the API can answer reads without device traffic.
+    settings_out: Option<watch::Sender<Vec<SettingView>>>,
+    /// Removes this session from the registry when dropped, including on the error paths.
+    registration: Option<Registration>,
+    /// Read-backs owed to a control request: what was asked for, and who is waiting.
+    ///
+    /// Keyed by register because that is what a response identifies itself by.
+    verifying: BTreeMap<Register, Verification>,
+}
+
+/// A read-back a control request is waiting on.
+#[derive(Debug)]
+struct Verification {
+    /// What the write asked the register to hold, if anything did.
+    requested: Option<Raw>,
+    /// Where to report the result. `None` for a verification nobody is waiting on.
+    reply: Option<oneshot::Sender<Outcome>>,
 }
 
 impl<S> Session<S>
@@ -181,7 +206,19 @@ where
             pending_read: None,
             read_deadline: None,
             settings: BTreeMap::new(),
+            registry: None,
+            requests: None,
+            settings_out: None,
+            registration: None,
+            verifying: BTreeMap::new(),
         }
+    }
+
+    /// Announce this session to the control API once its device is known.
+    #[must_use]
+    pub fn with_registry(mut self, registry: Option<Registry>) -> Self {
+        self.registry = registry;
+        self
     }
 
     /// Record every frame this session handles.
@@ -260,9 +297,25 @@ where
                             timeout_s = READ_REPLY_TIMEOUT.as_secs(),
                             "no answer to a settings read; moving on"
                         );
+                        // Anyone waiting on this one is told, rather than left to time out separately.
+                        if let Some(Verification { requested, reply }) = self.verifying.remove(&entry.register)
+                            && let Some(reply) = reply
+                        {
+                            drop(reply.send(Outcome::timed_out(entry.register, requested)));
+                        }
                     }
                     self.advance_resync();
                     self.send_pending_read().await?;
+                    continue;
+                }
+                Woke::Control(Some(request)) => {
+                    self.handle_control(request).await?;
+                    continue;
+                }
+                Woke::Control(None) => {
+                    // The API stopped. Nothing local depends on it, so carry on serving the device.
+                    tracing::warn!("the control API stopped; continuing without it");
+                    self.requests = None;
                     continue;
                 }
                 Woke::FromCloud(Some(message)) => {
@@ -329,8 +382,10 @@ where
                 })
                 .await?;
 
-                // The relay connects as the device, so it cannot start until the serial is known.
+                // Both need the serial: the relay connects upstream as the device, and control routes are
+                // scoped to it.
                 self.start_relay();
+                self.register();
 
                 if self.send_time_push {
                     // The vendor server sends its push about 4.5 s after connect. Matching that
@@ -609,9 +664,18 @@ where
             biased;
             () = Self::at(self.time_push_due) => Woke::TimePushDue,
             () = Self::at(self.read_deadline) => Woke::ReadTimedOut,
+            request = Self::from_control(self.requests.as_mut()) => Woke::Control(request),
             message = Self::from_cloud(self.relay.as_mut()) => Woke::FromCloud(message),
             packet = Self::read(&mut self.stream) => Woke::Packet(packet?),
         })
+    }
+
+    /// The next control request, or never if this session has not registered.
+    async fn from_control(requests: Option<&mut mpsc::Receiver<ControlRequest>>) -> Option<ControlRequest> {
+        match requests {
+            Some(requests) => requests.recv().await,
+            None => core::future::pending().await,
+        }
     }
 
     /// Resolve at a deadline, or never if there is none.
@@ -735,11 +799,48 @@ where
             );
         }
         self.settings.insert(response.register, response.raw);
+        self.settle_verification(response.register, response.raw);
+        self.publish_settings();
         self.advance_resync();
     }
 
-    /// Log what the resync learned.
+    /// Report a read-back to whoever asked for it, and say plainly when the device clamped.
+    fn settle_verification(&mut self, register: Register, stored: Raw) {
+        let Some(Verification { requested, reply }) = self.verifying.remove(&register) else {
+            return;
+        };
+        let outcome = Outcome::read_back(register, requested, stored);
+
+        if let Some(wanted) = requested {
+            if wanted == stored {
+                tracing::info!(
+                    register = %register,
+                    name = outcome.name.unwrap_or("unknown"),
+                    stored = stored.get(),
+                    "write confirmed by read-back"
+                );
+            } else {
+                // Not an error: the device did what it was going to do. Reported because a write that
+                // silently stores something else is indistinguishable from success at the protocol level.
+                tracing::warn!(
+                    register = %register,
+                    name = outcome.name.unwrap_or("unknown"),
+                    requested = wanted.get(),
+                    stored = stored.get(),
+                    "write was clamped by the device"
+                );
+            }
+        }
+
+        if let Some(reply) = reply {
+            // A dropped receiver means the caller gave up; the value is still recorded.
+            drop(reply.send(outcome));
+        }
+    }
+
+    /// Log what the resync learned, and publish it.
     fn finish_resync(&self) {
+        self.publish_settings();
         let known = self.settings.len();
         tracing::info!(known, "settings resynchronised");
 
@@ -755,6 +856,159 @@ where
                 "setting"
             );
         }
+    }
+
+    /// Join the registry so the control API can find this session.
+    ///
+    /// Only once the serial is known: routes are device-scoped, and a session with no name has nothing to
+    /// be addressed by.
+    fn register(&mut self) {
+        let (Some(registry), Some(device_id)) = (self.registry.clone(), self.device_id.clone()) else {
+            return;
+        };
+
+        let (request_tx, request_rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
+        let (settings_tx, settings_rx) = watch::channel(Vec::new());
+
+        self.registration = Some(registry.register(
+            &device_id,
+            SessionHandle {
+                requests: request_tx,
+                settings: settings_rx,
+            },
+        ));
+        self.requests = Some(request_rx);
+        self.settings_out = Some(settings_tx);
+        tracing::info!("registered with the control API");
+    }
+
+    /// Carry out one control request.
+    ///
+    /// Both kinds end the same way: a register is read off the device and the answer reports what it holds.
+    /// A write is not confirmed by having been sent — range writes are acknowledged with the register range
+    /// and nothing else, single-register writes are not acknowledged at all, and out-of-range values are
+    /// clamped silently.
+    async fn handle_control(&mut self, request: ControlRequest) -> Result<(), SessionError> {
+        let ControlRequest { action, reply } = request;
+
+        match action {
+            ControlAction::Refresh(register) => {
+                self.enqueue_verification(register, None, Some(reply));
+            }
+            ControlAction::Apply(command) => {
+                let verify = command.registers_to_verify();
+                self.transmit(&command).await?;
+
+                if verify.is_empty() {
+                    // Nothing to read back — a read or a time push. Answer immediately so the caller is not
+                    // left waiting for a confirmation that will never come.
+                    drop(reply.send(Outcome::read_back(Register(0), None, Raw(0))));
+                    return Ok(());
+                }
+
+                // The reply belongs to the first register; the rest are learned but unreported. One request,
+                // one answer, and the first entry is the one that was asked for.
+                let mut reply = Some(reply);
+                for (register, requested) in verify {
+                    self.enqueue_verification(register, requested, reply.take());
+                }
+            }
+        }
+
+        self.send_pending_read().await
+    }
+
+    /// Queue a register to be read back, ahead of any startup resync still in progress.
+    ///
+    /// Ahead, because someone is waiting on this one: a resync has up to an hour of slack, a caller holding
+    /// an HTTP connection has twenty seconds.
+    fn enqueue_verification(
+        &mut self,
+        register: Register,
+        requested: Option<Raw>,
+        reply: Option<oneshot::Sender<Outcome>>,
+    ) {
+        self.verifying.insert(register, Verification { requested, reply });
+
+        let entry = HoldingRegister::lookup(register).unwrap_or_else(|| {
+            // Readable but undocumented. Reading is harmless, and a value is still a fact; it simply has no
+            // name or domain to render it with.
+            HoldingRegister::range(
+                register.number(),
+                "unknown",
+                0,
+                u16::MAX,
+                Unit::None,
+                Confidence::Inferred,
+            )
+        });
+
+        self.resync.push_front(entry);
+        if self.awaiting.is_none() {
+            self.advance_resync();
+        }
+    }
+
+    /// Send a command to the device.
+    ///
+    /// Writes go out at QoS 0 and the time push at QoS 1, matching what the vendor server was observed to
+    /// do. Recorded as `inject`, because from the device's side our frames and the cloud's are
+    /// indistinguishable and that is exactly what makes a misbehaving write hard to diagnose.
+    async fn transmit(&mut self, command: &Command) -> Result<(), SessionError> {
+        let Some(device_id) = self.device_id.clone() else {
+            return Ok(());
+        };
+
+        let frame = command.to_frame(&device_id).context(EncodeSnafu)?;
+        let wire = frame.to_wire();
+        self.record(RecordStream::Inject, &wire);
+
+        tracing::info!(
+            message_type = %frame.message_type(),
+            acknowledged = command.is_acknowledged(),
+            "sending a command to the device"
+        );
+        tracing::trace!(
+            target: TARGET_WIRE,
+            direction = "tx",
+            len = wire.len(),
+            "{}",
+            Hex(&wire)
+        );
+
+        let qos = if matches!(command, Command::TimePush { .. }) {
+            QoS::AtLeastOnce
+        } else {
+            QoS::AtMostOnce
+        };
+        let packet_id = if qos == QoS::AtMostOnce {
+            None
+        } else {
+            Some(self.take_packet_id())
+        };
+
+        self.send(&Packet::Publish(Publish {
+            topic: format!("s/{device_id}"),
+            qos,
+            retain: false,
+            dup: false,
+            packet_id,
+            payload: wire,
+        }))
+        .await
+    }
+
+    /// Publish the current settings for the control API to read.
+    fn publish_settings(&self) {
+        let Some(out) = self.settings_out.as_ref() else {
+            return;
+        };
+        let views: Vec<SettingView> = self
+            .settings
+            .iter()
+            .filter_map(|(register, raw)| SettingView::new(*register, *raw))
+            .collect();
+        drop(out.send(views));
     }
 
     /// Hand a frame to the recorder, if one is configured.
@@ -904,6 +1158,8 @@ enum Woke {
     TimePushDue,
     /// A read went unanswered for too long.
     ReadTimedOut,
+    /// The control API asked for something, or stopped.
+    Control(Option<ControlRequest>),
     /// The cloud sent something for the device, or the relay stopped.
     FromCloud(Option<CloudMessage>),
 }

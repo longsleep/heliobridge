@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use heliobridge::VERSION;
 use heliobridge::config::{Config, LogFormat};
+use heliobridge::control::{self, Registry};
 use heliobridge::record::Recorder;
 use heliobridge::server;
 use tracing_subscriber::EnvFilter;
@@ -66,11 +67,28 @@ fn run(config: &Config) -> Result<(), String> {
         None => None,
     };
 
+    // Started inside the runtime for the same reason as the recorder: it spawns tasks.
+    let registry = match config.control_socket.as_deref() {
+        Some(path) => {
+            let registry = Registry::new();
+            runtime
+                .block_on(async { control::listen(path, registry.clone()) })
+                .map_err(|error| format!("control API failed to start: {}", chain(&error)))?;
+            tracing::info!(
+                socket = %path.display(),
+                "control API enabled; settings can be written through it"
+            );
+            Some(registry)
+        }
+        None => None,
+    };
+
     let options = server::SessionOptions {
         time_push: config.should_push_time(),
         cloud,
         recorder,
         slots: config.slots,
+        registry,
     };
     if options.time_push {
         // The device is sent *local* time, so an operator whose host runs UTC — a container default —

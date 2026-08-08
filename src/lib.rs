@@ -20,6 +20,7 @@
 //!   and the vendor cloud client both speak it, which is why it sits here rather than inside either.
 //! - [`server`] — everything device-facing: the session state machine, the accept loop, server TLS and
 //!   the clock behind the time push.
+//! - [`control`] — a local HTTP control API over a Unix socket, off unless configured.
 //! - [`record`] — raw frame recording for later analysis, off unless configured.
 //! - [`config`] — environment configuration, all of it prefixed `HELIOBRIDGE_`.
 //!
@@ -28,6 +29,7 @@
 //! Module paths double as tracing targets, so that layout is also the logging control surface.
 
 pub mod config;
+pub mod control;
 pub mod growatt;
 pub mod model;
 pub mod mqtt;
