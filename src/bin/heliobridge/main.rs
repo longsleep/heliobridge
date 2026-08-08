@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use heliobridge::VERSION;
 use heliobridge::config::{Config, LogFormat};
+use heliobridge::record::Recorder;
 use heliobridge::server;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -39,14 +40,6 @@ fn run(config: &Config) -> Result<(), String> {
         .map_err(|error| format!("TLS setup failed: {}", chain(&error)))?;
     tracing::info!(%origin, state_dir = %config.state_dir.display(), "certificate ready");
 
-    if let Some(dir) = config.record_dir.as_ref() {
-        // Not implemented yet; say so rather than let an operator believe frames are being captured.
-        tracing::warn!(
-            dir = %dir.display(),
-            "frame recording is configured but not implemented in this build; ignoring"
-        );
-    }
-
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -64,9 +57,19 @@ fn run(config: &Config) -> Result<(), String> {
         );
     }
 
+    // Started inside the runtime: it spawns a writer task.
+    let recorder = match config.recording() {
+        Some(recording) => runtime
+            .block_on(async { Recorder::start(recording) })
+            .map(Some)
+            .map_err(|error| format!("recording misconfigured: {}", chain(&error)))?,
+        None => None,
+    };
+
     let options = server::SessionOptions {
         time_push: config.should_push_time(),
         cloud,
+        recorder,
     };
     if options.time_push {
         // The device is sent *local* time, so an operator whose host runs UTC — a container default —

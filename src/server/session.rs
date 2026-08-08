@@ -24,6 +24,7 @@ use crate::growatt::v7::frame::{Frame, MessageType};
 use crate::growatt::{Codec, peek_version};
 use crate::model::{Hex, Timestamp};
 use crate::mqtt::{Packet, PacketStream, Publish, QoS, StreamError};
+use crate::record::{Recorder, Stream as RecordStream};
 use crate::server::clock::{Clock, Skew};
 use crate::{TARGET_VALUES, TARGET_WIRE};
 
@@ -124,6 +125,7 @@ pub struct Session<S> {
     warned_about_skew: bool,
     cloud: Option<CloudConfig>,
     relay: Option<Relay>,
+    recorder: Option<Recorder>,
 }
 
 impl<S> Session<S>
@@ -152,7 +154,15 @@ where
             warned_about_skew: false,
             cloud: None,
             relay: None,
+            recorder: None,
         }
+    }
+
+    /// Record every frame this session handles.
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Option<Recorder>) -> Self {
+        self.recorder = recorder;
+        self
     }
 
     /// Whether to send the time push after connect. On by default, because the vendor server does.
@@ -285,9 +295,10 @@ where
                         self.send(&Packet::PubAck { packet_id }).await?;
                     }
 
-                    // Relay before decoding, and regardless of whether decoding succeeds: the cloud
-                    // understands frames this build does not, so what reaches Growatt must not depend on
-                    // what this program can parse.
+                    // Record and relay before decoding, and regardless of whether decoding succeeds: the
+                    // cloud understands frames this build does not, and a recording is worth most for
+                    // exactly the frames this build cannot yet read.
+                    self.record(RecordStream::Up, &publish.payload);
                     self.forward_to_cloud(&publish);
                     self.handle_frame(&publish.topic, &publish.payload);
                 }
@@ -438,6 +449,10 @@ where
         let frame = command.to_frame(&device_id).context(EncodeSnafu)?;
         let wire = frame.to_wire();
 
+        // Recorded as `inject` rather than `down`: from the device's side the two are indistinguishable,
+        // and when a write misbehaves the first question is whether this program sent what it thought.
+        self.record(RecordStream::Inject, &wire);
+
         tracing::trace!(
             target: TARGET_WIRE,
             direction = "tx",
@@ -537,6 +552,16 @@ where
         self.stream.send(packet).await.context(StreamSnafu)
     }
 
+    /// Hand a frame to the recorder, if one is configured.
+    ///
+    /// Never fails and never waits. Recording is subordinate to serving the device, so a recorder that
+    /// cannot keep up loses records rather than delaying the session.
+    fn record(&self, stream: RecordStream, payload: &[u8]) {
+        if let Some(recorder) = self.recorder.as_ref() {
+            recorder.record(stream, payload);
+        }
+    }
+
     /// Start the cloud relay, now that the serial is known.
     fn start_relay(&mut self) {
         let (Some(cloud), Some(device_id)) = (self.cloud.clone(), self.device_id.clone()) else {
@@ -576,6 +601,7 @@ where
     /// less capable than the thing it relays.
     async fn forward_to_device(&mut self, message: CloudMessage) -> Result<(), SessionError> {
         self.stats.relay_received = self.stats.relay_received.saturating_add(1);
+        self.record(RecordStream::Down, &message.payload);
 
         tracing::trace!(
             target: TARGET_WIRE,

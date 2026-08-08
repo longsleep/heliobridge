@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::growatt::cloud::{self, CloudConfig};
+use crate::record::{self, RecorderConfig};
 
 /// Default device-facing listener address.
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:7006";
@@ -40,8 +41,18 @@ pub struct Config {
     pub state_dir: PathBuf,
 
     /// Record every frame here for later analysis. Off unless set.
+    ///
+    /// Writes `up.bin`, `down.bin` and `inject.bin`: raw octets exactly as they crossed the socket, so a
+    /// later, better decoder can re-read them.
     #[arg(long, env = "HELIOBRIDGE_RECORD_DIR")]
     pub record_dir: Option<PathBuf>,
+
+    /// Cap per recording stream, in bytes.
+    ///
+    /// On reaching it the file rotates once to `.1`, keeping the most recent window rather than stopping
+    /// at the least useful moment. Telemetry alone is roughly 10 MB per day.
+    #[arg(long, env = "HELIOBRIDGE_RECORD_MAX_BYTES", default_value_t = record::DEFAULT_MAX_BYTES)]
+    pub record_max_bytes: u64,
 
     /// Relay device traffic to the Growatt cloud, so the vendor app keeps working.
     ///
@@ -98,6 +109,14 @@ impl Config {
         self.cloud_relay.then(|| CloudConfig {
             host: self.cloud_host.clone(),
             port: self.cloud_port,
+        })
+    }
+
+    /// Where to record frames, or `None` when recording is off.
+    pub fn recording(&self) -> Option<RecorderConfig> {
+        self.record_dir.as_ref().map(|dir| RecorderConfig {
+            dir: dir.clone(),
+            max_bytes: self.record_max_bytes,
         })
     }
 

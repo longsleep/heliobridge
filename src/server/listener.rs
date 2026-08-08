@@ -21,6 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
 use crate::growatt::cloud::CloudConfig;
+use crate::record::Recorder;
 use crate::server::session::Session;
 
 /// Why the listener stopped.
@@ -38,7 +39,10 @@ pub enum ListenerError {
 }
 
 /// How each session should behave.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not comparable: it carries a [`Recorder`] handle, and two handles to the same recorder are the same
+/// recorder in every sense that matters, which is not a thing equality can usefully express.
+#[derive(Debug, Clone)]
 pub struct SessionOptions {
     /// Whether to push the server's wall-clock time after the device connects.
     ///
@@ -48,6 +52,9 @@ pub struct SessionOptions {
 
     /// Relay traffic to the vendor cloud, so the phone app keeps working.
     pub cloud: Option<CloudConfig>,
+
+    /// Record every frame, in both directions plus the ones this program originates.
+    pub recorder: Option<Recorder>,
 }
 
 impl Default for SessionOptions {
@@ -55,6 +62,7 @@ impl Default for SessionOptions {
         Self {
             time_push: true,
             cloud: None,
+            recorder: None,
         }
     }
 }
@@ -78,6 +86,7 @@ pub async fn serve(
         %address,
         time_push = options.time_push,
         cloud_relay = options.cloud.is_some(),
+        recording = options.recorder.is_some(),
         "listening for the device"
     );
 
@@ -136,7 +145,8 @@ async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcce
 
     let mut session = Session::new(stream)
         .with_time_push(options.time_push)
-        .with_cloud(options.cloud);
+        .with_cloud(options.cloud)
+        .with_recorder(options.recorder);
 
     match session.run().await {
         Ok(stats) => tracing::info!(
@@ -173,10 +183,11 @@ mod tests {
     use crate::growatt::cloud::CloudConfig;
 
     #[test]
-    fn defaults_relay_nothing_and_push_time() {
+    fn defaults_relay_nothing_record_nothing_and_push_time() {
         let options = SessionOptions::default();
         assert!(options.time_push, "the vendor server pushes time, so we do too");
         assert!(options.cloud.is_none(), "relaying is opt-in");
+        assert!(options.recorder.is_none(), "recording is opt-in");
     }
 
     #[test]
@@ -186,6 +197,7 @@ mod tests {
         let options = SessionOptions {
             time_push: false,
             cloud: Some(CloudConfig::default()),
+            recorder: None,
         };
         assert!(options.cloud.is_some());
         assert!(!options.time_push);

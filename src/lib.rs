@@ -20,6 +20,7 @@
 //!   and the vendor cloud client both speak it, which is why it sits here rather than inside either.
 //! - [`server`] — everything device-facing: the session state machine, the accept loop, server TLS and
 //!   the clock behind the time push.
+//! - [`record`] — raw frame recording for later analysis, off unless configured.
 //! - [`config`] — environment configuration, all of it prefixed `HELIOBRIDGE_`.
 //!
 //! Still to come: `bridge` (cached state, Home Assistant, optional cloud relay).
@@ -30,6 +31,7 @@ pub mod config;
 pub mod growatt;
 pub mod model;
 pub mod mqtt;
+pub mod record;
 pub mod server;
 
 /// The crate version, as published.
