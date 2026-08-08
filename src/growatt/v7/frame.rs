@@ -137,6 +137,12 @@ pub enum MessageType {
     /// The periodic clock push is one instance of it and arrives as `0xFE18`; commands issued from the
     /// vendor's web interface arrive as `0x0118`.
     ConfigWrite,
+    /// `0x0119` — request the value of one config register, server to device.
+    ///
+    /// The answer, if the device sends one, is an [`Self::IdentityReport`]. Unobserved: the vendor server was
+    /// never seen requesting one, so this is the only message here built from another implementation's
+    /// behaviour rather than from a capture.
+    ConfigRead,
     /// `0xFE19` — datalogger identity report, device to server.
     IdentityReport,
     /// Anything else. Log it with a hex dump rather than dropping it: that is how the next unknown
@@ -163,6 +169,11 @@ impl MessageType {
             // from its web interface as 0x0118 — same message, same body layout, and dispatching on the pair
             // would silently miss four of the five known config writes.
             (_, 0x18) => Self::ConfigWrite,
+            // `0x19` in two directions: the device reports its configuration under 0xFE, and a request for
+            // one register is sent under 0x01 — the address the vendor uses for everything an operator
+            // initiates. The request half is unobserved; the address follows that pattern rather than a
+            // capture.
+            (0x01, 0x19) => Self::ConfigRead,
             (0xFE, 0x19) => Self::IdentityReport,
             (address, function) => Self::Unrecognised { address, function },
         }
@@ -176,8 +187,10 @@ impl MessageType {
             | Self::ReadSingleRegister
             | Self::WriteSingleRegister
             | Self::WriteRegisterRange
-            | Self::ExtendedTelemetry => 0x01,
-            // The address this program *sends* a config write under. Both are accepted on receipt, and a
+            | Self::ExtendedTelemetry
+            // The vendor sends a config read under 0x01, captured at 44 octets.
+            | Self::ConfigRead => 0x01,
+            // The address this program *sends* a config write under. Either is accepted on receipt, and a
             // parsed frame keeps whichever octet it arrived with, since `to_wire` re-obfuscates the stored
             // bytes rather than rebuilding the header. 0xFE is what the vendor's own clock push uses, and the
             // byte-exactness test against it is worth keeping.
@@ -196,7 +209,8 @@ impl MessageType {
             Self::WriteRegisterRange => 0x10,
             Self::ExtendedTelemetry => 0x50,
             Self::ConfigWrite => 0x18,
-            Self::IdentityReport => 0x19,
+            // One function, two directions: the request downstream, the report back.
+            Self::ConfigRead | Self::IdentityReport => 0x19,
             Self::Unrecognised { function, .. } => function,
         }
     }
@@ -217,6 +231,7 @@ impl core::fmt::Display for MessageType {
             Self::WriteRegisterRange => "write-range",
             Self::ExtendedTelemetry => "extended-telemetry",
             Self::ConfigWrite => "config-write",
+            Self::ConfigRead => "config-read",
             Self::IdentityReport => "identity",
             Self::Unrecognised { .. } => "unrecognised",
         };

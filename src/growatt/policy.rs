@@ -377,6 +377,15 @@ impl Policy {
             Mode::Observer => Decision::Refuse(Refusal::ObserverMode),
             Mode::Controls => match intent {
                 // The device answers a read whoever asked, and a read changes nothing.
+                //
+                // That covers config reads too, which ask for the datalogger's own fields — including the
+                // broker endpoint. Refusing those would protect nothing today: the identity report carrying
+                // all 32 config registers is forwarded on every connect, and the settings snapshot hourly.
+                //
+                // It stops being true the moment either of those is withheld. If identity reports are ever
+                // held back — §8.6 of the implementation plan proposes exactly that after a retarget, so the
+                // cloud cannot see the new endpoint — then config reads must be held back with them, or the
+                // cloud simply asks for register 19 instead. They are one disclosure through two doors.
                 Intent::WriteSettings { .. } | Intent::ReadRequest { .. } => Decision::Allow,
                 Intent::WriteConfig { .. } => Decision::Refuse(Refusal::ConfigWrite),
                 // Fails closed, and deliberately: an unrecognised frame heading for the device is the shape

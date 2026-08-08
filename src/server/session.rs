@@ -630,7 +630,9 @@ where
 
             // Known message types this codec cannot decode yet. Counted and named so their arrival is
             // visible rather than silent.
-            MessageType::IdentityReport => match Identity::from_frame(frame) {
+            // The unsolicited report and the answer to a config read, which share a body layout: one carries
+            // everything the device knows about itself, the other the single register asked for.
+            MessageType::IdentityReport | MessageType::ConfigRead => match Identity::from_frame(frame) {
                 Ok(identity) => self.accept_identity(identity),
                 Err(error) => {
                     self.stats.rejected = self.stats.rejected.saturating_add(1);
@@ -942,7 +944,12 @@ where
             }
         }
 
-        self.identity = Some(identity);
+        // A single-register report is the answer to a read, not a fresh description of the device: fold it in
+        // rather than letting one field replace thirty-two.
+        match self.identity.as_mut() {
+            Some(held) if identity.entries.len() < held.entries.len() => held.apply(&identity),
+            _ => self.identity = Some(identity),
+        }
         self.publish_identity();
     }
 
@@ -1108,6 +1115,18 @@ where
                     self.enqueue_verification(register, requested, reply.take());
                 }
             }
+            ControlAction::Send(command) => {
+                // No read-back, and none possible: this is the config space, where a write draws no
+                // acknowledgement and the read that would confirm one has never been seen on the wire.
+                // Answering as soon as it is transmitted is the honest maximum.
+                let sent = self.transmit(&command).await;
+                let outcome = match &sent {
+                    Ok(()) => Outcome::sent(&command),
+                    Err(error) => Outcome::not_sent(&command, &error.to_string()),
+                };
+                drop(reply.send(outcome));
+                sent?;
+            }
         }
 
         self.send_pending_read().await
@@ -1172,7 +1191,9 @@ where
             Hex(&wire)
         );
 
-        let qos = if matches!(command, Command::TimePush { .. }) {
+        // Matching the capture rather than picking one: the vendor sends config writes at QoS 1 and register
+        // writes at QoS 0. All four commands captured from its web interface were QoS 1, like the clock push.
+        let qos = if matches!(command, Command::WriteConfig { .. }) {
             QoS::AtLeastOnce
         } else {
             QoS::AtMostOnce

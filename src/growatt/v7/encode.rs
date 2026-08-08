@@ -38,14 +38,14 @@ const DEFAULT_OUTPUT_POWER: u16 = 322;
 /// Register carrying `power_plus`, which gates the ceiling on [`DEFAULT_OUTPUT_POWER`].
 const POWER_PLUS: u16 = 325;
 
-/// Fixed prefix of the time push body, ahead of the ASCII timestamp.
+/// Octets of header on a config write entry: count, entry length, register, value length.
 ///
-/// The trailing `00 13` is 19, the length of the string that follows. The preceding pairs are
-/// unconfirmed and reproduced verbatim.
-pub const TIME_PUSH_PREFIX: [u8; 8] = [0x00, 0x01, 0x00, 0x17, 0x00, 0x1F, 0x00, 0x13];
+/// This was once `TIME_PUSH_PREFIX`, eight octets copied from the vendor and described as unexplained. They
+/// are a TLV entry header, and the clock push is one config write among several.
+pub const CONFIG_ENTRY_HEADER_LEN: usize = 8;
 
-/// Length of the ASCII timestamp in a time push: `YYYY-MM-DD HH:MM:SS`.
-pub const TIME_PUSH_TEXT_LEN: usize = 19;
+/// Length of the ASCII timestamp in a clock write: `YYYY-MM-DD HH:MM:SS`.
+pub const CLOCK_TEXT_LEN: usize = 19;
 
 /// Why a command could not be built.
 #[derive(Debug, Clone, PartialEq, Eq, Snafu)]
@@ -98,6 +98,13 @@ pub enum EncodeError {
     ImplausibleTimestamp {
         /// The offending value.
         timestamp: Timestamp,
+    },
+
+    /// A config write with nothing to write.
+    #[snafu(display("config register {} ({}) needs a value", register.register(), register.name()))]
+    EmptyConfigValue {
+        /// Which register was being written.
+        register: WritableConfig,
     },
 
     /// The frame layer rejected the assembled parts.
@@ -268,11 +275,106 @@ pub enum Command {
         register: Register,
     },
 
-    /// Push the server's wall-clock time with `0xFE18`.
-    TimePush {
-        /// The time to send.
-        time: Timestamp,
+    /// Write a config register with `0x18`.
+    ///
+    /// The clock push is one instance of this, and was the only one implemented while its body was thought
+    /// to be an opaque prefix. Values are ASCII on the wire whatever the field means.
+    WriteConfig {
+        /// Which config register, from the allowlist.
+        register: WritableConfig,
+        /// The value, as text.
+        value: String,
     },
+
+    /// Ask for one config register's value with `0x19`.
+    ReadConfig {
+        /// The register to ask for.
+        register: Register,
+    },
+}
+
+/// A config register this implementation will write, and what it is for.
+///
+/// An allowlist as a type, like [`WritableRegister`] — but a much shorter one, and split by consequence
+/// rather than by domain. The config space contains the broker endpoint: a wrong value there has no remote
+/// recovery, because the device listens on no port and would simply stop arriving.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum WritableConfig {
+    /// Register 31, the device's clock. Written on every connect **[O]**.
+    Clock,
+    /// Register 32. Restarts the datalogger; observed from the vendor's own interface **[O]**.
+    Restart,
+    /// Register 35. Clears the datalogger's log **[O]**.
+    ClearLog,
+    /// Register 19, the broker host name. **Retargets the device** — see [`Self::is_retarget`].
+    RemoteUrl,
+    /// Register 18, the broker port. **Retargets the device.**
+    RemotePort,
+    /// Register 17, the broker address. **Retargets the device**, and is the one member never observed
+    /// being written **[I]**.
+    RemoteIp,
+}
+
+impl WritableConfig {
+    /// Every member, for listing what this build can write.
+    pub const ALL: [Self; 6] = [
+        Self::Clock,
+        Self::Restart,
+        Self::ClearLog,
+        Self::RemoteUrl,
+        Self::RemotePort,
+        Self::RemoteIp,
+    ];
+
+    /// The config register number.
+    pub const fn register(self) -> Register {
+        Register(match self {
+            Self::Clock => 31,
+            Self::Restart => 32,
+            Self::ClearLog => 35,
+            Self::RemoteUrl => 19,
+            Self::RemotePort => 18,
+            Self::RemoteIp => 17,
+        })
+    }
+
+    /// The name this is addressed by, matching the specification's Appendix C.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Clock => "datetime",
+            Self::Restart => "restart",
+            Self::ClearLog => "clear_log",
+            Self::RemoteUrl => "remote_url",
+            Self::RemotePort => "remote_port",
+            Self::RemoteIp => "remote_ip",
+        }
+    }
+
+    /// Look one up by name.
+    pub fn lookup(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|entry| entry.name() == name)
+    }
+
+    /// Whether writing this moves the device to a different server.
+    ///
+    /// The reason this is a method rather than a comment: a caller must be able to refuse the whole class
+    /// without enumerating its members, because the failure mode is a device that never comes back and is
+    /// recoverable only by re-provisioning it over Bluetooth.
+    pub const fn is_retarget(self) -> bool {
+        matches!(self, Self::RemoteUrl | Self::RemotePort | Self::RemoteIp)
+    }
+
+    /// Whether this is an action rather than a setting.
+    ///
+    /// Registers 32 and 35 take `"1"` and *do* something; nothing suggests they hold a readable value.
+    pub const fn is_action(self) -> bool {
+        matches!(self, Self::Restart | Self::ClearLog)
+    }
+
+    /// The value that triggers an action, or `None` for a register that holds a value.
+    pub const fn trigger_value(self) -> Option<&'static str> {
+        if self.is_action() { Some("1") } else { None }
+    }
 }
 
 impl Command {
@@ -442,7 +544,81 @@ impl Command {
     /// [`EncodeError::ImplausibleTimestamp`] if the value would not render as a calendar time.
     pub fn time_push(time: Timestamp) -> Result<Self, EncodeError> {
         ensure!(time.is_plausible(), ImplausibleTimestampSnafu { timestamp: time });
-        Ok(Self::TimePush { time })
+        Ok(Self::WriteConfig {
+            register: WritableConfig::Clock,
+            value: format_time(time),
+        })
+    }
+
+    /// Write a config register.
+    ///
+    /// No domain to check against: the config space is text, and this implementation has no model of what
+    /// each field accepts beyond the allowlist itself. What it does check is that a value exists at all —
+    /// an empty write is not something the vendor was ever seen to send.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::EmptyConfigValue`] for an empty value.
+    pub fn write_config(register: WritableConfig, value: impl Into<String>) -> Result<Self, EncodeError> {
+        let value = value.into();
+        ensure!(!value.is_empty(), EmptyConfigValueSnafu { register });
+        Ok(Self::WriteConfig { register, value })
+    }
+
+    /// Restart the datalogger: register 32, value `"1"`.
+    ///
+    /// Recoverable — the device reboots and reconnects by itself — and the only known way to make it emit a
+    /// settings snapshot, which is what makes the vendor cloud's view catch up.
+    pub fn restart_datalogger() -> Self {
+        Self::WriteConfig {
+            register: WritableConfig::Restart,
+            value: "1".to_owned(),
+        }
+    }
+
+    /// Clear the datalogger's log: register 35, value `"1"`.
+    pub fn clear_datalogger_log() -> Self {
+        Self::WriteConfig {
+            register: WritableConfig::ClearLog,
+            value: "1".to_owned(),
+        }
+    }
+
+    /// Ask the device for the value of one config register.
+    ///
+    /// **Unobserved.** The vendor server never requested one across the whole capture set, so the frame
+    /// follows another implementation's behaviour rather than evidence: a `0x19` under address `0x01`, body
+    /// `count(2)` then the register. The answer, if any, arrives as an identity report.
+    ///
+    /// Any config register may be asked for, not only the writable ones — reading has no side effect, which
+    /// is the same reasoning that leaves [`Self::read`] unrestricted.
+    pub const fn read_config(register: Register) -> Self {
+        Self::ReadConfig { register }
+    }
+
+    /// The config register this command writes, or `None` if it is not a config write.
+    pub const fn config_register(&self) -> Option<WritableConfig> {
+        match self {
+            Self::WriteConfig { register, .. } => Some(*register),
+            _ => None,
+        }
+    }
+
+    /// The config register this command addresses, whether it writes or reads it.
+    pub const fn config_target(&self) -> Option<Register> {
+        match self {
+            Self::WriteConfig { register, .. } => Some(register.register()),
+            Self::ReadConfig { register } => Some(*register),
+            _ => None,
+        }
+    }
+
+    /// The value a config write carries, or `None` if it is not a config write.
+    pub fn config_value(&self) -> Option<&str> {
+        match self {
+            Self::WriteConfig { value, .. } => Some(value.as_str()),
+            _ => None,
+        }
     }
 
     /// The message type this command is carried by.
@@ -451,7 +627,8 @@ impl Command {
             Self::WriteSingle { .. } => MessageType::WriteSingleRegister,
             Self::WriteRange { .. } => MessageType::WriteRegisterRange,
             Self::ReadSingle { .. } => MessageType::ReadSingleRegister,
-            Self::TimePush { .. } => MessageType::ConfigWrite,
+            Self::WriteConfig { .. } => MessageType::ConfigWrite,
+            Self::ReadConfig { .. } => MessageType::ConfigRead,
         }
     }
 
@@ -486,7 +663,10 @@ impl Command {
                 .collect(),
 
             // Reads and the time push change nothing.
-            Self::ReadSingle { .. } | Self::TimePush { .. } => Vec::new(),
+            // Nothing to verify. A read has no effect to check, and a config write cannot be checked: it
+            // draws no acknowledgement, and its answer — if the device sends one — is an identity report
+            // rather than anything this queue understands.
+            Self::ReadSingle { .. } | Self::WriteConfig { .. } | Self::ReadConfig { .. } => Vec::new(),
         };
 
         let touches_power_plus = out.iter().any(|(register, _)| register.number() == POWER_PLUS);
@@ -554,10 +734,27 @@ impl Command {
                 body
             }
 
-            Self::TimePush { time } => {
-                let mut body = Vec::with_capacity(TIME_PUSH_PREFIX.len().saturating_add(TIME_PUSH_TEXT_LEN));
-                body.extend_from_slice(&TIME_PUSH_PREFIX);
-                body.extend_from_slice(format_time(*time).as_bytes());
+            // One TLV entry: count, entry length, register, value length, then ASCII. `entry_len` counts the
+            // register, the value length and the value — value_len + 4 — which held across all 11 captured
+            // frames, four of them written by the vendor's own interface with body lengths this code had
+            // never produced.
+            // Count, then the register. No length: there is no value to size.
+            Self::ReadConfig { register } => {
+                let mut body = Vec::with_capacity(4);
+                body.extend_from_slice(&1u16.to_be_bytes());
+                body.extend_from_slice(&register.number().to_be_bytes());
+                body
+            }
+
+            Self::WriteConfig { register, value } => {
+                let text = value.as_bytes();
+                let value_len = u16::try_from(text.len()).unwrap_or(u16::MAX);
+                let mut body = Vec::with_capacity(CONFIG_ENTRY_HEADER_LEN.saturating_add(text.len()));
+                body.extend_from_slice(&1u16.to_be_bytes());
+                body.extend_from_slice(&value_len.saturating_add(4).to_be_bytes());
+                body.extend_from_slice(&register.register().number().to_be_bytes());
+                body.extend_from_slice(&value_len.to_be_bytes());
+                body.extend_from_slice(text);
                 body
             }
         }
@@ -594,7 +791,7 @@ pub const fn slot_stride() -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, EncodeError, SlotConfig, SlotField, WritableRegister, slot_registers};
+    use super::{Command, EncodeError, SlotConfig, SlotField, WritableConfig, WritableRegister, slot_registers};
     use crate::growatt::v7::decode::Timestamp;
     use crate::growatt::v7::frame::MessageType;
     use crate::model::{Raw, Register};
@@ -951,14 +1148,62 @@ mod tests {
         assert_eq!(frame.message_type(), MessageType::ConfigWrite);
         assert_eq!(frame.header().address, 0xFE);
 
+        // The eight octets once copied verbatim as an opaque prefix, now produced by the general TLV rule:
+        // count 1, entry length 23, register 31, value length 19.
         let body = frame.body();
-        assert_eq!(body.get(..8), Some(super::TIME_PUSH_PREFIX.as_slice()));
+        assert_eq!(
+            body.get(..8),
+            Some([0x00, 0x01, 0x00, 0x17, 0x00, 0x1F, 0x00, 0x13].as_slice())
+        );
         assert_eq!(
             body.get(8..).map(String::from_utf8_lossy).as_deref(),
             Some("2026-08-06 23:43:02")
         );
-        // The trailing pair of the prefix is the string length.
-        assert_eq!(usize::from(super::TIME_PUSH_PREFIX[7]), body.len() - 8);
+        assert_eq!(super::CLOCK_TEXT_LEN, body.len() - 8);
+    }
+
+    #[test]
+    fn the_action_commands_match_the_captured_frames() {
+        // Bytes the vendor's web interface sent, register and value both: 32 = "1" restarts, 35 = "1" clears
+        // the log. Building them from the general config write must reproduce those exactly.
+        for (command, register, value) in [
+            (Command::restart_datalogger(), 32u16, "1"),
+            (Command::clear_datalogger_log(), 35, "1"),
+        ] {
+            let frame = command.to_frame(SERIAL).expect("build");
+            assert_eq!(frame.message_type(), MessageType::ConfigWrite);
+            let body = frame.body();
+            assert_eq!(body.len(), 9, "count, entry length, register, value length, one octet");
+            assert_eq!(body.get(..2), Some([0x00, 0x01].as_slice()), "one entry");
+            assert_eq!(body.get(2..4), Some([0x00, 0x05].as_slice()), "value_len + 4");
+            assert_eq!(body.get(4..6), Some(register.to_be_bytes().as_slice()));
+            assert_eq!(body.get(6..8), Some([0x00, 0x01].as_slice()));
+            assert_eq!(body.get(8..), Some(value.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn a_config_write_needs_a_value() {
+        assert!(Command::write_config(WritableConfig::RemoteUrl, "").is_err());
+        assert!(Command::write_config(WritableConfig::RemoteUrl, "example.invalid").is_ok());
+    }
+
+    #[test]
+    fn the_retarget_registers_are_identifiable_as_a_class() {
+        // A caller must be able to refuse all of them without listing them: a wrong value here leaves a
+        // device that never comes back.
+        for register in [
+            WritableConfig::RemoteIp,
+            WritableConfig::RemotePort,
+            WritableConfig::RemoteUrl,
+        ] {
+            assert!(register.is_retarget(), "{}", register.name());
+        }
+        for register in [WritableConfig::Clock, WritableConfig::Restart, WritableConfig::ClearLog] {
+            assert!(!register.is_retarget(), "{}", register.name());
+        }
+        assert_eq!(WritableConfig::Restart.trigger_value(), Some("1"));
+        assert_eq!(WritableConfig::Clock.trigger_value(), None);
     }
 
     #[test]

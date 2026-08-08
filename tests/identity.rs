@@ -245,6 +245,55 @@ fn config_writes_arrive_under_either_address() {
     }
 }
 
+#[test]
+fn the_answer_to_a_config_read_decodes_as_a_one_entry_report() {
+    // The shape the device actually replied with: address 0x01 rather than the report's 0xFE, and a body
+    // that is the report's own layout carrying the single register asked for. Values here are synthetic.
+    let body = [
+        0x00, 0x01, // count: one entry
+        0x00, // the same pad the full report carries
+        0x00, 0x15, // register 21
+        0x00, 0x07, // seven octets of value
+        b'9', b'.', b'9', b'.', b'9', b'.', b'9',
+    ];
+    let wire = frame_with(0x01, 0x19, &body);
+    let frame = Frame::parse(&wire).expect("the hand-built frame parses");
+    assert_eq!(frame.message_type(), MessageType::ConfigRead);
+
+    let answer = Identity::from_frame(&frame).expect("an answer decodes like a report");
+    assert_eq!(answer.declared, 1);
+    assert!(!answer.truncated, "the body is consumed exactly");
+    assert_eq!(answer.get("sw_version"), Some("9.9.9.9"));
+}
+
+#[test]
+fn an_answer_replaces_only_the_register_it_carries() {
+    let mut report = {
+        let frame = Frame::parse(FULL_REPORT).expect("the fixture parses");
+        Identity::from_frame(&frame).expect("the identity report decodes")
+    };
+    let before = report.entries.len();
+    let model = report.get("model_id").map(str::to_owned);
+
+    let answer = {
+        let body = [
+            0x00, 0x01, 0x00, 0x00, 0x15, 0x00, 0x07, b'9', b'.', b'9', b'.', b'9', b'.', b'9',
+        ];
+        let wire = frame_with(0x01, 0x19, &body);
+        let frame = Frame::parse(&wire).expect("the hand-built frame parses");
+        Identity::from_frame(&frame).expect("an answer decodes like a report")
+    };
+    report.apply(&answer);
+
+    assert_eq!(
+        report.get("sw_version"),
+        Some("9.9.9.9"),
+        "the answered register is fresh"
+    );
+    assert_eq!(report.get("model_id"), model.as_deref(), "the rest survives");
+    assert_eq!(report.entries.len(), before, "a merge is not an append");
+}
+
 /// Build a frame with an arbitrary address, which `Frame::new` cannot do — it derives the address from the
 /// message type, and the point here is a message type arriving under an address this program never sends.
 fn frame_with(address: u8, function: u8, body: &[u8]) -> Vec<u8> {

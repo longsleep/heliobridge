@@ -135,6 +135,21 @@ impl Identity {
         parts.join(" ")
     }
 
+    /// Fold a later report into this one.
+    ///
+    /// The answer to a config read carries a single register, and replacing a 32-entry report with it would
+    /// discard everything else the device said about itself. Entries are updated in place or appended, and
+    /// `declared` keeps describing the report this began as — it is a fact about a frame, not about the
+    /// accumulated picture.
+    pub fn apply(&mut self, newer: &Self) {
+        for entry in &newer.entries {
+            match self.entries.iter_mut().find(|held| held.register == entry.register) {
+                Some(held) => held.value.clone_from(&entry.value),
+                None => self.entries.push(entry.clone()),
+            }
+        }
+    }
+
     /// Whether a config register this build documents was reported at all.
     ///
     /// The reason this matters: an action keyed to a register the device never mentions should not be
@@ -153,9 +168,13 @@ impl fmt::Display for Identity {
 
 impl FromFrame for Identity {
     fn from_frame(frame: &Frame) -> Result<Self, DecodeError> {
+        // Two message types, one body. An unsolicited report arrives as 0xFE19 with everything the device
+        // knows about itself; the answer to a config read arrives as 0x0119 with the one register asked for,
+        // laid out identically — count, pad, then TLV entries. Observed: a read of register 21 came back in
+        // 54 octets as `00 01 00 | 00 15 00 07 "4.0.1.9"`.
         let actual = frame.message_type();
         ensure!(
-            actual == MessageType::IdentityReport,
+            matches!(actual, MessageType::IdentityReport | MessageType::ConfigRead),
             WrongMessageTypeSnafu {
                 expected: MessageType::IdentityReport,
                 actual,

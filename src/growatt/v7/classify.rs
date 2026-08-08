@@ -29,6 +29,18 @@ impl Frame {
             MessageType::SettingsSnapshot => Intent::SettingsSnapshot,
             MessageType::IdentityReport => Intent::Identity,
 
+            // Direction decides again, and the register sits at a different offset in each: the request is
+            // `count(2) register(2)`, the answer `count(2) pad(1) register(2) length(2) value` — the identity
+            // report's own layout with a single entry.
+            MessageType::ConfigRead if to_device => match self.register_at(2) {
+                Some(register) => Intent::ReadRequest { register },
+                None => Intent::Unrecognised,
+            },
+            MessageType::ConfigRead => match self.register_at(3) {
+                Some(register) => Intent::ReadResponse { register },
+                None => Intent::Unrecognised,
+            },
+
             // The config write carries its register inside the first TLV entry: count, entry length,
             // then the register.
             MessageType::ConfigWrite => match self.register_at(4) {

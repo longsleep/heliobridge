@@ -86,8 +86,8 @@ use snafu::{ResultExt, Snafu};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::growatt::v7::encode::Command;
-use crate::growatt::v7::registers::{HoldingRegister, SLOT_COUNT};
+use crate::growatt::v7::encode::{Command, WritableConfig};
+use crate::growatt::v7::registers::{ConfigRegister, HoldingRegister, SLOT_COUNT};
 use crate::model::{Raw, Register};
 
 /// How many commands may queue per device before new ones are refused.
@@ -122,6 +122,12 @@ pub enum Action {
     Apply(Command),
     /// Read a register and report its value.
     Refresh(Register),
+    /// Transmit a config-space write and report only that it was sent.
+    ///
+    /// Deliberately unverified, unlike [`Self::Apply`]. A config write draws no acknowledgement, and the
+    /// read that would confirm one has never been observed on the wire, so "sent" is the honest maximum.
+    /// Two of these do not even hold a value to read back: registers 32 and 35 are actions.
+    Send(Command),
 }
 
 /// One request, with somewhere to send the answer.
@@ -165,6 +171,48 @@ impl Outcome {
             value: None,
             confirmed: false,
             error: Some("the device did not answer the read-back".to_owned()),
+        }
+    }
+
+    /// An outcome for a config command that was transmitted.
+    ///
+    /// `confirmed` is true because the request was carried out as far as the protocol allows: the frame went
+    /// out. It does not claim the device acted on it — `error` carries that caveat rather than leaving the
+    /// caller to infer it. A read is answered, but asynchronously, in an uplink frame that lands in the
+    /// identity cache rather than here; a write is never answered at all.
+    pub fn sent(command: &Command) -> Self {
+        let caveat = if command.config_register().is_some() {
+            "sent; a config write draws no acknowledgement, so the device's action is unverified"
+        } else {
+            "sent; the answer arrives as a separate report, so read the register back to see it"
+        };
+        Self {
+            confirmed: true,
+            error: Some(caveat.to_owned()),
+            ..Self::for_config(command)
+        }
+    }
+
+    /// An outcome for a config command that could not be transmitted.
+    pub fn not_sent(command: &Command, error: &str) -> Self {
+        Self {
+            confirmed: false,
+            error: Some(error.to_owned()),
+            ..Self::for_config(command)
+        }
+    }
+
+    /// The register and value fields shared by both config outcomes.
+    fn for_config(command: &Command) -> Self {
+        let target = command.config_target();
+        Self {
+            name: target.and_then(ConfigRegister::lookup).map(|entry| entry.name),
+            register: target.map_or(0, Register::number),
+            requested: None,
+            stored: None,
+            value: command.config_value().map(str::to_owned),
+            confirmed: false,
+            error: None,
         }
     }
 
@@ -427,6 +475,10 @@ pub fn listen(path: &Path, registry: Registry) -> Result<(), ControlError> {
         .route("/devices/{device}/settings", get(Api::settings))
         .route("/devices/{device}/settings/{key}", get(Api::setting).put(Api::write))
         .route("/devices/{device}/settings/{key}/read", post(Api::refresh))
+        .route("/devices/{device}/actions", get(Api::actions))
+        .route("/devices/{device}/actions/{key}", post(Api::act))
+        .route("/devices/{device}/config/{key}", get(Api::config))
+        .route("/devices/{device}/config/{key}/read", post(Api::read_config))
         .with_state(registry);
 
     let socket = path.to_path_buf();
@@ -451,6 +503,65 @@ fn restrict(path: &Path) {
         if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
             tracing::warn!(%error, "could not restrict the control socket's permissions");
         }
+    }
+}
+
+/// An action the device can be asked to perform.
+///
+/// Config-space commands rather than settings: each is a write of `"1"` to a register that *does* something
+/// and holds nothing. Kept as a closed enum rather than derived from the register map, because "this register
+/// is writable" and "triggering this is a sensible thing to offer over an API" are different claims — the
+/// retarget registers are writable and belong nowhere near a one-word `POST`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum DeviceAction {
+    /// Restart the datalogger. Recoverable: it reboots and reconnects by itself.
+    Restart,
+    /// Clear the datalogger's log.
+    ClearLog,
+}
+
+impl DeviceAction {
+    /// Every action offered.
+    const ALL: [Self; 2] = [Self::Restart, Self::ClearLog];
+
+    /// The name in the route.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Restart => "restart",
+            Self::ClearLog => "clear-log",
+        }
+    }
+
+    /// What it does, in a sentence, for the listing.
+    const fn effect(self) -> &'static str {
+        match self {
+            Self::Restart => {
+                "reboots the datalogger; the session drops and returns within seconds, and telemetry pauses \
+                 meanwhile. The inverter keeps running"
+            }
+            Self::ClearLog => "clears the datalogger's own log; no effect on telemetry or settings",
+        }
+    }
+
+    /// The config register behind it.
+    const fn config(self) -> WritableConfig {
+        match self {
+            Self::Restart => WritableConfig::Restart,
+            Self::ClearLog => WritableConfig::ClearLog,
+        }
+    }
+
+    /// The command that performs it.
+    fn command(self) -> Command {
+        match self {
+            Self::Restart => Command::restart_datalogger(),
+            Self::ClearLog => Command::clear_datalogger_log(),
+        }
+    }
+
+    /// Find one by name.
+    fn lookup(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.name() == name)
     }
 }
 
@@ -704,6 +815,101 @@ impl Api {
     /// Force a read of one register.
     async fn refresh(Session { handle, .. }: Session, setting: Setting) -> Response {
         dispatch(&handle, Action::Refresh(setting.register)).await
+    }
+
+    /// One config register's value, as last reported.
+    ///
+    /// From the accumulated identity — no device traffic, like every other `GET` here.
+    async fn config(Session { handle, .. }: Session, Key(key): Key) -> Response {
+        let register = match Self::config_register(&key) {
+            Ok(register) => register,
+            Err(rejection) => return rejection.into_response(),
+        };
+        let found = handle.identity.borrow().as_ref().and_then(|report| {
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.register == register.number())
+                .cloned()
+        });
+        match found {
+            Some(entry) => axum::Json(entry).into_response(),
+            None => problem(
+                StatusCode::NOT_FOUND,
+                &format!("the device has not reported config register {}", register.number()),
+            ),
+        }
+    }
+
+    /// Ask the device to report one config register again.
+    ///
+    /// A `POST` rather than a query parameter on the `GET`, and for the same reason `…/settings/{key}/read`
+    /// is one: it puts a frame on the wire. A `GET` is supposed to be safe, and this costs the device's
+    /// attention, may time out, and cannot be repeated for free.
+    ///
+    /// It also cannot answer with the value. The reply arrives asynchronously as an identity report, which is
+    /// folded into the accumulated picture — so this reports that the request went out, and the `GET` above is
+    /// where the value appears.
+    async fn read_config(Session { handle, .. }: Session, Key(key): Key) -> Response {
+        let register = match Self::config_register(&key) {
+            Ok(register) => register,
+            Err(rejection) => return rejection.into_response(),
+        };
+        dispatch(&handle, Action::Send(Command::read_config(register))).await
+    }
+
+    /// Resolve a config register by documented name or by number.
+    ///
+    /// Any register, not only the writable ones: reading has no side effect, which is the same reasoning that
+    /// leaves the holding-register read unrestricted.
+    fn config_register(key: &str) -> Result<Register, Rejection> {
+        if let Ok(number) = key.parse::<u16>() {
+            return Ok(Register(number));
+        }
+        ConfigRegister::lookup_name(key)
+            .map(|entry| entry.register)
+            .ok_or_else(|| {
+                Rejection::new(
+                    StatusCode::NOT_FOUND,
+                    format!("unknown config register {key:?}; see /devices/…/identity"),
+                )
+            })
+    }
+
+    /// What actions this device accepts.
+    ///
+    /// Listed rather than documented elsewhere, because the set depends on what has been observed rather than
+    /// on what a register map contains: these are config-space commands, and each was captured from the
+    /// vendor's own interface before being offered here.
+    async fn actions(_session: Session) -> Response {
+        let listed: Vec<_> = DeviceAction::ALL
+            .iter()
+            .map(|action| {
+                serde_json::json!({
+                    "action": action.name(),
+                    "register": action.config().register().number(),
+                    "value": action.config().trigger_value(),
+                    "effect": action.effect(),
+                    "confirmable": false,
+                })
+            })
+            .collect();
+        axum::Json(serde_json::json!({ "actions": listed })).into_response()
+    }
+
+    /// Trigger one action.
+    ///
+    /// `POST`, not `PUT`: these are not idempotent in any useful sense — restarting twice restarts twice —
+    /// and there is no resource whose state they set.
+    async fn act(Session { handle, .. }: Session, Key(key): Key) -> Response {
+        let Some(action) = DeviceAction::lookup(&key) else {
+            let known: Vec<&str> = DeviceAction::ALL.iter().map(|action| action.name()).collect();
+            return problem(
+                StatusCode::NOT_FOUND,
+                &format!("unknown action {key:?}; this device accepts {}", known.join(", ")),
+            );
+        };
+        dispatch(&handle, Action::Send(action.command())).await
     }
 
     /// Serve a cached value, or explain that it has not arrived yet.
