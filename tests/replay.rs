@@ -12,7 +12,7 @@ use heliobridge::growatt::v7::decode::{FromFrame, InputBlock, RECORD_MARKER_TELE
 use heliobridge::growatt::v7::frame::{Frame, MessageType};
 use heliobridge::growatt::v7::registers::{INPUT_REGISTERS, InputRegister};
 use heliobridge::growatt::{Codec, ProtocolVersion, peek_version};
-use heliobridge::model::{Confidence, Register, Value};
+use heliobridge::model::{Confidence, Register, Timestamp, Value};
 
 /// The redacted serial every fixture carries.
 const SERIAL: &str = "0EXAMPLE00000001";
@@ -302,15 +302,19 @@ fn embedded_serial_matches_the_header() {
 #[test]
 fn no_fixture_contains_anything_but_the_placeholder_serial() {
     // Guards the privacy property directly rather than trusting the generator: a fixture regenerated
-    // by hand, or a new one added carelessly, fails here.
-    for fixture in FIXTURES {
-        let frame = Frame::parse(fixture.wire).expect("parse");
+    // by hand, or a new one added carelessly, fails here. The buffered replay is checked alongside the
+    // telemetry set, since it is the same 585-octet record and carries the serial in the same places.
+    let files = FIXTURES
+        .iter()
+        .map(|fixture| (fixture.file, fixture.wire))
+        .chain(core::iter::once(("telemetry-buffered-replay.bin", BUFFERED_REPLAY)));
+    for (file, wire) in files {
+        let frame = Frame::parse(wire).expect("parse");
         let plain = frame.plain();
         let occurrences = plain.windows(SERIAL.len()).filter(|w| *w == SERIAL.as_bytes()).count();
         assert_eq!(
             occurrences, 3,
-            "{}: expected the placeholder three times, found {occurrences}",
-            fixture.file
+            "{file}: expected the placeholder three times, found {occurrences}"
         );
 
         // Any other long run of printable text would be a leak — a component serial, a hostname.
@@ -332,18 +336,13 @@ fn no_fixture_contains_anything_but_the_placeholder_serial() {
                     let text = String::from_utf8_lossy(run);
                     assert!(
                         text.contains(SERIAL),
-                        "{}: printable run of {} octets at offset {from} is not the placeholder: {text:?}",
-                        fixture.file,
+                        "{file}: printable run of {} octets at offset {from} is not the placeholder: {text:?}",
                         run.len()
                     );
                 }
             }
         }
-        assert_eq!(
-            checked, 3,
-            "{}: expected exactly three long printable runs",
-            fixture.file
-        );
+        assert_eq!(checked, 3, "{file}: expected exactly three long printable runs");
     }
 }
 
@@ -428,5 +427,48 @@ fn every_octet_of_the_body_is_covered_by_the_obfuscation() {
         InputRegister::lookup(Register(5)).map(InputRegister::offset),
         Some(0x59),
         "register 5 sits at 0x4F + 10"
+    );
+}
+
+/// A record the device held in its archive and replayed on connect, rather than a current reading.
+const BUFFERED_REPLAY: &[u8] = include_bytes!("fixtures/telemetry-buffered-replay.bin");
+
+#[test]
+fn a_buffered_replay_decodes_as_ordinary_telemetry() {
+    // `0x50` is the same record as `0x04` — same length, same marker, same register block — so one
+    // decoder serves both. A codec that rejected it by message type would be discarding history.
+    let frame = Frame::parse(BUFFERED_REPLAY).expect("parse");
+    assert_eq!(frame.message_type(), MessageType::BufferedTelemetry);
+    assert_eq!(frame.wire_len(), 585);
+    assert_eq!(frame.header().length, 577);
+
+    let telemetry = Telemetry::from_frame(&frame).expect("decode");
+    assert_eq!(telemetry.device_id, SERIAL);
+    assert_eq!(telemetry.record_marker, RECORD_MARKER_TELEMETRY);
+    assert!(telemetry.timestamp.is_some_and(Timestamp::is_plausible));
+
+    // Same register coverage as a current frame; the fixtures differ in values, not in shape.
+    let current = Telemetry::from_frame(&Frame::parse(FIXTURES[0].wire).expect("parse")).expect("decode");
+    assert_eq!(telemetry.readings.len(), current.readings.len());
+}
+
+#[test]
+fn a_buffered_replay_is_older_than_the_telemetry_it_arrived_with() {
+    // The point of the message type. Both fixtures come from the same connect, but this record was
+    // sampled 70 s before the telemetry frame and would overwrite it with stale values if merged into
+    // current state. Only the embedded timestamp reveals that.
+    let replayed = Telemetry::from_frame(&Frame::parse(BUFFERED_REPLAY).expect("parse"))
+        .expect("decode")
+        .timestamp
+        .expect("stamped");
+    let current = Telemetry::from_frame(&Frame::parse(FIXTURES[0].wire).expect("parse"))
+        .expect("decode")
+        .timestamp
+        .expect("stamped");
+
+    assert_eq!(current.to_string(), FIXTURES[0].timestamp);
+    assert!(
+        replayed.to_string() < current.to_string(),
+        "replayed {replayed} should predate {current}"
     );
 }

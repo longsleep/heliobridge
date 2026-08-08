@@ -57,6 +57,17 @@ encoding, which every other frame here would pass.
 
 All four satisfy the derived-value rule `battery_charge_power == pv_power_total − |ac_power|`.
 
+A fifth telemetry frame is here for a different reason:
+
+| File | Timestamp | Function | Why |
+|---|---|---|---|
+| `telemetry-buffered-replay.bin` | 2026-08-06 23:41:35 | `0x50` | A record the device held in its archive and replayed on connect |
+
+It is the same 585-octet record as the four above and decodes with the same map, but it was sampled
+**70 seconds before** `telemetry-night-discharge.bin` and delivered alongside it. That is the whole
+point of the fixture: only the embedded timestamp distinguishes a replayed sample from a current one,
+and a decoder that merges it into live state publishes stale readings after every reconnect.
+
 ## Server-originated frames
 
 Frames the **vendor server** sent to the device, used to check that the encoder produces byte-identical

@@ -25,7 +25,7 @@ impl Frame {
     pub fn intent(&self, direction: Direction) -> Intent {
         let to_device = matches!(direction, Direction::ToDevice);
         match self.message_type() {
-            MessageType::Telemetry | MessageType::ExtendedTelemetry => Intent::Telemetry,
+            MessageType::Telemetry | MessageType::BufferedTelemetry => Intent::Telemetry,
             MessageType::SettingsSnapshot => Intent::SettingsSnapshot,
             MessageType::IdentityReport => Intent::Identity,
 

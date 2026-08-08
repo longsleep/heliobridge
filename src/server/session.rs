@@ -110,6 +110,8 @@ pub struct SessionStats {
     pub frames: u64,
     /// Telemetry frames decoded.
     pub telemetry: u64,
+    /// Telemetry records replayed from the device's archive, decoded but not published as current.
+    pub buffered: u64,
     /// Frames that failed to parse.
     pub rejected: u64,
     /// Frames of a message type this codec does not decode.
@@ -640,7 +642,26 @@ where
                 }
             },
 
-            MessageType::SettingsSnapshot | MessageType::ExtendedTelemetry | MessageType::ConfigWrite => {
+            // Decoded, deliberately not published. This is a sample the device took earlier and held until
+            // it could reach a server — observed 68 minutes stale — so feeding it to the live state would
+            // replace good readings with old ones each time a session starts. Logged with its own timestamp
+            // so a gap in history is at least visible; filling that gap needs somewhere to put it.
+            MessageType::BufferedTelemetry => match Telemetry::from_frame(frame) {
+                Ok(telemetry) => {
+                    self.stats.buffered = self.stats.buffered.saturating_add(1);
+                    tracing::info!(
+                        recorded = telemetry.timestamp.map(|stamp| stamp.to_string()),
+                        readings = telemetry.readings.len(),
+                        "a telemetry record replayed from the device's archive, not current state"
+                    );
+                }
+                Err(error) => {
+                    self.stats.rejected = self.stats.rejected.saturating_add(1);
+                    tracing::warn!(%error, "could not decode a buffered telemetry record");
+                }
+            },
+
+            MessageType::SettingsSnapshot | MessageType::ConfigWrite => {
                 self.stats.undecoded = self.stats.undecoded.saturating_add(1);
                 tracing::info!(
                     %message_type,

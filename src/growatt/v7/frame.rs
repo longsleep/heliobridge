@@ -130,8 +130,13 @@ pub enum MessageType {
     WriteSingleRegister,
     /// `0x0110` — write a contiguous register range, server to device.
     WriteRegisterRange,
-    /// `0x0150` — extended telemetry, device to server.
-    ExtendedTelemetry,
+    /// `0x0150` — a telemetry record replayed from the device's archive, device to server.
+    ///
+    /// The same record as [`Self::Telemetry`] in every respect but freshness: the device samples every
+    /// ~5 minutes into a buffer and flushes what the server missed when it reconnects, oldest first. The
+    /// frame's own timestamp is the only thing that says when it was taken, and it has been observed 68
+    /// minutes stale.
+    BufferedTelemetry,
     /// `0x18` under either address — write to a config register, server to device.
     ///
     /// The periodic clock push is one instance of it and arrives as `0xFE18`; commands issued from the
@@ -164,7 +169,7 @@ impl MessageType {
             (0x01, 0x05) => Self::ReadSingleRegister,
             (0x01, 0x06) => Self::WriteSingleRegister,
             (0x01, 0x10) => Self::WriteRegisterRange,
-            (0x01, 0x50) => Self::ExtendedTelemetry,
+            (0x01, 0x50) => Self::BufferedTelemetry,
             // Either address. The vendor's periodic clock push arrives as 0xFE18 and every command issued
             // from its web interface as 0x0118 — same message, same body layout, and dispatching on the pair
             // would silently miss four of the five known config writes.
@@ -187,7 +192,7 @@ impl MessageType {
             | Self::ReadSingleRegister
             | Self::WriteSingleRegister
             | Self::WriteRegisterRange
-            | Self::ExtendedTelemetry
+            | Self::BufferedTelemetry
             // The vendor sends a config read under 0x01, captured at 44 octets.
             | Self::ConfigRead => 0x01,
             // The address this program *sends* a config write under. Either is accepted on receipt, and a
@@ -207,7 +212,7 @@ impl MessageType {
             Self::ReadSingleRegister => 0x05,
             Self::WriteSingleRegister => 0x06,
             Self::WriteRegisterRange => 0x10,
-            Self::ExtendedTelemetry => 0x50,
+            Self::BufferedTelemetry => 0x50,
             Self::ConfigWrite => 0x18,
             // One function, two directions: the request downstream, the report back.
             Self::ConfigRead | Self::IdentityReport => 0x19,
@@ -229,7 +234,7 @@ impl core::fmt::Display for MessageType {
             Self::ReadSingleRegister => "read-single",
             Self::WriteSingleRegister => "write-single",
             Self::WriteRegisterRange => "write-range",
-            Self::ExtendedTelemetry => "extended-telemetry",
+            Self::BufferedTelemetry => "buffered-telemetry",
             Self::ConfigWrite => "config-write",
             Self::ConfigRead => "config-read",
             Self::IdentityReport => "identity",
@@ -616,7 +621,7 @@ mod tests {
             MessageType::ReadSingleRegister,
             MessageType::WriteSingleRegister,
             MessageType::WriteRegisterRange,
-            MessageType::ExtendedTelemetry,
+            MessageType::BufferedTelemetry,
             MessageType::ConfigWrite,
             MessageType::IdentityReport,
         ] {

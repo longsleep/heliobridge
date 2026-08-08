@@ -383,13 +383,17 @@ impl<'a> InputBlock<'a> {
 }
 
 impl FromFrame for Telemetry {
-    /// Decode a `0x04` telemetry frame.
+    /// Decode a `0x04` telemetry frame, or the `0x50` replay of one.
+    ///
+    /// Both carry the same record; `0x50` differs only in being a sample taken earlier and held in the
+    /// device's archive. The timestamp is what tells them apart, and a caller that merges a `0x50` into
+    /// current state will publish stale values after every reconnect.
     ///
     /// Unknown registers are decoded and included; whether to present them is the caller's decision.
     fn from_frame(frame: &Frame) -> Result<Self, DecodeError> {
         let actual = frame.message_type();
         ensure!(
-            actual == MessageType::Telemetry,
+            matches!(actual, MessageType::Telemetry | MessageType::BufferedTelemetry),
             WrongMessageTypeSnafu {
                 expected: MessageType::Telemetry,
                 actual,

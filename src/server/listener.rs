@@ -172,6 +172,7 @@ async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcce
         Ok(stats) => tracing::info!(
             frames = stats.frames,
             telemetry = stats.telemetry,
+            buffered = stats.buffered,
             reads = stats.reads,
             rejected = stats.rejected,
             undecoded = stats.undecoded,
