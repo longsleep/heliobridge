@@ -56,6 +56,14 @@ fn run(config: &Config) -> Result<(), String> {
             cloud = %endpoint.address(),
             "relaying to the vendor cloud; the phone app and cloud integrations keep working"
         );
+        // Worth a line of its own: the relay is the one place where a party other than this program can
+        // write to the device, so what it will and will not carry should not have to be inferred.
+        tracing::info!(
+            mode = ?config.relay_mode,
+            answers = ?config.relay_answers,
+            "relay policy: how much the cloud may change, and which command answers it is told about. \
+             Telemetry, identity and settings snapshots are always forwarded"
+        );
     }
 
     // Started inside the runtime: it spawns a writer task.
@@ -86,6 +94,7 @@ fn run(config: &Config) -> Result<(), String> {
     let options = server::SessionOptions {
         time_push: config.should_push_time(),
         cloud,
+        policy: config.policy(),
         recorder,
         slots: config.slots,
         registry,
@@ -100,7 +109,7 @@ fn run(config: &Config) -> Result<(), String> {
             "will push this server's time to the device after it connects"
         );
     } else {
-        tracing::info!("not pushing server time: the cloud relay is the clock authority");
+        tracing::info!("not pushing server time: relaying in full mode, so the cloud is the clock authority");
     }
 
     let listen = config.listen;

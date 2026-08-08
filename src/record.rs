@@ -4,17 +4,24 @@
 //! because the protocol became tractable by re-reading captures with a better decoder, and the next
 //! unknown register will be found the same way.
 //!
-//! # Three streams, kept separate
+//! # Four streams, kept separate
 //!
 //! | File | Contents |
 //! |---|---|
 //! | `up.bin` | frames received from the device |
 //! | `down.bin` | frames received from the cloud, when relaying |
 //! | `inject.bin` | frames this program originated itself |
+//! | `blocked.bin` | frames the relay policy refused to deliver to the device |
 //!
 //! Keeping `inject` apart from `down` is the point rather than tidiness: from the device's side the two
 //! are indistinguishable, so when a write misbehaves the first question is whether this program sent what
 //! it thought it sent. One merged stream cannot answer that.
+//!
+//! `blocked` answers a different question — what the relay policy refused — and is recorded *in addition*
+//! to `down`, so that stream stays a complete record of what the cloud sent. Filtering the wrong thing is
+//! the failure mode a filter introduces, and it is only auditable if the refusals are written down.
+//! Uplink refusals need no file of their own: `up.bin` already holds every frame the device sent, whether
+//! or not it was forwarded.
 //!
 //! # Raw octets, exactly as they crossed the socket
 //!
@@ -98,11 +105,18 @@ pub enum Stream {
     Down,
     /// Originated by this program.
     Inject,
+    /// Refused by the relay policy and never delivered to the device.
+    ///
+    /// Deliberately redundant with [`Self::Down`], which keeps holding everything the cloud sent: one
+    /// file answers "what did the cloud send", the other "what did we refuse", and neither has to be
+    /// reconstructed by subtracting the other. Refusals are rare enough — six in twelve hours — that the
+    /// duplicated octets do not matter.
+    Blocked,
 }
 
 impl Stream {
     /// Every stream, for iterating.
-    pub const ALL: [Self; 3] = [Self::Up, Self::Down, Self::Inject];
+    pub const ALL: [Self; 4] = [Self::Up, Self::Down, Self::Inject, Self::Blocked];
 
     /// The octet written into a record.
     pub const fn tag(self) -> u8 {
@@ -110,6 +124,7 @@ impl Stream {
             Self::Up => 0,
             Self::Down => 1,
             Self::Inject => 2,
+            Self::Blocked => 3,
         }
     }
 
@@ -119,6 +134,7 @@ impl Stream {
             0 => Some(Self::Up),
             1 => Some(Self::Down),
             2 => Some(Self::Inject),
+            3 => Some(Self::Blocked),
             _ => None,
         }
     }
@@ -129,6 +145,7 @@ impl Stream {
             Self::Up => "up.bin",
             Self::Down => "down.bin",
             Self::Inject => "inject.bin",
+            Self::Blocked => "blocked.bin",
         }
     }
 }
@@ -139,6 +156,7 @@ impl fmt::Display for Stream {
             Self::Up => "up",
             Self::Down => "down",
             Self::Inject => "inject",
+            Self::Blocked => "blocked",
         })
     }
 }

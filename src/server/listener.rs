@@ -22,6 +22,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::control::Registry;
 use crate::growatt::cloud::CloudConfig;
+use crate::growatt::policy::Policy;
 use crate::record::Recorder;
 use crate::server::session::Session;
 
@@ -47,12 +48,16 @@ pub enum ListenerError {
 pub struct SessionOptions {
     /// Whether to push the server's wall-clock time after the device connects.
     ///
-    /// Off when relaying to the cloud, which sends its own — two servers setting one clock would set it
-    /// twice per connect, to values differing by whatever skew exists between them.
+    /// Off only when the cloud's own configuration write is being relayed through, since two parties
+    /// setting one clock would set it twice per connect, to values differing by whatever skew exists
+    /// between them.
     pub time_push: bool,
 
     /// Relay traffic to the vendor cloud, so the phone app keeps working.
     pub cloud: Option<CloudConfig>,
+
+    /// What the relay carries in each direction. Ignored unless `cloud` is set.
+    pub policy: Policy,
 
     /// Record every frame, in both directions plus the ones this program originates.
     pub recorder: Option<Recorder>,
@@ -69,6 +74,7 @@ impl Default for SessionOptions {
         Self {
             time_push: true,
             cloud: None,
+            policy: Policy::default(),
             recorder: None,
             slots: 1,
             registry: None,
@@ -96,6 +102,8 @@ pub async fn serve(
         time_push = options.time_push,
         cloud_relay = options.cloud.is_some(),
         recording = options.recorder.is_some(),
+        mode = ?options.policy.mode,
+        answers = ?options.policy.answers,
         "listening for the device"
     );
 
@@ -155,6 +163,7 @@ async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcce
     let mut session = Session::new(stream)
         .with_time_push(options.time_push)
         .with_cloud(options.cloud)
+        .with_policy(options.policy)
         .with_recorder(options.recorder)
         .with_slots(options.slots)
         .with_registry(options.registry);
@@ -169,6 +178,8 @@ async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcce
             pings = stats.pings,
             relay_received = stats.relay_received,
             relay_dropped = stats.relay_dropped,
+            refused_to_device = stats.refused_to_device,
+            withheld_from_cloud = stats.withheld_from_cloud,
             "session ended"
         ),
         Err(error) => tracing::warn!(reason = %flatten(&error), "session failed"),
@@ -193,6 +204,7 @@ fn flatten(error: &dyn std::error::Error) -> String {
 mod tests {
     use super::SessionOptions;
     use crate::growatt::cloud::CloudConfig;
+    use crate::growatt::policy::Policy;
 
     #[test]
     fn defaults_relay_nothing_record_nothing_and_push_time() {
@@ -204,11 +216,13 @@ mod tests {
 
     #[test]
     fn the_two_settings_are_independent_but_conventionally_opposed() {
-        // Relaying means the cloud owns the clock, so the wiring in `main` turns the push off. Nothing
-        // here enforces that — it is a policy decision, and this type only carries it.
+        // The clock has one owner. Relaying with the cloud's configuration write passing through makes it
+        // the cloud, so the wiring in `main` turns our push off. Nothing here enforces that — it is a
+        // policy decision, and this type only carries it.
         let options = SessionOptions {
             time_push: false,
             cloud: Some(CloudConfig::default()),
+            policy: Policy::OPEN,
             recorder: None,
             slots: 1,
             registry: None,

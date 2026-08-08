@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::growatt::cloud::{self, CloudConfig};
+use crate::growatt::policy::{Answers, Mode, Policy};
 use crate::record::{self, RecorderConfig};
 
 /// Default device-facing listener address.
@@ -42,8 +43,8 @@ pub struct Config {
 
     /// Record every frame here for later analysis. Off unless set.
     ///
-    /// Writes `up.bin`, `down.bin` and `inject.bin`: raw octets exactly as they crossed the socket, so a
-    /// later, better decoder can re-read them.
+    /// Writes `up.bin`, `down.bin`, `inject.bin` and `blocked.bin`: raw octets exactly as they crossed the
+    /// socket, so a later, better decoder can re-read them.
     #[arg(long, env = "HELIOBRIDGE_RECORD_DIR")]
     pub record_dir: Option<PathBuf>,
 
@@ -71,9 +72,8 @@ pub struct Config {
 
     /// Relay device traffic to the Growatt cloud, so the vendor app keeps working.
     ///
-    /// Also decides who sets the device's clock. The server time push is sent unless this is on: the
-    /// cloud sends its own, and two servers setting one clock is one too many — the device would be set
-    /// twice per connect, to values differing by whatever skew exists between them.
+    /// How much authority the cloud then keeps is a separate decision — see `--relay-mode`, which also
+    /// decides who owns the device's clock, since the vendor server sets it with a configuration write.
     #[arg(long, env = "HELIOBRIDGE_CLOUD_RELAY", default_value_t = false)]
     pub cloud_relay: bool,
 
@@ -86,6 +86,43 @@ pub struct Config {
     /// Cloud port.
     #[arg(long, env = "HELIOBRIDGE_CLOUD_PORT", default_value_t = cloud::DEFAULT_PORT)]
     pub cloud_port: u16,
+
+    /// How much authority the vendor cloud keeps while relaying.
+    ///
+    /// In every mode the vendor app keeps **displaying** correctly; what differs is what it may change.
+    ///
+    /// - `full` — the app works as if this program were absent, including datalogger configuration. The
+    ///   cloud then also owns the clock, and could retarget the device's broker away from here.
+    /// - `controls` — the app still changes slots, output power, charge limits and the switches, but not the
+    ///   broker endpoint, DNS, timezone or clock, and nothing unrecognised. The vendor server was never
+    ///   observed sending anything outside the permitted set, so this costs no observed functionality;
+    ///   refusing the unrecognised is also the only available defence against a message nobody can classify.
+    /// - `observer` — the cloud sees everything and changes nothing. The right choice once settings are
+    ///   driven locally, since a second writer is then only a way for two pictures to disagree.
+    ///
+    /// Nothing the device sends is ever withheld, in any mode: a report cannot change the device's behaviour,
+    /// and the vendor app's display is fed from the cloud's store, so withholding one only makes the app
+    /// wrong — and an app writing whole register ranges from a wrong picture reverts settings.
+    ///
+    /// Worth remembering in every mode: "the cloud" is anyone who can reach the vendor broker knowing this
+    /// serial.
+    #[arg(long, env = "HELIOBRIDGE_RELAY_MODE", default_value = "controls")]
+    pub relay_mode: Mode,
+
+    /// Which answers to earlier commands are forwarded to the cloud while relaying.
+    ///
+    /// `cloud-only`, the default, forwards only answers to commands the cloud itself issued. Every local write
+    /// produces an acknowledgement and a read-back, and every reconnect re-reads each exposed setting, so a
+    /// controller driving the device turns those into a steady stream of frames the cloud never asked for.
+    ///
+    /// Forwarding them was measured to achieve nothing: the vendor app's settings view is updated by the
+    /// periodic snapshot alone — neither acknowledgements nor read responses move it — so the app trails the
+    /// device by up to an hour either way. Unrequested traffic with no upside is worth avoiding against a
+    /// vendor whose APIs are documented as rate-limiting and IP-banning.
+    ///
+    /// Reports are never withheld in either setting: telemetry, identity and the settings snapshot always pass.
+    #[arg(long, env = "HELIOBRIDGE_RELAY_ANSWERS", default_value = "cloud-only")]
+    pub relay_answers: Answers,
 
     /// Tracing filter, per subsystem. Falls back to `RUST_LOG`.
     #[arg(long, env = "HELIOBRIDGE_LOG", default_value = "info")]
@@ -113,10 +150,19 @@ impl Config {
 
     /// Whether this server should push its wall-clock time to the device.
     ///
-    /// Always, unless relaying — in which case the cloud does it and we would be a second authority on
-    /// the same clock.
+    /// Exactly one party may own the clock. The vendor server sets it with a configuration write, so the
+    /// question is not "are we relaying" but "is that write getting through": if the mode refuses it, nobody
+    /// is setting the clock unless we do. In the default mode that is always, relay or not.
     pub const fn should_push_time(&self) -> bool {
-        !self.cloud_relay
+        !(self.cloud_relay && self.relay_mode.cloud_may_write_config())
+    }
+
+    /// What the relay carries in each direction.
+    pub const fn policy(&self) -> Policy {
+        Policy {
+            mode: self.relay_mode,
+            answers: self.relay_answers,
+        }
     }
 
     /// The cloud endpoint to relay to, or `None` when relaying is off.
@@ -155,7 +201,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, DEFAULT_LISTEN, LogFormat};
+    use super::{Answers, Config, DEFAULT_LISTEN, LogFormat, Mode};
     use clap::Parser as _;
 
     fn parse(flags: &[&str]) -> Config {
@@ -193,6 +239,34 @@ mod tests {
         assert!(Config::try_parse_from(["heliobridge", "--listen", "not-an-address"]).is_err());
         let config = parse(&["--listen", "127.0.0.1:17006"]);
         assert_eq!(config.listen.port(), 17006);
+    }
+
+    #[test]
+    fn the_clock_authority_follows_the_policy_not_the_relay() {
+        // Not relaying: nobody else could set it.
+        assert!(parse(&[]).should_push_time());
+        // Relaying in the default mode, which refuses the cloud's configuration write: if we did not push,
+        // the device's clock would go unset.
+        assert!(parse(&["--cloud-relay"]).should_push_time());
+        assert!(parse(&["--cloud-relay", "--relay-mode", "observer"]).should_push_time());
+        // Full mode: the cloud's write gets through, so pushing as well would set the clock twice per
+        // connect, to two slightly different values.
+        assert!(!parse(&["--cloud-relay", "--relay-mode", "full"]).should_push_time());
+    }
+
+    #[test]
+    fn the_default_keeps_the_app_working_minus_configuration() {
+        let config = parse(&[]);
+        assert_eq!(config.relay_mode, Mode::Controls);
+        assert!(
+            !config.relay_mode.cloud_may_write_config(),
+            "no datalogger configuration"
+        );
+        assert_eq!(
+            config.relay_answers,
+            Answers::CloudOnly,
+            "answers to our own commands are not forwarded; the cloud ignores them anyway"
+        );
     }
 
     #[test]

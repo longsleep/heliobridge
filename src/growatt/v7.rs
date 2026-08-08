@@ -5,6 +5,7 @@
 //!
 //! The generation-agnostic header lives in [`crate::growatt::header`].
 
+pub mod classify;
 pub mod decode;
 pub mod encode;
 pub mod frame;

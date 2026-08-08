@@ -24,6 +24,7 @@ use crate::control::{
     Request as ControlRequest, SessionHandle, SettingView,
 };
 use crate::growatt::cloud::{CloudConfig, Message as CloudMessage, Relay};
+use crate::growatt::policy::{CloudCommands, Direction, Intent, Originator, Policy};
 use crate::growatt::v7::decode::{FromFrame, ReadResponse, Telemetry, WriteAck};
 use crate::growatt::v7::encode::{Command, EncodeError};
 use crate::growatt::v7::frame::{Frame, MessageType};
@@ -120,6 +121,10 @@ pub struct SessionStats {
     pub relay_received: u64,
     /// Frames that could not be handed to the cloud because it was not keeping up.
     pub relay_dropped: u64,
+    /// Frames from the cloud the policy refused to deliver to the device.
+    pub refused_to_device: u64,
+    /// Frames from the device the policy did not forward to the cloud.
+    pub withheld_from_cloud: u64,
 }
 
 /// A device session over an established, already-encrypted stream.
@@ -140,6 +145,10 @@ pub struct Session<S> {
     warned_about_skew: bool,
     cloud: Option<CloudConfig>,
     relay: Option<Relay>,
+    /// What the relay carries in each direction. Consulted only while relaying.
+    policy: Policy,
+    /// Cloud commands awaiting an answer, so answers to ours are not forwarded.
+    cloud_commands: CloudCommands,
     recorder: Option<Recorder>,
     slots: u16,
     /// Registers waiting to be read, each knowing why.
@@ -242,6 +251,8 @@ where
             warned_about_skew: false,
             cloud: None,
             relay: None,
+            policy: Policy::default(),
+            cloud_commands: CloudCommands::default(),
             recorder: None,
             slots: 1,
 
@@ -287,6 +298,13 @@ where
     #[must_use]
     pub const fn with_time_push(mut self, enabled: bool) -> Self {
         self.send_time_push = enabled;
+        self
+    }
+
+    /// What the relay carries in each direction. Has no effect unless relaying.
+    #[must_use]
+    pub const fn with_policy(mut self, policy: Policy) -> Self {
+        self.policy = policy;
         self
     }
 
@@ -467,8 +485,11 @@ where
                 // cloud understands frames this build does not, and a recording is worth most for
                 // exactly the frames this build cannot yet read.
                 self.record(RecordStream::Up, &publish.payload);
-                self.forward_to_cloud(&publish);
-                self.handle_frame(&publish.topic, &publish.payload);
+                let frame = self.parse_frame(&publish.topic, &publish.payload);
+                self.forward_to_cloud(&publish, frame.as_ref());
+                if let Some(frame) = &frame {
+                    self.handle_frame(frame, &publish.payload);
+                }
 
                 // A read response may have decided the next read; transmitting needs an await, which
                 // frame handling cannot do.
@@ -501,8 +522,12 @@ where
         Ok(Flow::Continue)
     }
 
-    /// Parse and log one protocol frame from a PUBLISH payload.
-    fn handle_frame(&mut self, topic: &str, payload: &[u8]) {
+    /// Parse one protocol frame from a PUBLISH payload, logging why if it cannot be read.
+    ///
+    /// Separate from [`Self::handle_frame`] because the relay needs the parsed frame too, and parsing the
+    /// same octets twice per telemetry frame to serve two callers would be waste. A `None` still reaches the
+    /// cloud: an unreadable frame classifies as unrecognised, and the uplink deliberately fails open.
+    fn parse_frame(&mut self, topic: &str, payload: &[u8]) -> Option<Frame> {
         tracing::trace!(
             target: TARGET_WIRE,
             direction = "rx",
@@ -523,17 +548,20 @@ where
                     len = payload.len(),
                     "unsupported protocol generation; ignoring the frame"
                 );
-                return;
+                return None;
             }
             None => {
                 self.stats.rejected = self.stats.rejected.saturating_add(1);
                 tracing::warn!(len = payload.len(), "payload too short to be a frame");
-                return;
+                return None;
             }
         }
 
-        let frame = match Frame::parse(payload) {
-            Ok(frame) => frame,
+        match Frame::parse(payload) {
+            Ok(frame) => {
+                self.stats.frames = self.stats.frames.saturating_add(1);
+                Some(frame)
+            }
             Err(error) => {
                 self.stats.rejected = self.stats.rejected.saturating_add(1);
                 // At warn with a hex dump rather than dropped: this is how the next unknown gets
@@ -544,15 +572,17 @@ where
                     dump = %Hex(payload),
                     "rejected a frame"
                 );
-                return;
+                None
             }
-        };
+        }
+    }
 
-        self.stats.frames = self.stats.frames.saturating_add(1);
+    /// Act on one parsed frame from the device.
+    fn handle_frame(&mut self, frame: &Frame, payload: &[u8]) {
         let message_type = frame.message_type();
 
         match message_type {
-            MessageType::Telemetry => match Telemetry::from_frame(&frame) {
+            MessageType::Telemetry => match Telemetry::from_frame(frame) {
                 Ok(telemetry) => {
                     self.stats.telemetry = self.stats.telemetry.saturating_add(1);
                     // Kept as the only independent reference for our own clock. A zero timestamp is
@@ -568,7 +598,7 @@ where
                 }
             },
 
-            MessageType::ReadSingleRegister => match ReadResponse::from_frame(&frame) {
+            MessageType::ReadSingleRegister => match ReadResponse::from_frame(frame) {
                 Ok(response) => {
                     self.stats.reads = self.stats.reads.saturating_add(1);
                     self.accept_read(response);
@@ -579,7 +609,7 @@ where
                 }
             },
 
-            MessageType::WriteSingleRegister | MessageType::WriteRegisterRange => self.accept_write_ack(&frame),
+            MessageType::WriteSingleRegister | MessageType::WriteRegisterRange => self.accept_write_ack(frame),
 
             // Known message types this codec cannot decode yet. Counted and named so their arrival is
             // visible rather than silent.
@@ -1126,7 +1156,31 @@ where
     }
 
     /// Hand a frame the device published to the cloud, if relaying.
-    fn forward_to_cloud(&mut self, publish: &Publish) {
+    fn forward_to_cloud(&mut self, publish: &Publish, frame: Option<&Frame>) {
+        if self.relay.is_none() {
+            return;
+        }
+
+        // An unreadable frame classifies as unrecognised, which the uplink allows: the cloud understands
+        // frames this build does not.
+        let intent = frame.map_or(Intent::Unrecognised, |frame| frame.intent(Direction::ToCloud));
+        let originator = if intent.needs_attribution() {
+            self.cloud_commands.claim(&intent, Instant::now())
+        } else {
+            Originator::Unknown
+        };
+
+        if let Some(refusal) = self.policy.evaluate(Direction::ToCloud, &intent, originator).refusal() {
+            self.stats.withheld_from_cloud = self.stats.withheld_from_cloud.saturating_add(1);
+            tracing::debug!(
+                %intent,
+                %refusal,
+                count = self.stats.withheld_from_cloud,
+                "not forwarding to the cloud"
+            );
+            return;
+        }
+
         let Some(relay) = self.relay.as_mut() else {
             return;
         };
@@ -1162,20 +1216,50 @@ where
             Hex(&message.payload)
         );
 
-        // Name what it is, when that is knowable, without depending on it.
-        match Frame::parse(&message.payload) {
-            Ok(frame) => tracing::info!(
-                message_type = %frame.message_type(),
+        // Classify before deciding. A frame this build cannot parse is unrecognised, and the downlink
+        // policy refuses that — the opposite default from the uplink, and deliberately so: an
+        // unrecognised frame heading for the device is the shape an unknown firmware trigger would take.
+        let parsed = Frame::parse(&message.payload);
+        let intent = match &parsed {
+            Ok(frame) => frame.intent(Direction::ToDevice),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    topic = %message.topic,
+                    len = message.payload.len(),
+                    "a cloud message this build cannot parse"
+                );
+                Intent::Unrecognised
+            }
+        };
+
+        if let Some(refusal) = self
+            .policy
+            .evaluate(Direction::ToDevice, &intent, Originator::Cloud)
+            .refusal()
+        {
+            self.stats.refused_to_device = self.stats.refused_to_device.saturating_add(1);
+            // Recorded as well as counted: filtering the wrong thing is the failure a filter
+            // introduces, and it is only auditable if the refusals are kept.
+            self.record(RecordStream::Blocked, &message.payload);
+            tracing::warn!(
+                %intent,
+                %refusal,
                 topic = %message.topic,
-                "relaying a cloud command to the device"
-            ),
-            Err(error) => tracing::warn!(
-                %error,
-                topic = %message.topic,
-                len = message.payload.len(),
-                "relaying a cloud message this build cannot parse"
-            ),
+                count = self.stats.refused_to_device,
+                "refused a cloud message; it will not reach the device"
+            );
+            return Ok(());
         }
+
+        tracing::info!(
+            %intent,
+            topic = %message.topic,
+            "relaying a cloud command to the device"
+        );
+        // Remembered only once it is certain to be sent, so a refused command cannot absorb the attribution
+        // of a later answer.
+        self.cloud_commands.remember(&intent, Instant::now());
 
         let packet_id = if message.qos == QoS::AtMostOnce {
             None
