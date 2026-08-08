@@ -403,9 +403,11 @@ async fn put_setting(
         return problem(StatusCode::BAD_REQUEST, r#"expected a body like {"value":100}"#);
     };
 
-    // Built here so a refusal reads as a bad request rather than a device problem: the allowlist and the
-    // register's domain are the encoder's decision, and both are the caller's mistake.
-    let command = match Command::write(register, body.value) {
+    // `set` rather than `write`, so `default_output_power` goes out as the `321..322` range the vendor uses
+    // rather than as a single-register write nobody has seen this device accept. Built here so a refusal
+    // reads as a bad request rather than a device problem: the allowlist and the register's domain are the
+    // encoder's decision, and both are the caller's mistake.
+    let command = match Command::set(register, body.value) {
         Ok(command) => command,
         Err(error) => return problem(StatusCode::BAD_REQUEST, &error.to_string()),
     };

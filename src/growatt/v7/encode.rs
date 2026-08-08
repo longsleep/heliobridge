@@ -276,7 +276,28 @@ pub enum Command {
 }
 
 impl Command {
+    /// Set a setting, in whatever form the vendor uses for it.
+    ///
+    /// The entry point a caller should reach for. Most settings are a single-register write, but
+    /// `default_output_power` is not: the vendor server always writes it as the `321..322` range, and a bare
+    /// single-register write to 322 has never been observed on this hardware. Leaving that choice to the
+    /// caller means every caller has to know it, and the one that forgets sends an untested frame to a
+    /// mains-connected battery inverter.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::NotWritable`] if the register is not in the holding map, or
+    /// [`EncodeError::OutOfRange`] if the value is not accepted.
+    pub fn set(register: Register, value: u16) -> Result<Self, EncodeError> {
+        if register.number() == DEFAULT_OUTPUT_POWER {
+            return Self::set_default_output_power(value);
+        }
+        Self::write(register, value)
+    }
+
     /// Write a single register.
+    ///
+    /// Prefer [`Command::set`], which picks the form the vendor uses for the register in question.
     ///
     /// # Errors
     ///
@@ -576,7 +597,7 @@ mod tests {
     use super::{Command, EncodeError, SlotConfig, SlotField, WritableRegister, slot_registers};
     use crate::growatt::v7::decode::Timestamp;
     use crate::growatt::v7::frame::MessageType;
-    use crate::model::Register;
+    use crate::model::{Raw, Register};
 
     const SERIAL: &str = "0EXAMPLE00000001";
 
@@ -667,6 +688,44 @@ mod tests {
         // Range 321..322 with a zero in 321, exactly as the vendor server sends it.
         assert_eq!(frame.body(), [0x01, 0x41, 0x01, 0x42, 0x00, 0x00, 0x03, 0xE8]);
         assert_eq!(frame.wire_len(), 48);
+    }
+
+    #[test]
+    fn set_picks_the_form_the_vendor_uses() {
+        // Every setting but one is a single-register write.
+        assert!(matches!(
+            Command::set(Register(326), 1).expect("writable"),
+            Command::WriteSingle { .. }
+        ));
+
+        // `default_output_power` is the exception: the range write the vendor sends, not a bare write to
+        // 322 that nothing has been observed to accept.
+        match Command::set(Register(322), 1000).expect("writable") {
+            Command::WriteRange { start, values } => {
+                assert_eq!(start, Register(321));
+                assert_eq!(values.first().copied().map(Raw::get), Some(0));
+                assert_eq!(values.get(1).copied().map(Raw::get), Some(1000));
+            }
+            other => panic!("expected the composite range write, got {other:?}"),
+        }
+
+        // And it verifies 322 — not 321, which has no meaning to compare against.
+        let verify = Command::set(Register(322), 1000)
+            .expect("writable")
+            .registers_to_verify();
+        assert_eq!(verify, vec![(Register(322), Some(Raw(1000)))]);
+    }
+
+    #[test]
+    fn toggling_power_plus_also_verifies_the_power_it_gates() {
+        // Clearing the flag drops a stored 1000 W to 800 W with no write to 322, so a verification that
+        // covered only what was written would leave a cached value wrong.
+        let verify = Command::set(Register(325), 0).expect("writable").registers_to_verify();
+        assert_eq!(
+            verify,
+            vec![(Register(325), Some(Raw(0))), (Register(322), None)],
+            "325 should drag 322 in, with no expected value for it"
+        );
     }
 
     #[test]
