@@ -433,6 +433,43 @@ impl HoldingRegister {
         })
     }
 
+    /// Decode a raw value according to this entry's domain.
+    ///
+    /// Mirrors [`InputRegister::decode`], so a setting read back renders the same way a telemetry field
+    /// does — a flag as a flag, a slot boundary as a time, a work mode as its label.
+    pub fn decode(&self, raw: Raw) -> Value {
+        match self.domain {
+            Domain::Flag => Value::Int(u16::from(raw.get() != 0)),
+            Domain::TimeOfDay => Value::TimeOfDay {
+                hour: u8::try_from(raw.get() >> 8).unwrap_or(0),
+                minute: u8::try_from(raw.get() & 0xFF).unwrap_or(0),
+            },
+            Domain::Enum(labels) => Value::Enum {
+                raw: raw.get(),
+                label: labels.get(usize::from(raw.get())).copied(),
+            },
+            Domain::Range { .. } => Value::Int(raw.get()),
+        }
+    }
+
+    /// Every setting worth reading back at startup, for `slots` exposed schedule slots.
+    ///
+    /// This is the resync set. Switch positions never appear in periodic telemetry, so without a read they
+    /// are visible only in the hourly settings snapshot — meaning a server that restarts mid-hour would
+    /// otherwise publish nothing for them, or worse, publish a stale guess.
+    ///
+    /// Ordered with the fixed settings first and the slots after, so the interesting values arrive early if
+    /// the sequence is interrupted.
+    pub fn resync_set(slots: u16) -> Vec<Self> {
+        let mut out: Vec<Self> = HOLDING_REGISTERS.to_vec();
+        for slot in 1..=slots.min(SLOT_COUNT) {
+            if let Some(entries) = Self::slot(slot) {
+                out.extend_from_slice(&entries);
+            }
+        }
+        out
+    }
+
     /// The registers of one schedule slot, `slot` counted from 1.
     pub fn slot(slot: u16) -> Option<[Self; 5]> {
         if slot == 0 || slot > SLOT_COUNT {
@@ -636,6 +673,58 @@ mod tests {
             let entry = InputRegister::lookup(Register(number)).expect("documented");
             assert_eq!(entry.confidence, Confidence::Inferred, "register {number}");
         }
+    }
+
+    #[test]
+    fn the_resync_set_covers_the_settings_plus_the_exposed_slots() {
+        use super::HoldingRegister;
+
+        // Ten documented settings, then five registers per exposed slot.
+        let one = HoldingRegister::resync_set(1);
+        assert_eq!(one.len(), super::HOLDING_REGISTERS.len() + 5);
+        let nine = HoldingRegister::resync_set(9);
+        assert_eq!(nine.len(), super::HOLDING_REGISTERS.len() + 45);
+
+        // Fixed settings come first, so the interesting values arrive early if the sequence is cut short.
+        assert_eq!(one.first().map(|e| e.register), Some(Register(250)));
+        assert!(
+            one.get(super::HOLDING_REGISTERS.len()).map(|e| e.name) == Some("slot1_start_time"),
+            "the slots should follow the fixed settings"
+        );
+
+        // Asking for more slots than exist is clamped rather than refused: the caller's number came from
+        // configuration, and nine is the honest answer to "give me twenty".
+        assert_eq!(HoldingRegister::resync_set(99).len(), nine.len());
+
+        // Register 321 must not appear. It is unknown, and reading is harmless — but the resync set is
+        // also what will drive published entities, and an unknown register has nothing to publish.
+        assert!(!nine.iter().any(|e| e.register == Register(321)));
+    }
+
+    #[test]
+    fn holding_registers_decode_their_own_values() {
+        use super::HoldingRegister;
+
+        let flag = HoldingRegister::lookup(Register(326)).expect("grid_power_allowed");
+        assert_eq!(flag.decode(Raw(1)), Value::Int(1));
+        assert_eq!(flag.decode(Raw(0)), Value::Int(0));
+        // Anything non-zero is on; the device is not obliged to store exactly 1.
+        assert_eq!(flag.decode(Raw(7)), Value::Int(1));
+
+        let start = HoldingRegister::lookup(Register(254)).expect("slot1_start_time");
+        assert_eq!(start.decode(Raw(0x173B)), Value::TimeOfDay { hour: 23, minute: 59 });
+
+        let mode = HoldingRegister::lookup(Register(256)).expect("slot1_work_mode");
+        assert_eq!(
+            mode.decode(Raw(1)),
+            Value::Enum {
+                raw: 1,
+                label: Some("battery_first")
+            }
+        );
+
+        let power = HoldingRegister::lookup(Register(322)).expect("default_output_power");
+        assert_eq!(power.decode(Raw(800)), Value::Int(800));
     }
 
     #[test]

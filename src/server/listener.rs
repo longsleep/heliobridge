@@ -55,6 +55,9 @@ pub struct SessionOptions {
 
     /// Record every frame, in both directions plus the ones this program originates.
     pub recorder: Option<Recorder>,
+
+    /// How many schedule slots to read back at startup.
+    pub slots: u16,
 }
 
 impl Default for SessionOptions {
@@ -63,6 +66,7 @@ impl Default for SessionOptions {
             time_push: true,
             cloud: None,
             recorder: None,
+            slots: 1,
         }
     }
 }
@@ -146,12 +150,14 @@ async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcce
     let mut session = Session::new(stream)
         .with_time_push(options.time_push)
         .with_cloud(options.cloud)
-        .with_recorder(options.recorder);
+        .with_recorder(options.recorder)
+        .with_slots(options.slots);
 
     match session.run().await {
         Ok(stats) => tracing::info!(
             frames = stats.frames,
             telemetry = stats.telemetry,
+            reads = stats.reads,
             rejected = stats.rejected,
             undecoded = stats.undecoded,
             pings = stats.pings,
@@ -198,6 +204,7 @@ mod tests {
             time_push: false,
             cloud: Some(CloudConfig::default()),
             recorder: None,
+            slots: 1,
         };
         assert!(options.cloud.is_some());
         assert!(!options.time_push);

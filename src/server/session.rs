@@ -12,17 +12,19 @@
 //! so a server that sends nothing beyond SUBACK still receives telemetry.
 
 use core::time::Duration;
+use std::collections::{BTreeMap, VecDeque};
 
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Instant;
 
 use crate::growatt::cloud::{CloudConfig, Message as CloudMessage, Relay};
-use crate::growatt::v7::decode::{FromFrame, Telemetry};
+use crate::growatt::v7::decode::{FromFrame, ReadResponse, Telemetry};
 use crate::growatt::v7::encode::{Command, EncodeError};
 use crate::growatt::v7::frame::{Frame, MessageType};
+use crate::growatt::v7::registers::HoldingRegister;
 use crate::growatt::{Codec, peek_version};
-use crate::model::{Hex, Timestamp};
+use crate::model::{Hex, Raw, Register, Timestamp};
 use crate::mqtt::{Packet, PacketStream, Publish, QoS, StreamError};
 use crate::record::{Recorder, Stream as RecordStream};
 use crate::server::clock::{Clock, Skew};
@@ -50,6 +52,12 @@ pub const GRANTED_QOS: u8 = 0x01;
 /// then the device has published its first telemetry, so its own clock can be compared with ours before
 /// ours replaces it.
 pub const TIME_PUSH_DELAY: Duration = Duration::from_millis(4_500);
+
+/// How long to wait for a read to be answered before moving on.
+///
+/// The device answered a read in about 0.6 s. Ten seconds is generous enough that a busy device is not
+/// skipped, and short enough that a resync of sixty registers cannot stall for minutes if one is ignored.
+pub const READ_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Why a session ended.
 #[derive(Debug, Snafu)]
@@ -101,6 +109,8 @@ pub struct SessionStats {
     pub undecoded: u64,
     /// Keepalive exchanges.
     pub pings: u64,
+    /// Settings read back successfully.
+    pub reads: u64,
     /// Messages the cloud sent for the device, when relaying.
     pub relay_received: u64,
     /// Frames that could not be handed to the cloud because it was not keeping up.
@@ -126,6 +136,16 @@ pub struct Session<S> {
     cloud: Option<CloudConfig>,
     relay: Option<Relay>,
     recorder: Option<Recorder>,
+    slots: u16,
+    resync: VecDeque<HoldingRegister>,
+    awaiting: Option<HoldingRegister>,
+    /// A read decided on but not yet transmitted.
+    ///
+    /// The decision is made while handling a packet, which cannot await; the loop sends it immediately
+    /// afterwards. Without this the read would have to be issued from a synchronous context.
+    pending_read: Option<Register>,
+    read_deadline: Option<Instant>,
+    settings: BTreeMap<Register, Raw>,
 }
 
 impl<S> Session<S>
@@ -155,6 +175,12 @@ where
             cloud: None,
             relay: None,
             recorder: None,
+            slots: 1,
+            resync: VecDeque::new(),
+            awaiting: None,
+            pending_read: None,
+            read_deadline: None,
+            settings: BTreeMap::new(),
         }
     }
 
@@ -163,6 +189,18 @@ where
     pub fn with_recorder(mut self, recorder: Option<Recorder>) -> Self {
         self.recorder = recorder;
         self
+    }
+
+    /// How many schedule slots to read back at startup.
+    #[must_use]
+    pub const fn with_slots(mut self, slots: u16) -> Self {
+        self.slots = slots;
+        self
+    }
+
+    /// Settings learned by reading them back, keyed by register.
+    pub const fn settings(&self) -> &BTreeMap<Register, Raw> {
+        &self.settings
     }
 
     /// Whether to send the time push after connect. On by default, because the vendor server does.
@@ -212,6 +250,21 @@ where
                     self.push_time().await?;
                     continue;
                 }
+                Woke::ReadTimedOut => {
+                    // One unanswered read must not stall the rest. Recorded and skipped: the value stays
+                    // unknown, which is honest, rather than being inferred.
+                    if let Some(entry) = self.awaiting.take() {
+                        tracing::warn!(
+                            register = %entry.register,
+                            name = entry.name,
+                            timeout_s = READ_REPLY_TIMEOUT.as_secs(),
+                            "no answer to a settings read; moving on"
+                        );
+                    }
+                    self.advance_resync();
+                    self.send_pending_read().await?;
+                    continue;
+                }
                 Woke::FromCloud(Some(message)) => {
                     self.forward_to_device(message).await?;
                     continue;
@@ -237,95 +290,119 @@ where
 
             tracing::trace!(kind = packet.kind(), "received");
 
-            match packet {
-                Packet::Connect(connect) => {
-                    if connect.protocol_level != crate::mqtt::PROTOCOL_LEVEL {
-                        return Err(SessionError::UnsupportedLevel {
-                            level: connect.protocol_level,
-                        });
-                    }
-                    tracing::Span::current().record("device_id", &connect.client_id);
-                    tracing::info!(
-                        client_id = %connect.client_id,
-                        keepalive_s = connect.keepalive,
-                        clean_session = connect.clean_session,
-                        username = connect.username.as_deref().unwrap_or("<none>"),
-                        // Deliberately not logging the password. It is a known constant, not a secret,
-                        // but a log that habitually prints credentials is a bad habit to establish.
-                        "device connected"
-                    );
-                    self.device_id = Some(connect.client_id);
-                    self.send(&Packet::ConnAck {
-                        session_present: false,
-                        code: 0,
-                    })
-                    .await?;
-
-                    // The relay connects as the device, so it cannot start until the serial is known.
-                    self.start_relay();
-
-                    if self.send_time_push {
-                        // The vendor server sends its push about 4.5 s after connect. Matching that
-                        // delay rather than firing immediately is not superstition: by then the device
-                        // has published its first telemetry, so its own clock is known and can be
-                        // cross-checked before ours is imposed on it.
-                        self.time_push_due = Instant::now().checked_add(TIME_PUSH_DELAY);
-                    }
-                }
-
-                Packet::Subscribe(subscribe) => {
-                    // One granted octet per requested filter, always QoS 1.
-                    let granted = vec![GRANTED_QOS; subscribe.filters.len()];
-                    for (filter, requested) in &subscribe.filters {
-                        tracing::info!(filter, requested, granted = GRANTED_QOS, "subscription");
-                    }
-                    self.subscribed = true;
-                    self.send(&Packet::SubAck {
-                        packet_id: subscribe.packet_id,
-                        granted,
-                    })
-                    .await?;
-                }
-
-                Packet::Publish(publish) => {
-                    // Acknowledge first, then decode. The device is waiting for the PUBACK, and a
-                    // decode problem must not delay or prevent it — a missing PUBACK stops telemetry,
-                    // an undecodable frame merely loses one reading.
-                    if let (QoS::AtLeastOnce, Some(packet_id)) = (publish.qos, publish.packet_id) {
-                        self.send(&Packet::PubAck { packet_id }).await?;
-                    }
-
-                    // Record and relay before decoding, and regardless of whether decoding succeeds: the
-                    // cloud understands frames this build does not, and a recording is worth most for
-                    // exactly the frames this build cannot yet read.
-                    self.record(RecordStream::Up, &publish.payload);
-                    self.forward_to_cloud(&publish);
-                    self.handle_frame(&publish.topic, &publish.payload);
-                }
-
-                Packet::PingReq => {
-                    self.stats.pings = self.stats.pings.saturating_add(1);
-                    tracing::debug!(count = self.stats.pings, "keepalive");
-                    self.send(&Packet::PingResp).await?;
-                }
-
-                Packet::Disconnect => {
-                    tracing::info!(?self.stats, "device disconnected cleanly");
-                    return Ok(self.stats);
-                }
-
-                // The device acknowledging something this server published.
-                Packet::PubAck { packet_id } => {
-                    tracing::debug!(packet_id, "device acknowledged our publish");
-                }
-
-                // Server-to-device types are refused by the codec, so these are unreachable in
-                // practice. Handled rather than ignored so the match stays exhaustive.
-                Packet::ConnAck { .. } | Packet::SubAck { .. } | Packet::PingResp => {
-                    tracing::warn!(kind = packet.kind(), "ignoring a server-to-device packet");
-                }
+            if self.handle_packet(packet).await? == Flow::Stop {
+                return Ok(self.stats);
             }
         }
+    }
+
+    /// Act on one packet from the device.
+    ///
+    /// Split from [`Session::run`] so the loop is the loop and this is the protocol. They grow at different
+    /// rates: the loop has been stable while this gains a case per message type implemented.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] if replying fails or the peer is not speaking MQTT 3.1.1.
+    async fn handle_packet(&mut self, packet: Packet) -> Result<Flow, SessionError> {
+        match packet {
+            Packet::Connect(connect) => {
+                if connect.protocol_level != crate::mqtt::PROTOCOL_LEVEL {
+                    return Err(SessionError::UnsupportedLevel {
+                        level: connect.protocol_level,
+                    });
+                }
+                tracing::Span::current().record("device_id", &connect.client_id);
+                tracing::info!(
+                    client_id = %connect.client_id,
+                    keepalive_s = connect.keepalive,
+                    clean_session = connect.clean_session,
+                    username = connect.username.as_deref().unwrap_or("<none>"),
+                    // Deliberately not logging the password. It is a known constant, not a secret,
+                    // but a log that habitually prints credentials is a bad habit to establish.
+                    "device connected"
+                );
+                self.device_id = Some(connect.client_id);
+                self.send(&Packet::ConnAck {
+                    session_present: false,
+                    code: 0,
+                })
+                .await?;
+
+                // The relay connects as the device, so it cannot start until the serial is known.
+                self.start_relay();
+
+                if self.send_time_push {
+                    // The vendor server sends its push about 4.5 s after connect. Matching that
+                    // delay rather than firing immediately is not superstition: by then the device
+                    // has published its first telemetry, so its own clock is known and can be
+                    // cross-checked before ours is imposed on it.
+                    self.time_push_due = Instant::now().checked_add(TIME_PUSH_DELAY);
+                }
+            }
+
+            Packet::Subscribe(subscribe) => {
+                // One granted octet per requested filter, always QoS 1.
+                let granted = vec![GRANTED_QOS; subscribe.filters.len()];
+                for (filter, requested) in &subscribe.filters {
+                    tracing::info!(filter, requested, granted = GRANTED_QOS, "subscription");
+                }
+                self.subscribed = true;
+                self.send(&Packet::SubAck {
+                    packet_id: subscribe.packet_id,
+                    granted,
+                })
+                .await?;
+
+                // Only now: a read is a publish the device has to be subscribed to receive.
+                self.begin_resync();
+                self.send_pending_read().await?;
+            }
+
+            Packet::Publish(publish) => {
+                // Acknowledge first, then decode. The device is waiting for the PUBACK, and a
+                // decode problem must not delay or prevent it — a missing PUBACK stops telemetry,
+                // an undecodable frame merely loses one reading.
+                if let (QoS::AtLeastOnce, Some(packet_id)) = (publish.qos, publish.packet_id) {
+                    self.send(&Packet::PubAck { packet_id }).await?;
+                }
+
+                // Record and relay before decoding, and regardless of whether decoding succeeds: the
+                // cloud understands frames this build does not, and a recording is worth most for
+                // exactly the frames this build cannot yet read.
+                self.record(RecordStream::Up, &publish.payload);
+                self.forward_to_cloud(&publish);
+                self.handle_frame(&publish.topic, &publish.payload);
+
+                // A read response may have decided the next read; transmitting needs an await, which
+                // frame handling cannot do.
+                self.send_pending_read().await?;
+            }
+
+            Packet::PingReq => {
+                self.stats.pings = self.stats.pings.saturating_add(1);
+                tracing::debug!(count = self.stats.pings, "keepalive");
+                self.send(&Packet::PingResp).await?;
+            }
+
+            Packet::Disconnect => {
+                tracing::info!(?self.stats, "device disconnected cleanly");
+                return Ok(Flow::Stop);
+            }
+
+            // The device acknowledging something this server published.
+            Packet::PubAck { packet_id } => {
+                tracing::debug!(packet_id, "device acknowledged our publish");
+            }
+
+            // Server-to-device types are refused by the codec, so these are unreachable in practice.
+            // Handled rather than ignored so the match stays exhaustive.
+            other @ (Packet::ConnAck { .. } | Packet::SubAck { .. } | Packet::PingResp) => {
+                tracing::warn!(kind = other.kind(), "ignoring a server-to-device packet");
+            }
+        }
+
+        Ok(Flow::Continue)
     }
 
     /// Parse and log one protocol frame from a PUBLISH payload.
@@ -395,12 +472,22 @@ where
                 }
             },
 
+            MessageType::ReadSingleRegister => match ReadResponse::from_frame(&frame) {
+                Ok(response) => {
+                    self.stats.reads = self.stats.reads.saturating_add(1);
+                    self.accept_read(response);
+                }
+                Err(error) => {
+                    self.stats.rejected = self.stats.rejected.saturating_add(1);
+                    tracing::warn!(%error, "could not decode a read response");
+                }
+            },
+
             // Known message types this codec cannot decode yet. Counted and named so their arrival is
             // visible rather than silent.
             MessageType::SettingsSnapshot
             | MessageType::IdentityReport
             | MessageType::ExtendedTelemetry
-            | MessageType::ReadSingleRegister
             | MessageType::WriteSingleRegister
             | MessageType::WriteRegisterRange
             | MessageType::TimePush => {
@@ -508,30 +595,38 @@ where
         current
     }
 
-    /// Wait for whichever of the three things happens first.
+    /// Wait for whichever thing happens first.
     ///
     /// Split out of the loop because each branch needs `self` afterwards, and doing the work inside a
-    /// `select!` arm would hold a borrow taken by another arm's future. The branches that only need
-    /// `Copy` state — the timer deadline — are set up before the `select!` for the same reason.
+    /// `select!` arm would hold a borrow taken by another arm's future.
+    ///
+    /// Every branch is always present. A timer that is not set, or a relay that is not configured, becomes
+    /// a future that never resolves — so adding a timer adds one arm rather than doubling the arrangements
+    /// this function has to spell out. The four arms borrow disjoint fields, which is what lets them sit
+    /// together.
     async fn wait(&mut self) -> Result<Woke, SessionError> {
-        match (self.time_push_due, self.relay.as_mut()) {
-            (Some(due), Some(relay)) => Ok(tokio::select! {
-                biased;
-                () = tokio::time::sleep_until(due) => Woke::TimePushDue,
-                message = relay.next_from_cloud() => Woke::FromCloud(message),
-                packet = Self::read(&mut self.stream) => Woke::Packet(packet?),
-            }),
-            (Some(due), None) => Ok(tokio::select! {
-                biased;
-                () = tokio::time::sleep_until(due) => Woke::TimePushDue,
-                packet = Self::read(&mut self.stream) => Woke::Packet(packet?),
-            }),
-            (None, Some(relay)) => Ok(tokio::select! {
-                biased;
-                message = relay.next_from_cloud() => Woke::FromCloud(message),
-                packet = Self::read(&mut self.stream) => Woke::Packet(packet?),
-            }),
-            (None, None) => Ok(Woke::Packet(Self::read(&mut self.stream).await?)),
+        Ok(tokio::select! {
+            biased;
+            () = Self::at(self.time_push_due) => Woke::TimePushDue,
+            () = Self::at(self.read_deadline) => Woke::ReadTimedOut,
+            message = Self::from_cloud(self.relay.as_mut()) => Woke::FromCloud(message),
+            packet = Self::read(&mut self.stream) => Woke::Packet(packet?),
+        })
+    }
+
+    /// Resolve at a deadline, or never if there is none.
+    async fn at(deadline: Option<Instant>) {
+        match deadline {
+            Some(at) => tokio::time::sleep_until(at).await,
+            None => core::future::pending().await,
+        }
+    }
+
+    /// The next message from the cloud, or never if there is no relay.
+    async fn from_cloud(relay: Option<&mut Relay>) -> Option<CloudMessage> {
+        match relay {
+            Some(relay) => relay.next_from_cloud().await,
+            None => core::future::pending().await,
         }
     }
 
@@ -550,6 +645,116 @@ where
     /// Write one packet.
     async fn send(&mut self, packet: &Packet) -> Result<(), SessionError> {
         self.stream.send(packet).await.context(StreamSnafu)
+    }
+
+    /// Queue every setting for reading back, and start the sequence.
+    ///
+    /// Switch positions never appear in periodic telemetry. Without this they are visible only in the hourly
+    /// settings snapshot, so a server that restarts mid-hour would have nothing to say about them for up to
+    /// an hour — or would guess, which is worse.
+    fn begin_resync(&mut self) {
+        self.resync = HoldingRegister::resync_set(self.slots).into();
+        tracing::info!(
+            registers = self.resync.len(),
+            slots = self.slots,
+            "reading settings back to resynchronise"
+        );
+        self.advance_resync();
+    }
+
+    /// Issue the next read, if any remain.
+    ///
+    /// One at a time on purpose. The device answered a read in about 0.6 s, and a burst of sixty would be
+    /// a novel load on hardware that cannot be patched — for a sequence that only has to finish before the
+    /// hourly snapshot would have arrived anyway.
+    fn advance_resync(&mut self) {
+        let Some(entry) = self.resync.pop_front() else {
+            if self.awaiting.is_some() || !self.settings.is_empty() {
+                self.finish_resync();
+            }
+            self.awaiting = None;
+            self.read_deadline = None;
+            return;
+        };
+
+        self.awaiting = Some(entry);
+        self.read_deadline = Instant::now().checked_add(READ_REPLY_TIMEOUT);
+        self.pending_read = Some(entry.register);
+    }
+
+    /// Send the queued read request. Separate from [`Session::advance_resync`] because that is called from
+    /// places that cannot await.
+    async fn send_pending_read(&mut self) -> Result<(), SessionError> {
+        let Some(register) = self.pending_read.take() else {
+            return Ok(());
+        };
+        let Some(device_id) = self.device_id.clone() else {
+            return Ok(());
+        };
+
+        let frame = Command::read(register).to_frame(&device_id).context(EncodeSnafu)?;
+        let wire = frame.to_wire();
+        self.record(RecordStream::Inject, &wire);
+
+        tracing::debug!(register = %register, "reading a setting back");
+
+        let packet_id = self.take_packet_id();
+        self.send(&Packet::Publish(Publish {
+            topic: format!("s/{device_id}"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            dup: false,
+            packet_id: Some(packet_id),
+            payload: wire,
+        }))
+        .await
+    }
+
+    /// Record a value the device reported, and move the sequence along.
+    fn accept_read(&mut self, response: ReadResponse) {
+        let expected = self.awaiting.map(|entry| entry.register);
+        if expected != Some(response.register) {
+            // Not what was asked for. Kept anyway — it is still a fact about the device — but the sequence
+            // is not advanced by it, or a stray response would skip a register.
+            tracing::warn!(
+                got = %response.register,
+                expected = expected.map_or_else(|| "nothing".to_owned(), |r| r.to_string()),
+                "unexpected read response"
+            );
+            self.settings.insert(response.register, response.raw);
+            return;
+        }
+
+        if let Some(entry) = self.awaiting {
+            tracing::debug!(
+                register = %response.register,
+                name = entry.name,
+                value = %entry.decode(response.raw),
+                raw = response.raw.get(),
+                "setting"
+            );
+        }
+        self.settings.insert(response.register, response.raw);
+        self.advance_resync();
+    }
+
+    /// Log what the resync learned.
+    fn finish_resync(&self) {
+        let known = self.settings.len();
+        tracing::info!(known, "settings resynchronised");
+
+        for (register, raw) in &self.settings {
+            let Some(entry) = HoldingRegister::lookup(*register) else {
+                continue;
+            };
+            tracing::info!(
+                register = %register,
+                name = entry.name,
+                value = %entry.decode(*raw),
+                unit = entry.unit.symbol(),
+                "setting"
+            );
+        }
     }
 
     /// Hand a frame to the recorder, if one is configured.
@@ -679,18 +884,33 @@ where
 ///
 /// A small enum rather than acting inside the `select!` arms: doing the work there would need `self`
 /// while the other arm's future still borrows it.
+/// Whether the session should keep going after handling a packet.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Flow {
+    /// Carry on.
+    Continue,
+    /// The peer is finished; end the session cleanly.
+    Stop,
+}
+
+/// What woke the session loop.
+///
+/// A small enum rather than acting inside the `select!` arms: doing the work there would need `self` while
+/// the other arm's future still borrows it.
 enum Woke {
     /// A packet arrived from the device, or it closed the connection.
     Packet(Option<Packet>),
     /// The time push became due.
     TimePushDue,
+    /// A read went unanswered for too long.
+    ReadTimedOut,
     /// The cloud sent something for the device, or the relay stopped.
     FromCloud(Option<CloudMessage>),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Clock, Frame, GRANTED_QOS, MessageType, Session, TIME_PUSH_DELAY, Timestamp};
+    use super::{Clock, Frame, GRANTED_QOS, MessageType, Raw, Session, TIME_PUSH_DELAY, Timestamp};
     use crate::mqtt::{Connect, Packet, Publish, QoS, Subscribe};
 
     const SERIAL: &str = "0EXAMPLE00000001";
@@ -933,6 +1153,94 @@ mod tests {
         );
         // The rest of the session still works.
         assert!(replies.iter().any(|p| matches!(p, Packet::ConnAck { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_read_is_issued_after_subscribing() {
+        // Only after SUBACK: a read is a publish, and the device has to be subscribed to receive it.
+        let mut script = connect_packet();
+        script.extend_from_slice(&subscribe_packet());
+        let (replies, _) = drive(&script).await;
+        let replies = packets(&replies);
+
+        let publish = replies
+            .iter()
+            .find_map(|packet| match packet {
+                Packet::Publish(publish) => Some(publish),
+                _ => None,
+            })
+            .expect("a read should have been published");
+
+        let frame = Frame::parse(&publish.payload).expect("the read must be a valid frame");
+        assert_eq!(frame.message_type(), MessageType::ReadSingleRegister);
+        // The first entry of the resync set is charge_limit_upper, register 250.
+        assert_eq!(frame.body().get(..2), Some([0x00, 0xFA].as_slice()));
+        assert_eq!(frame.wire_len(), 44);
+
+        // Nothing is published before the subscription; a read sent then would be lost.
+        let (before, _) = drive(&connect_packet()).await;
+        assert!(
+            !packets(&before).iter().any(|p| matches!(p, Packet::Publish(_))),
+            "no read should be issued before the device subscribes"
+        );
+    }
+
+    /// A read response for one register, as the device would answer.
+    fn read_response(register: u16, value: u16) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&register.to_be_bytes());
+        body.extend_from_slice(&register.to_be_bytes());
+        body.extend_from_slice(&value.to_be_bytes());
+        let frame = Frame::new(MessageType::ReadSingleRegister, SERIAL, &body).expect("build");
+        publish_packet(&frame.to_wire(), 100)
+    }
+
+    #[tokio::test]
+    async fn answering_a_read_advances_to_the_next_register() {
+        let mut script = connect_packet();
+        script.extend_from_slice(&subscribe_packet());
+        // Answer the first two registers of the resync set: 250 then 251.
+        script.extend_from_slice(&read_response(250, 100));
+        script.extend_from_slice(&read_response(251, 5));
+
+        let (replies, stats) = drive(&script).await;
+        let reads: Vec<u16> = packets(&replies)
+            .into_iter()
+            .filter_map(|packet| match packet {
+                Packet::Publish(publish) => Frame::parse(&publish.payload)
+                    .ok()
+                    .and_then(|frame| frame.u16_at(38).map(Raw::get)),
+                _ => None,
+            })
+            .collect();
+
+        // Three reads issued: the initial one, then one after each answer.
+        assert_eq!(reads, vec![250, 251, 304], "each answer should trigger the next read");
+        assert_eq!(stats.reads, 2);
+        assert_eq!(stats.rejected, 0);
+    }
+
+    #[tokio::test]
+    async fn a_stray_read_response_is_kept_but_does_not_advance_the_sequence() {
+        let mut script = connect_packet();
+        script.extend_from_slice(&subscribe_packet());
+        // Answer a register that was not asked for.
+        script.extend_from_slice(&read_response(327, 1));
+
+        let (replies, stats) = drive(&script).await;
+        let reads: Vec<u16> = packets(&replies)
+            .into_iter()
+            .filter_map(|packet| match packet {
+                Packet::Publish(publish) => Frame::parse(&publish.payload)
+                    .ok()
+                    .and_then(|frame| frame.u16_at(38).map(Raw::get)),
+                _ => None,
+            })
+            .collect();
+
+        // Only the initial read. A stray answer must not skip the register still being awaited.
+        assert_eq!(reads, vec![250]);
+        assert_eq!(stats.reads, 1, "the value is still counted and kept");
     }
 
     #[tokio::test]

@@ -70,6 +70,7 @@ fn run(config: &Config) -> Result<(), String> {
         time_push: config.should_push_time(),
         cloud,
         recorder,
+        slots: config.slots,
     };
     if options.time_push {
         // The device is sent *local* time, so an operator whose host runs UTC — a container default —

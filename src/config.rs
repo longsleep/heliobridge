@@ -54,6 +54,14 @@ pub struct Config {
     #[arg(long, env = "HELIOBRIDGE_RECORD_MAX_BYTES", default_value_t = record::DEFAULT_MAX_BYTES)]
     pub record_max_bytes: u64,
 
+    /// How many schedule slots to read back and expose, 1–9.
+    ///
+    /// The device has nine, each five registers. Nine would be 45 entities for hardware that in practice
+    /// runs a single all-day slot, so the default keeps things readable while the capability stays
+    /// available.
+    #[arg(long, env = "HELIOBRIDGE_SLOTS", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=9))]
+    pub slots: u16,
+
     /// Relay device traffic to the Growatt cloud, so the vendor app keeps working.
     ///
     /// Also decides who sets the device's clock. The server time push is sent unless this is on: the

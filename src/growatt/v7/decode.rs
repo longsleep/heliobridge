@@ -4,7 +4,7 @@ use snafu::{OptionExt, Snafu, ensure};
 
 use crate::growatt::v7::frame::{Frame, MessageType};
 use crate::growatt::v7::registers::{INPUT_REGISTERS, InputRegister, Kind};
-use crate::model::{Reading, Register, Value};
+use crate::model::{Raw, Reading, Register, Value};
 
 /// Absolute offset of the six-octet timestamp.
 pub const TIMESTAMP_OFFSET: usize = 68;
@@ -51,6 +51,15 @@ pub enum DecodeError {
         field: &'static str,
         /// Where it started.
         offset: usize,
+    },
+
+    /// A read response named two different registers.
+    #[snafu(display("read response names register {register} then echoes {echoed}"))]
+    MismatchedEcho {
+        /// The first copy.
+        register: Register,
+        /// The second copy.
+        echoed: Register,
     },
 }
 
@@ -118,6 +127,72 @@ impl Telemetry {
             }
         }
         Some(out)
+    }
+}
+
+/// The answer to a single-register read.
+///
+/// Body layout is the register number **twice** followed by the value, mirroring the request. Both copies
+/// are checked against each other: they have always agreed, and a disagreement would mean the response
+/// belongs to a different read than the one being awaited — which matters when reads are issued in
+/// sequence.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct ReadResponse {
+    /// Which register was read.
+    pub register: Register,
+    /// Its value, unscaled.
+    pub raw: Raw,
+}
+
+impl FromFrame for ReadResponse {
+    fn from_frame(frame: &Frame) -> Result<Self, DecodeError> {
+        let actual = frame.message_type();
+        ensure!(
+            actual == MessageType::ReadSingleRegister,
+            WrongMessageTypeSnafu {
+                expected: MessageType::ReadSingleRegister,
+                actual,
+            }
+        );
+
+        let body = frame.body();
+        let field = |offset: usize, field| {
+            let end = offset.saturating_add(2);
+            body.get(offset..end)
+                .and_then(|pair| <[u8; 2]>::try_from(pair).ok())
+                .map(u16::from_be_bytes)
+                .context(TruncatedSnafu {
+                    field,
+                    offset,
+                    end,
+                    available: body.len(),
+                })
+        };
+
+        let register = field(0, "register")?;
+        let echoed = field(2, "register echo")?;
+        let raw = field(4, "value")?;
+
+        ensure!(
+            register == echoed,
+            MismatchedEchoSnafu {
+                register: Register(register),
+                echoed: Register(echoed),
+            }
+        );
+
+        Ok(Self {
+            register: Register(register),
+            raw: Raw(raw),
+        })
+    }
+}
+
+impl TryFrom<&Frame> for ReadResponse {
+    type Error = DecodeError;
+
+    fn try_from(frame: &Frame) -> Result<Self, Self::Error> {
+        Self::from_frame(frame)
     }
 }
 
@@ -317,6 +392,64 @@ mod tests {
 
     /// Offset of the record marker relative to the start of the body, i.e. 74 − 38.
     const RECORD_MARKER_OFFSET_IN_BODY: usize = 36;
+
+    #[test]
+    fn a_read_response_decodes_its_register_and_value() {
+        use super::ReadResponse;
+        use crate::growatt::v7::encode::Command;
+        use crate::model::{Raw, Register};
+
+        // The worked example from the specification: reading register 322 answered 0x0320 = 800.
+        let body = [0x01, 0x42, 0x01, 0x42, 0x03, 0x20];
+        let frame = Frame::new(MessageType::ReadSingleRegister, "0EXAMPLE00000001", &body).expect("build");
+        assert_eq!(frame.wire_len(), 46, "a read response is 46 octets");
+
+        let response = ReadResponse::from_frame(&frame).expect("decode");
+        assert_eq!(response.register, Register(322));
+        assert_eq!(response.raw, Raw(800));
+
+        // And it answers the request the encoder builds for the same register.
+        let request = Command::read(Register(322))
+            .to_frame("0EXAMPLE00000001")
+            .expect("build");
+        assert_eq!(request.body().get(..4), frame.body().get(..4));
+    }
+
+    #[test]
+    fn a_read_response_that_names_two_registers_is_refused() {
+        use super::{DecodeError, ReadResponse};
+
+        // The echo exists to be checked. A mismatch means the answer belongs to a different read than the
+        // one being awaited, which matters when reads are issued in sequence.
+        let body = [0x01, 0x42, 0x01, 0x43, 0x03, 0x20];
+        let frame = Frame::new(MessageType::ReadSingleRegister, "0EXAMPLE00000001", &body).expect("build");
+        assert!(matches!(
+            ReadResponse::from_frame(&frame),
+            Err(DecodeError::MismatchedEcho { .. })
+        ));
+    }
+
+    #[test]
+    fn a_truncated_read_response_is_refused() {
+        use super::{DecodeError, ReadResponse};
+
+        for len in 0..6usize {
+            let body = vec![0u8; len];
+            let frame = Frame::new(MessageType::ReadSingleRegister, "0EXAMPLE00000001", &body).expect("b");
+            assert!(
+                matches!(ReadResponse::from_frame(&frame), Err(DecodeError::Truncated { .. })),
+                "a {len}-octet body should not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_is_not_mistaken_for_a_read_response() {
+        use super::ReadResponse;
+
+        let frame = Frame::new(MessageType::Telemetry, "0EXAMPLE00000001", &[0u8; 547]).expect("build");
+        assert!(ReadResponse::from_frame(&frame).is_err());
+    }
 
     #[test]
     fn implausible_timestamps_are_flagged_not_rejected() {
