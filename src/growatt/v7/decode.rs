@@ -196,6 +196,92 @@ impl TryFrom<&Frame> for ReadResponse {
     }
 }
 
+/// The device's answer to a write.
+///
+/// Both write forms are acknowledged, and they say different amounts:
+///
+/// - **`0x06`**, single register: `<register:2> <status:1> <value:2>`. On acceptance the status is `0x00`
+///   and the value is what the register now holds; a refusal was observed as status `0x02` with `0x0001`
+///   in place of the value.
+/// - **`0x10`**, range: `<start:2> <end:2> <status:1>`. No value at all — and the status was `0x00` even
+///   for a write the device clamped from 1000 to 800.
+///
+/// That asymmetry is the point. A `0x10` acknowledgement cannot confirm anything, because it says the same
+/// thing whether or not the value survived; reading the register back is the only way to know. A `0x06`
+/// acknowledgement is more informative, but the stored value it reports has only been seen for writes that
+/// were accepted verbatim, so it is treated as a signal rather than as proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteAck {
+    /// First register written.
+    pub start: Register,
+    /// Last register written. Equal to `start` for a single-register write.
+    pub end: Register,
+    /// Status octet. `0x00` accepted; `0x02` observed on a refusal.
+    pub status: u8,
+    /// The value the device reports holding, for a single-register acknowledgement.
+    pub value: Option<Raw>,
+}
+
+impl WriteAck {
+    /// Whether the device reported accepting the write.
+    ///
+    /// Not the same as the value having been stored: a range acknowledgement reports acceptance even when
+    /// the value was clamped.
+    pub const fn accepted(&self) -> bool {
+        self.status == 0
+    }
+}
+
+impl FromFrame for WriteAck {
+    fn from_frame(frame: &Frame) -> Result<Self, DecodeError> {
+        let actual = frame.message_type();
+        let body = frame.body();
+        let at = |offset: usize, field| {
+            let end = offset.saturating_add(2);
+            body.get(offset..end)
+                .and_then(|pair| <[u8; 2]>::try_from(pair).ok())
+                .map(u16::from_be_bytes)
+                .context(TruncatedSnafu {
+                    field,
+                    offset,
+                    end,
+                    available: body.len(),
+                })
+        };
+        let octet = |offset: usize, field| {
+            body.get(offset).copied().context(TruncatedSnafu {
+                field,
+                offset,
+                end: offset.saturating_add(1),
+                available: body.len(),
+            })
+        };
+
+        match actual {
+            MessageType::WriteSingleRegister => {
+                let register = Register(at(0, "register")?);
+                Ok(Self {
+                    start: register,
+                    end: register,
+                    status: octet(2, "status")?,
+                    value: Some(Raw(at(3, "value")?)),
+                })
+            }
+            MessageType::WriteRegisterRange => Ok(Self {
+                start: Register(at(0, "start register")?),
+                end: Register(at(2, "end register")?),
+                status: octet(4, "status")?,
+                value: None,
+            }),
+            actual => WrongMessageTypeSnafu {
+                expected: MessageType::WriteSingleRegister,
+                actual,
+            }
+            .fail(),
+        }
+    }
+}
+
 /// A message this codec can decode out of a frame.
 ///
 /// A trait rather than a free function per message type, because there are several to come — the
@@ -441,6 +527,79 @@ mod tests {
                 "a {len}-octet body should not decode"
             );
         }
+    }
+
+    #[test]
+    fn a_single_register_acknowledgement_carries_a_status_and_the_stored_value() {
+        use super::WriteAck;
+        use crate::model::{Raw, Register};
+
+        // Octets the device actually sent, answering a write of 100 to slot1_output_power.
+        let frame = Frame::new(
+            MessageType::WriteSingleRegister,
+            "0EXAMPLE00000001",
+            &[0x01, 0x01, 0x00, 0x00, 0x64],
+        )
+        .expect("build");
+        assert_eq!(frame.wire_len(), 45, "the acknowledgement is 45 octets");
+
+        let ack = WriteAck::from_frame(&frame).expect("decode");
+        assert_eq!(ack.start, Register(257));
+        assert_eq!(ack.end, Register(257));
+        assert_eq!(ack.status, 0);
+        assert_eq!(ack.value, Some(Raw(100)));
+        assert!(ack.accepted());
+    }
+
+    #[test]
+    fn a_refusal_is_distinguishable_from_an_acceptance() {
+        use super::WriteAck;
+        use crate::model::Register;
+
+        // What the device sent when 1000 W was written to slot1_output_power: status 2, and 0x0001 where
+        // an accepted write reports the stored value.
+        let frame = Frame::new(
+            MessageType::WriteSingleRegister,
+            "0EXAMPLE00000001",
+            &[0x01, 0x01, 0x02, 0x00, 0x01],
+        )
+        .expect("build");
+
+        let ack = WriteAck::from_frame(&frame).expect("decode");
+        assert_eq!(ack.start, Register(257));
+        assert_eq!(ack.status, 2);
+        assert!(!ack.accepted());
+    }
+
+    #[test]
+    fn a_range_acknowledgement_reports_no_value_even_when_the_write_was_clamped() {
+        use super::WriteAck;
+        use crate::model::Register;
+
+        // The device sent exactly this after storing 800 for a write of 1000: the range, and a status of
+        // zero. Nothing distinguishes it from a write that was stored verbatim, which is why a read-back
+        // is the only confirmation worth having.
+        let frame = Frame::new(
+            MessageType::WriteRegisterRange,
+            "0EXAMPLE00000001",
+            &[0x01, 0x41, 0x01, 0x42, 0x00],
+        )
+        .expect("build");
+
+        let ack = WriteAck::from_frame(&frame).expect("decode");
+        assert_eq!(ack.start, Register(321));
+        assert_eq!(ack.end, Register(322));
+        assert_eq!(ack.status, 0);
+        assert_eq!(ack.value, None, "a range acknowledgement carries no value");
+        assert!(ack.accepted(), "and claims success regardless of clamping");
+    }
+
+    #[test]
+    fn telemetry_is_not_mistaken_for_a_write_acknowledgement() {
+        use super::WriteAck;
+
+        let frame = Frame::new(MessageType::Telemetry, "0EXAMPLE00000001", &[0u8; 547]).expect("build");
+        assert!(WriteAck::from_frame(&frame).is_err());
     }
 
     #[test]

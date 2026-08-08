@@ -24,7 +24,7 @@ use crate::control::{
     Request as ControlRequest, SessionHandle, SettingView,
 };
 use crate::growatt::cloud::{CloudConfig, Message as CloudMessage, Relay};
-use crate::growatt::v7::decode::{FromFrame, ReadResponse, Telemetry};
+use crate::growatt::v7::decode::{FromFrame, ReadResponse, Telemetry, WriteAck};
 use crate::growatt::v7::encode::{Command, EncodeError};
 use crate::growatt::v7::frame::{Frame, MessageType};
 use crate::growatt::v7::registers::HoldingRegister;
@@ -142,8 +142,14 @@ pub struct Session<S> {
     relay: Option<Relay>,
     recorder: Option<Recorder>,
     slots: u16,
-    resync: VecDeque<HoldingRegister>,
-    awaiting: Option<HoldingRegister>,
+    /// Registers waiting to be read, each knowing why.
+    ///
+    /// One queue rather than two because only one read may be in flight — the device answers sequentially
+    /// and responses identify themselves by register. Two queues would need a scheduler to choose between
+    /// them, which is the same thing with more parts. Verification reads go to the front: a startup resync
+    /// has up to an hour of slack, a caller holding an HTTP connection has twenty seconds.
+    reads: VecDeque<PendingRead>,
+    awaiting: Option<PendingRead>,
     /// A read decided on but not yet transmitted.
     ///
     /// The decision is made while handling a packet, which cannot await; the loop sends it immediately
@@ -158,19 +164,56 @@ pub struct Session<S> {
     settings_out: Option<watch::Sender<Vec<SettingView>>>,
     /// Removes this session from the registry when dropped, including on the error paths.
     registration: Option<Registration>,
-    /// Read-backs owed to a control request: what was asked for, and who is waiting.
-    ///
-    /// Keyed by register because that is what a response identifies itself by.
-    verifying: BTreeMap<Register, Verification>,
 }
 
-/// A read-back a control request is waiting on.
+/// A register queued to be read, and why.
+///
+/// Carrying the purpose is what lets one queue serve both the startup read-back and one-off verifications:
+/// the alternative was a side table keyed by register plus a flag, which is the same information stored
+/// twice and able to disagree with itself.
 #[derive(Debug)]
-struct Verification {
-    /// What the write asked the register to hold, if anything did.
-    requested: Option<Raw>,
-    /// Where to report the result. `None` for a verification nobody is waiting on.
-    reply: Option<oneshot::Sender<Outcome>>,
+struct PendingRead {
+    /// Which register, and how to render what comes back.
+    entry: HoldingRegister,
+    /// Why it is being read.
+    purpose: ReadPurpose,
+}
+
+impl PendingRead {
+    /// Whether this read belongs to the startup sequence.
+    const fn is_resync(&self) -> bool {
+        matches!(self.purpose, ReadPurpose::Resync)
+    }
+
+    /// What the caller asked the register to hold, if this is confirming a write.
+    const fn requested(&self) -> Option<Raw> {
+        match self.purpose {
+            ReadPurpose::Verify { requested, .. } => requested,
+            ReadPurpose::Resync => None,
+        }
+    }
+
+    /// Take whoever is waiting on this read, if anyone is.
+    fn take_reply(&mut self) -> Option<oneshot::Sender<Outcome>> {
+        match &mut self.purpose {
+            ReadPurpose::Verify { reply, .. } => reply.take(),
+            ReadPurpose::Resync => None,
+        }
+    }
+}
+
+/// Why a register is being read.
+#[derive(Debug)]
+enum ReadPurpose {
+    /// Part of the startup read-back, which announces itself once when the last of them lands.
+    Resync,
+    /// Confirming a write, or a caller asking directly.
+    Verify {
+        /// What the write asked for, if anything did. `None` means there is only something to learn.
+        requested: Option<Raw>,
+        /// Where to report the result.
+        reply: Option<oneshot::Sender<Outcome>>,
+    },
 }
 
 impl<S> Session<S>
@@ -201,7 +244,7 @@ where
             relay: None,
             recorder: None,
             slots: 1,
-            resync: VecDeque::new(),
+
             awaiting: None,
             pending_read: None,
             read_deadline: None,
@@ -210,7 +253,7 @@ where
             requests: None,
             settings_out: None,
             registration: None,
-            verifying: BTreeMap::new(),
+            reads: VecDeque::new(),
         }
     }
 
@@ -290,21 +333,19 @@ where
                 Woke::ReadTimedOut => {
                     // One unanswered read must not stall the rest. Recorded and skipped: the value stays
                     // unknown, which is honest, rather than being inferred.
-                    if let Some(entry) = self.awaiting.take() {
+                    if let Some(mut read) = self.awaiting.take() {
                         tracing::warn!(
-                            register = %entry.register,
-                            name = entry.name,
+                            register = %read.entry.register,
+                            name = read.entry.name,
                             timeout_s = READ_REPLY_TIMEOUT.as_secs(),
                             "no answer to a settings read; moving on"
                         );
-                        // Anyone waiting on this one is told, rather than left to time out separately.
-                        if let Some(Verification { requested, reply }) = self.verifying.remove(&entry.register)
-                            && let Some(reply) = reply
-                        {
-                            drop(reply.send(Outcome::timed_out(entry.register, requested)));
+                        // Anyone waiting on this one is told now, rather than left to time out separately.
+                        if let Some(reply) = read.take_reply() {
+                            drop(reply.send(Outcome::timed_out(read.entry.register, read.requested())));
                         }
                     }
-                    self.advance_resync();
+                    self.start_next_read();
                     self.send_pending_read().await?;
                     continue;
                 }
@@ -538,13 +579,13 @@ where
                 }
             },
 
+            MessageType::WriteSingleRegister | MessageType::WriteRegisterRange => self.accept_write_ack(&frame),
+
             // Known message types this codec cannot decode yet. Counted and named so their arrival is
             // visible rather than silent.
             MessageType::SettingsSnapshot
             | MessageType::IdentityReport
             | MessageType::ExtendedTelemetry
-            | MessageType::WriteSingleRegister
-            | MessageType::WriteRegisterRange
             | MessageType::TimePush => {
                 self.stats.undecoded = self.stats.undecoded.saturating_add(1);
                 tracing::info!(
@@ -717,36 +758,44 @@ where
     /// settings snapshot, so a server that restarts mid-hour would have nothing to say about them for up to
     /// an hour — or would guess, which is worse.
     fn begin_resync(&mut self) {
-        self.resync = HoldingRegister::resync_set(self.slots).into();
+        for entry in HoldingRegister::resync_set(self.slots) {
+            self.reads.push_back(PendingRead {
+                entry,
+                purpose: ReadPurpose::Resync,
+            });
+        }
         tracing::info!(
-            registers = self.resync.len(),
+            registers = self.reads.len(),
             slots = self.slots,
             "reading settings back to resynchronise"
         );
-        self.advance_resync();
+        self.start_next_read();
     }
 
     /// Issue the next read, if any remain.
     ///
     /// One at a time on purpose. The device answered a read in about 0.6 s, and a burst of sixty would be
     /// a novel load on hardware that cannot be patched — for a sequence that only has to finish before the
-    /// hourly snapshot would have arrived anyway.
-    fn advance_resync(&mut self) {
-        let Some(entry) = self.resync.pop_front() else {
-            if self.awaiting.is_some() || !self.settings.is_empty() {
-                self.finish_resync();
-            }
+    /// hourly snapshot would have arrived anyway. That is also why there is one queue rather than two: with
+    /// a single read in flight, a second queue would only need a scheduler to choose between them.
+    fn start_next_read(&mut self) {
+        let Some(next) = self.reads.pop_front() else {
             self.awaiting = None;
             self.read_deadline = None;
             return;
         };
 
-        self.awaiting = Some(entry);
+        self.pending_read = Some(next.entry.register);
+        self.awaiting = Some(next);
         self.read_deadline = Instant::now().checked_add(READ_REPLY_TIMEOUT);
-        self.pending_read = Some(entry.register);
     }
 
-    /// Send the queued read request. Separate from [`Session::advance_resync`] because that is called from
+    /// Whether a startup resync is still draining.
+    fn resync_outstanding(&self) -> bool {
+        self.awaiting.as_ref().is_some_and(PendingRead::is_resync) || self.reads.iter().any(PendingRead::is_resync)
+    }
+
+    /// Send the queued read request. Separate from [`Session::start_next_read`] because that is called from
     /// places that cannot await.
     async fn send_pending_read(&mut self) -> Result<(), SessionError> {
         let Some(register) = self.pending_read.take() else {
@@ -776,65 +825,106 @@ where
 
     /// Record a value the device reported, and move the sequence along.
     fn accept_read(&mut self, response: ReadResponse) {
-        let expected = self.awaiting.map(|entry| entry.register);
+        let expected = self.awaiting.as_ref().map(|read| read.entry.register);
         if expected != Some(response.register) {
             // Not what was asked for. Kept anyway — it is still a fact about the device — but the sequence
-            // is not advanced by it, or a stray response would skip a register.
+            // is not advanced by it, or a stray response would skip whichever register is outstanding.
             tracing::warn!(
                 got = %response.register,
-                expected = expected.map_or_else(|| "nothing".to_owned(), |r| r.to_string()),
+                expected = expected.map_or_else(|| "nothing".to_owned(), |register| register.to_string()),
                 "unexpected read response"
             );
             self.settings.insert(response.register, response.raw);
+            self.publish_settings();
             return;
         }
 
-        if let Some(entry) = self.awaiting {
-            tracing::debug!(
-                register = %response.register,
-                name = entry.name,
-                value = %entry.decode(response.raw),
-                raw = response.raw.get(),
-                "setting"
-            );
-        }
-        self.settings.insert(response.register, response.raw);
-        self.settle_verification(response.register, response.raw);
-        self.publish_settings();
-        self.advance_resync();
-    }
-
-    /// Report a read-back to whoever asked for it, and say plainly when the device clamped.
-    fn settle_verification(&mut self, register: Register, stored: Raw) {
-        let Some(Verification { requested, reply }) = self.verifying.remove(&register) else {
+        let Some(read) = self.awaiting.take() else {
             return;
         };
-        let outcome = Outcome::read_back(register, requested, stored);
+        tracing::debug!(
+            register = %response.register,
+            name = read.entry.name,
+            value = %read.entry.decode(response.raw),
+            raw = response.raw.get(),
+            "setting"
+        );
 
-        if let Some(wanted) = requested {
-            if wanted == stored {
-                tracing::info!(
-                    register = %register,
-                    name = outcome.name.unwrap_or("unknown"),
-                    stored = stored.get(),
-                    "write confirmed by read-back"
-                );
-            } else {
-                // Not an error: the device did what it was going to do. Reported because a write that
-                // silently stores something else is indistinguishable from success at the protocol level.
-                tracing::warn!(
-                    register = %register,
-                    name = outcome.name.unwrap_or("unknown"),
-                    requested = wanted.get(),
-                    stored = stored.get(),
-                    "write was clamped by the device"
-                );
+        self.settings.insert(response.register, response.raw);
+        self.publish_settings();
+        self.settle(read, response.raw);
+        self.start_next_read();
+    }
+
+    /// Note the device's answer to a write.
+    ///
+    /// Informative rather than authoritative: a range acknowledgement reports acceptance even for a value
+    /// the device clamped, so the read-back still decides. A refusal is worth saying out loud, though — it
+    /// is the one case where the device volunteers that it did not do as asked.
+    fn accept_write_ack(&mut self, frame: &Frame) {
+        match WriteAck::from_frame(frame) {
+            Ok(ack) if ack.accepted() => tracing::debug!(
+                start = %ack.start,
+                end = %ack.end,
+                value = ack.value.map_or_else(|| "none".to_owned(), |raw| raw.get().to_string()),
+                "device acknowledged a write"
+            ),
+            Ok(ack) => tracing::warn!(
+                start = %ack.start,
+                end = %ack.end,
+                status = ack.status,
+                "device refused a write"
+            ),
+            Err(error) => {
+                self.stats.rejected = self.stats.rejected.saturating_add(1);
+                tracing::warn!(%error, "could not decode a write acknowledgement");
             }
         }
+    }
 
-        if let Some(reply) = reply {
-            // A dropped receiver means the caller gave up; the value is still recorded.
-            drop(reply.send(outcome));
+    /// Finish one read according to why it was issued.
+    fn settle(&self, read: PendingRead, stored: Raw) {
+        let register = read.entry.register;
+        match read.purpose {
+            // The startup sequence announces itself only once, when the last of its reads lands. Sharing
+            // the queue with verification reads is what makes carrying the purpose necessary: without it,
+            // every one-off read looks like a resync completing.
+            ReadPurpose::Resync => {
+                if !self.resync_outstanding() {
+                    self.finish_resync();
+                }
+            }
+
+            ReadPurpose::Verify { requested, reply } => {
+                let outcome = Outcome::read_back(register, requested, stored);
+
+                if let Some(wanted) = requested {
+                    if wanted == stored {
+                        tracing::info!(
+                            register = %register,
+                            name = read.entry.name,
+                            stored = stored.get(),
+                            "write confirmed by read-back"
+                        );
+                    } else {
+                        // Not an error: the device did what it was going to do. Reported because a write
+                        // that stores something else is indistinguishable from success at the protocol
+                        // level.
+                        tracing::warn!(
+                            register = %register,
+                            name = read.entry.name,
+                            requested = wanted.get(),
+                            stored = stored.get(),
+                            "the device did not store what was written"
+                        );
+                    }
+                }
+
+                if let Some(reply) = reply {
+                    // A dropped receiver means the caller gave up; the value is still recorded.
+                    drop(reply.send(outcome));
+                }
+            }
         }
     }
 
@@ -928,8 +1018,6 @@ where
         requested: Option<Raw>,
         reply: Option<oneshot::Sender<Outcome>>,
     ) {
-        self.verifying.insert(register, Verification { requested, reply });
-
         let entry = HoldingRegister::lookup(register).unwrap_or_else(|| {
             // Readable but undocumented. Reading is harmless, and a value is still a fact; it simply has no
             // name or domain to render it with.
@@ -943,9 +1031,12 @@ where
             )
         });
 
-        self.resync.push_front(entry);
+        self.reads.push_front(PendingRead {
+            entry,
+            purpose: ReadPurpose::Verify { requested, reply },
+        });
         if self.awaiting.is_none() {
-            self.advance_resync();
+            self.start_next_read();
         }
     }
 
