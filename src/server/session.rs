@@ -20,8 +20,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::control::{
-    Action as ControlAction, Outcome, QUEUE_DEPTH as CONTROL_QUEUE_DEPTH, Registration, Registry,
-    Request as ControlRequest, SessionHandle, SettingView,
+    Action as ControlAction, ConfigView, IdentityView, Outcome, QUEUE_DEPTH as CONTROL_QUEUE_DEPTH, ReadingView,
+    Registration, Registry, Request as ControlRequest, SessionHandle, SettingView, TelemetryView,
 };
 use crate::growatt::cloud::{CloudConfig, Message as CloudMessage, Relay};
 use crate::growatt::policy::{CloudCommands, Direction, Intent, Originator, Policy};
@@ -174,6 +174,10 @@ pub struct Session<S> {
     requests: Option<mpsc::Receiver<ControlRequest>>,
     /// Where to publish settings so the API can answer reads without device traffic.
     settings_out: Option<watch::Sender<Vec<SettingView>>>,
+    /// Where to publish the datalogger's own report of itself.
+    identity_out: Option<watch::Sender<Option<IdentityView>>>,
+    /// Where to publish the most recent telemetry frame.
+    telemetry_out: Option<watch::Sender<Option<TelemetryView>>>,
     /// Removes this session from the registry when dropped, including on the error paths.
     registration: Option<Registration>,
 }
@@ -267,6 +271,8 @@ where
             registry: None,
             requests: None,
             settings_out: None,
+            identity_out: None,
+            telemetry_out: None,
             registration: None,
             reads: VecDeque::new(),
         }
@@ -595,6 +601,7 @@ where
                         self.device_time = Some(stamp);
                     }
                     self.log_telemetry(&telemetry);
+                    self.publish_telemetry(&telemetry);
                 }
                 Err(error) => {
                     self.stats.rejected = self.stats.rejected.saturating_add(1);
@@ -930,6 +937,7 @@ where
         }
 
         self.identity = Some(identity);
+        self.publish_identity();
     }
 
     /// Note the device's answer to a write.
@@ -1035,16 +1043,27 @@ where
 
         let (request_tx, request_rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
         let (settings_tx, settings_rx) = watch::channel(Vec::new());
+        let (identity_tx, identity_rx) = watch::channel(None);
+        let (telemetry_tx, telemetry_rx) = watch::channel(None);
 
         self.registration = Some(registry.register(
             &device_id,
             SessionHandle {
                 requests: request_tx,
                 settings: settings_rx,
+                identity: identity_rx,
+                telemetry: telemetry_rx,
             },
         ));
         self.requests = Some(request_rx);
         self.settings_out = Some(settings_tx);
+        self.identity_out = Some(identity_tx);
+        self.telemetry_out = Some(telemetry_tx);
+
+        // An identity report arrives once per connect, and registration happens on CONNECT — so if this
+        // session already has one, it was decoded before the API could see it. Republish rather than make a
+        // caller wait for a reconnect.
+        self.publish_identity();
         tracing::info!("registered with the control API");
     }
 
@@ -1176,6 +1195,59 @@ where
             .filter_map(|(register, raw)| SettingView::new(*register, *raw))
             .collect();
         drop(out.send(views));
+    }
+
+    /// Publish the datalogger's identity for the API.
+    ///
+    /// Everything it reported, in the order sent: this is the owner's own device on the owner's own socket,
+    /// so the serial and password fields are served like any other. What must not carry them is a committed
+    /// fixture, which is the fixture generator's business rather than this one's.
+    fn publish_identity(&self) {
+        let (Some(out), Some(identity)) = (self.identity_out.as_ref(), self.identity.as_ref()) else {
+            return;
+        };
+        let entries = identity
+            .entries
+            .iter()
+            .map(|entry| ConfigView {
+                register: entry.register.number(),
+                name: entry.name(),
+                role: entry.role().map(ConfigRole::as_str),
+                value: entry.value.clone(),
+            })
+            .collect();
+        drop(out.send(Some(IdentityView {
+            declared: identity.declared,
+            truncated: identity.truncated,
+            endpoint: identity.endpoint(),
+            entries,
+        })));
+    }
+
+    /// Publish a decoded telemetry frame for the API.
+    ///
+    /// Every input register the frame carried, including the `unknown_*` ones with their confidence — a value
+    /// nobody has identified is identified by watching it, and a trace log is a poor place to watch from.
+    fn publish_telemetry(&self, telemetry: &Telemetry) {
+        let Some(out) = self.telemetry_out.as_ref() else {
+            return;
+        };
+        let readings = telemetry
+            .readings
+            .iter()
+            .map(|reading| ReadingView {
+                register: reading.register.number(),
+                name: reading.name,
+                raw: reading.raw.get(),
+                value: reading.value.to_string(),
+                unit: reading.unit.symbol(),
+                confidence: reading.confidence.as_str(),
+            })
+            .collect();
+        drop(out.send(Some(TelemetryView {
+            timestamp: telemetry.timestamp.map(|stamp| stamp.to_string()),
+            readings,
+        })));
     }
 
     /// Hand a frame to the recorder, if one is configured.

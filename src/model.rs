@@ -162,6 +162,20 @@ pub enum Confidence {
     Verified,
 }
 
+impl Confidence {
+    /// The marker used in the specification, and in anything this publishes.
+    ///
+    /// Deliberately the same three words the documentation uses, so a consumer reading `inferred` from the
+    /// API and `[I]` in the specification is reading one claim rather than two vocabularies.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inferred => "inferred",
+            Self::Observed => "observed",
+            Self::Verified => "verified",
+        }
+    }
+}
+
 /// The physical unit of a scaled value.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Unit {
@@ -306,7 +320,14 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Int(v) => write!(f, "{v}"),
-            Self::Float(v) => write!(f, "{v}"),
+            // Three decimals, then trimmed. Every scaling in the register map is a power of ten down to
+            // thousandths, so three digits is lossless here — and the default `{}` is not: `30999 × 0.1 −
+            // 3000` renders as `99.90000000000018`, which is arithmetically true and useless to read.
+            Self::Float(v) => {
+                let rendered = format!("{v:.3}");
+                let trimmed = rendered.trim_end_matches('0').trim_end_matches('.');
+                f.write_str(trimmed)
+            }
             Self::Enum { raw, label } => match label {
                 Some(name) => write!(f, "{name}"),
                 None => write!(f, "{raw}"),
@@ -406,6 +427,20 @@ mod tests {
     fn time_of_day_formats_with_leading_zeros() {
         let value = Value::TimeOfDay { hour: 7, minute: 5 };
         assert_eq!(value.to_string(), "07:05");
+    }
+
+    #[test]
+    fn floats_render_without_binary_noise() {
+        // The exact value register 116 produces: 30 999 × 0.1 − 3000. `{}` renders it 99.90000000000018.
+        let hires = Scaling::new(0.1, -3000.0).apply(Raw(30_999));
+        assert_eq!(Value::Float(hires).to_string(), "99.9");
+
+        // A whole number keeps no decimal point, and thousandths — the finest scaling in the map, used for
+        // cell voltages — survive.
+        assert_eq!(Value::Float(99.0).to_string(), "99");
+        assert_eq!(Value::Float(3.271).to_string(), "3.271");
+        assert_eq!(Value::Float(-49.0).to_string(), "-49");
+        assert_eq!(Value::Float(30.4).to_string(), "30.4");
     }
 
     #[test]

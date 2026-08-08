@@ -219,6 +219,37 @@ fn ac_power_and_its_high_resolution_twin_agree() {
 }
 
 #[test]
+fn the_household_load_registers_are_unsigned_and_mirror_the_ac_magnitude() {
+    // Guards the correction that produced `household_load_total = -29901 W` from a house exporting 99 W:
+    // these two are unsigned, so the signed `delta = -30000` must not creep back.
+    //
+    // The equality with |ac_power| is a property of the installation these fixtures came from rather than of
+    // the protocol. The pair differs by load measured through interconnected vendor smart plugs, and there are
+    // none here, so the difference is zero. It is asserted anyway because it is a sharp check on the scaling —
+    // but a fixture from an installation with plugs would legitimately fail this half of the test, and should
+    // be given its own.
+    for fixture in FIXTURES {
+        let frame = Frame::parse(fixture.wire).expect("parse");
+        let telemetry = Telemetry::from_frame(&frame).expect("decode");
+        let ac = telemetry.value("ac_power").expect("register 5");
+        for name in ["household_load_total", "household_load_excl_groplug"] {
+            let load = telemetry.value(name).expect(name);
+            assert!(
+                load >= 0.0,
+                "{}: {name} is {load}, so the signed encoding is back",
+                fixture.file
+            );
+            assert!(
+                (load - ac.abs()).abs() <= 3.0,
+                "{}: {name} {load} does not track |ac_power| {}",
+                fixture.file,
+                ac.abs()
+            );
+        }
+    }
+}
+
+#[test]
 fn temperatures_are_physically_plausible() {
     // The scaling-order bug this guards against read a battery temperature as 289.79 °C.
     for fixture in FIXTURES {

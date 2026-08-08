@@ -53,8 +53,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::{FromRequestParts, RawPathParams, State};
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
@@ -189,6 +190,63 @@ impl SettingView {
     }
 }
 
+/// One config register as the datalogger reported it.
+///
+/// Every field is served, the serial and password included. This socket belongs to the device's owner —
+/// its routes are keyed by the serial already — so filtering their own data out of their own API would only
+/// make fields that exist on the wire unreachable. Redaction is a property of what gets committed, not of
+/// what runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigView {
+    /// Config register number. Its own address space: config 31 is the clock, holding 31 is nothing.
+    pub register: u16,
+    /// Documented field name, or `null` for a key this build cannot name.
+    pub name: Option<&'static str>,
+    /// What the field is for: identity, metadata, dynamic, endpoint, inert, or `null` when unknown.
+    pub role: Option<&'static str>,
+    /// The value as sent. ASCII on the wire whatever the field means.
+    pub value: String,
+}
+
+/// What the datalogger says about itself, from the report it sends on every connect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IdentityView {
+    /// Entries the frame declared, which is also how many follow.
+    pub declared: u16,
+    /// Whether the body ran out before the declared count was reached.
+    pub truncated: bool,
+    /// The endpoint the device believes it should dial, assembled from three registers.
+    pub endpoint: Option<String>,
+    /// Every entry reported, in the order sent.
+    pub entries: Vec<ConfigView>,
+}
+
+/// One telemetry register as last decoded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReadingView {
+    /// Input register number.
+    pub register: u16,
+    /// Field name. `unknown_*` where the meaning is not established.
+    pub name: &'static str,
+    /// Raw register value, before scaling.
+    pub raw: u16,
+    /// Scaled and rendered value.
+    pub value: String,
+    /// Unit symbol, empty where there is none.
+    pub unit: &'static str,
+    /// How well the field's meaning is established: `observed`, `verified` or `inferred`.
+    pub confidence: &'static str,
+}
+
+/// The most recent telemetry frame, decoded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TelemetryView {
+    /// The device's own timestamp for the frame, where it reported a plausible one.
+    pub timestamp: Option<String>,
+    /// Every input register the frame carried.
+    pub readings: Vec<ReadingView>,
+}
+
 /// How the API reaches one device's session.
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
@@ -196,6 +254,10 @@ pub struct SessionHandle {
     pub requests: mpsc::Sender<Request>,
     /// Its current settings, so a read needs no device traffic.
     pub settings: watch::Receiver<Vec<SettingView>>,
+    /// What the datalogger last said about itself. Absent until the first report, about a second in.
+    pub identity: watch::Receiver<Option<IdentityView>>,
+    /// The most recent telemetry frame. Absent until the first one arrives, about a second in.
+    pub telemetry: watch::Receiver<Option<TelemetryView>>,
 }
 
 /// Which devices are connected, and how to reach each.
@@ -310,11 +372,14 @@ pub fn listen(path: &Path, registry: Registry) -> Result<(), ControlError> {
     restrict(path);
 
     let router = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/devices", get(list_devices))
-        .route("/devices/{device}/settings", get(list_settings))
-        .route("/devices/{device}/settings/{key}", get(get_setting).put(put_setting))
-        .route("/devices/{device}/settings/{key}/read", post(refresh_setting))
+        .route("/healthz", get(Api::health))
+        .route("/devices", get(Api::devices))
+        .route("/devices/{device}/identity", get(Api::identity))
+        .route("/devices/{device}/telemetry", get(Api::telemetry))
+        .route("/devices/{device}/telemetry/{key}", get(Api::reading))
+        .route("/devices/{device}/settings", get(Api::settings))
+        .route("/devices/{device}/settings/{key}", get(Api::setting).put(Api::write))
+        .route("/devices/{device}/settings/{key}/read", post(Api::refresh))
         .with_state(registry);
 
     let socket = path.to_path_buf();
@@ -342,90 +407,233 @@ fn restrict(path: &Path) {
     }
 }
 
-/// Liveness, for a service manager or a script waiting for startup.
-async fn healthz() -> &'static str {
-    "ok\n"
+/// Why an extractor refused a request.
+///
+/// A status and a sentence rather than a built `Response`: a response is large enough that returning one in
+/// an `Err` is worth a lint, and this keeps the rendering — the problem document — in exactly one place.
+struct Rejection {
+    /// What to answer with.
+    code: StatusCode,
+    /// What to tell the caller.
+    detail: String,
 }
 
-/// Which devices are connected right now.
-async fn list_devices(State(registry): State<Registry>) -> Response {
-    axum::Json(serde_json::json!({ "devices": registry.devices() })).into_response()
-}
-
-/// Every setting a device's session knows, from its cache. No device traffic.
-async fn list_settings(State(registry): State<Registry>, UrlPath(device): UrlPath<String>) -> Response {
-    match registry.handle(&device) {
-        Some(handle) => axum::Json(handle.settings.borrow().clone()).into_response(),
-        None => not_connected(&device),
+impl Rejection {
+    /// Refuse with a status and a message.
+    fn new(code: StatusCode, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            detail: detail.into(),
+        }
     }
 }
 
-/// One setting from the cache.
-async fn get_setting(State(registry): State<Registry>, UrlPath((device, key)): UrlPath<(String, String)>) -> Response {
-    let Some(handle) = registry.handle(&device) else {
-        return not_connected(&device);
-    };
-    let Some(register) = resolve(&key) else {
-        return problem(StatusCode::NOT_FOUND, &format!("unknown setting {key:?}"));
-    };
+impl IntoResponse for Rejection {
+    fn into_response(self) -> Response {
+        problem(self.code, &self.detail)
+    }
+}
 
-    let found = handle
-        .settings
-        .borrow()
+/// The session named in the route, resolved before the handler runs.
+///
+/// Every device-scoped route began with the same three lines — look the serial up, answer "not connected"
+/// otherwise. That is a precondition rather than logic, and a precondition is what an extractor is for: a
+/// handler taking a `Session` cannot run without one, so a new route cannot forget the check.
+struct Session(SessionHandle);
+
+impl FromRequestParts<Registry> for Session {
+    type Rejection = Rejection;
+
+    async fn from_request_parts(parts: &mut Parts, registry: &Registry) -> Result<Self, Self::Rejection> {
+        let device = path_param(parts, "device").await?;
+        registry.handle(&device).map(Self).ok_or_else(|| {
+            Rejection::new(
+                StatusCode::NOT_FOUND,
+                format!("no connected device {device:?}; see /devices"),
+            )
+        })
+    }
+}
+
+/// The `{key}` path segment, whatever it names.
+///
+/// Telemetry fields are not holding registers, so a reading is found by name rather than resolved to a
+/// writable register. This carries the segment as sent.
+struct Key(String);
+
+impl FromRequestParts<Registry> for Key {
+    type Rejection = Rejection;
+
+    async fn from_request_parts(parts: &mut Parts, _registry: &Registry) -> Result<Self, Self::Rejection> {
+        path_param(parts, "key").await.map(Self)
+    }
+}
+
+/// The setting named in the route, resolved to a register before the handler runs.
+struct Setting {
+    /// The register the key resolved to.
+    register: Register,
+    /// The key as the caller wrote it, so a message can echo their own words back.
+    key: String,
+}
+
+impl FromRequestParts<Registry> for Setting {
+    type Rejection = Rejection;
+
+    async fn from_request_parts(parts: &mut Parts, _registry: &Registry) -> Result<Self, Self::Rejection> {
+        let key = path_param(parts, "key").await?;
+        let register =
+            resolve(&key).ok_or_else(|| Rejection::new(StatusCode::NOT_FOUND, format!("unknown setting {key:?}")))?;
+        Ok(Self { register, key })
+    }
+}
+
+/// Read one named path parameter.
+///
+/// By name rather than by position, so a route that gains a segment cannot silently shift what an extractor
+/// reads. A missing parameter is this program's mistake, not the caller's, hence the 500.
+async fn path_param(parts: &mut Parts, name: &str) -> Result<String, Rejection> {
+    let missing = || {
+        Rejection::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("route is missing the {name:?} parameter"),
+        )
+    };
+    // Through the extractor rather than by reading `parts.extensions`: the matched parameters live in a
+    // private type there, so poking at extensions directly compiles and then finds nothing at runtime.
+    let params = RawPathParams::from_request_parts(parts, &())
+        .await
+        .map_err(|_ignored| missing())?;
+    params
         .iter()
-        .find(|view| view.register == register.number())
-        .cloned();
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| value.to_owned())
+        .ok_or_else(missing)
+}
 
-    match found {
-        Some(view) => axum::Json(view).into_response(),
-        // Known register, no value yet: the startup read-back has not reached it, which is a different
-        // thing from it not existing.
-        None => problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &format!("no value for {key} yet; the startup read-back may still be in progress"),
-        ),
+/// The HTTP surface.
+///
+/// A unit type carrying the handlers as associated functions rather than a module of loose `async fn`s: the
+/// routes name `Api::identity` and `Api::write`, so what serves a route is findable from the route, and the
+/// helpers they share sit with them instead of alongside every other free function in the file.
+struct Api;
+
+#[expect(
+    clippy::unused_async,
+    reason = "axum's Handler trait takes a function returning a future, so a handler that awaits nothing is \
+              still async. Scoped to this impl rather than the crate, where an idle async fn is worth knowing \
+              about."
+)]
+impl Api {
+    /// Liveness, for a supervisor that wants a cheap check.
+    async fn health() -> &'static str {
+        "ok\n"
     }
-}
 
-/// Write a setting and report what the device ended up holding.
-async fn put_setting(
-    State(registry): State<Registry>,
-    UrlPath((device, key)): UrlPath<(String, String)>,
-    body: Result<axum::Json<WriteBody>, axum::extract::rejection::JsonRejection>,
-) -> Response {
-    let Some(handle) = registry.handle(&device) else {
-        return not_connected(&device);
-    };
-    let Some(register) = resolve(&key) else {
-        return problem(StatusCode::NOT_FOUND, &format!("unknown setting {key:?}"));
-    };
-    let Ok(axum::Json(body)) = body else {
-        return problem(StatusCode::BAD_REQUEST, r#"expected a body like {"value":100}"#);
-    };
+    /// Which devices are connected right now.
+    async fn devices(State(registry): State<Registry>) -> Response {
+        axum::Json(serde_json::json!({ "devices": registry.devices() })).into_response()
+    }
 
-    // `set` rather than `write`, so `default_output_power` goes out as the `321..322` range the vendor uses
-    // rather than as a single-register write nobody has seen this device accept. Built here so a refusal
-    // reads as a bad request rather than a device problem: the allowlist and the register's domain are the
-    // encoder's decision, and both are the caller's mistake.
-    let command = match Command::set(register, body.value) {
-        Ok(command) => command,
-        Err(error) => return problem(StatusCode::BAD_REQUEST, &error.to_string()),
-    };
+    /// What the datalogger says about itself: firmware, model, network, clock, endpoint.
+    ///
+    /// Every field it reported, the serial and password included. From the report sent on every connect, so
+    /// no device traffic.
+    async fn identity(Session(handle): Session) -> Response {
+        Self::cached(
+            handle.identity.borrow().clone(),
+            "no identity report yet; the device sends one on connect",
+        )
+    }
 
-    dispatch(&handle, Action::Apply(command)).await
-}
+    /// The most recent telemetry frame, every register it carried.
+    async fn telemetry(Session(handle): Session) -> Response {
+        Self::cached(
+            handle.telemetry.borrow().clone(),
+            "no telemetry yet; the device publishes about a second after connecting",
+        )
+    }
 
-/// Force a read of one register.
-async fn refresh_setting(
-    State(registry): State<Registry>,
-    UrlPath((device, key)): UrlPath<(String, String)>,
-) -> Response {
-    let Some(handle) = registry.handle(&device) else {
-        return not_connected(&device);
-    };
-    match resolve(&key) {
-        Some(register) => dispatch(&handle, Action::Refresh(register)).await,
-        None => problem(StatusCode::NOT_FOUND, &format!("unknown setting {key:?}")),
+    /// One telemetry reading, by field name or register number.
+    async fn reading(Session(handle): Session, Key(key): Key) -> Response {
+        let number = key.parse::<u16>().ok();
+        let found = handle.telemetry.borrow().as_ref().and_then(|view| {
+            view.readings
+                .iter()
+                .find(|reading| reading.name == key || Some(reading.register) == number)
+                .cloned()
+        });
+        match found {
+            Some(reading) => axum::Json(reading).into_response(),
+            None => problem(StatusCode::NOT_FOUND, &format!("no telemetry reading {key:?}")),
+        }
+    }
+
+    /// Every setting a device's session knows, from its cache. No device traffic.
+    async fn settings(Session(handle): Session) -> Response {
+        axum::Json(handle.settings.borrow().clone()).into_response()
+    }
+
+    /// One setting from the cache.
+    async fn setting(Session(handle): Session, setting: Setting) -> Response {
+        let found = handle
+            .settings
+            .borrow()
+            .iter()
+            .find(|view| view.register == setting.register.number())
+            .cloned();
+
+        match found {
+            Some(view) => axum::Json(view).into_response(),
+            // Known register, no value yet: the startup read-back has not reached it, which is a different
+            // thing from it not existing.
+            None => problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!(
+                    "no value for {} yet; the startup read-back may still be in progress",
+                    setting.key
+                ),
+            ),
+        }
+    }
+
+    /// Write a setting and report what the device ended up holding.
+    async fn write(
+        Session(handle): Session,
+        setting: Setting,
+        body: Result<axum::Json<WriteBody>, axum::extract::rejection::JsonRejection>,
+    ) -> Response {
+        let Ok(axum::Json(body)) = body else {
+            return problem(StatusCode::BAD_REQUEST, r#"expected a body like {"value":100}"#);
+        };
+
+        // `set` rather than `write`, so `default_output_power` goes out as the `321..322` range the vendor
+        // uses rather than as a single-register write nobody has seen this device accept. Built here so a
+        // refusal reads as a bad request rather than a device problem: the allowlist and the register's
+        // domain are the encoder's decision, and both are the caller's mistake.
+        let command = match Command::set(setting.register, body.value) {
+            Ok(command) => command,
+            Err(error) => return problem(StatusCode::BAD_REQUEST, &error.to_string()),
+        };
+
+        dispatch(&handle, Action::Apply(command)).await
+    }
+
+    /// Force a read of one register.
+    async fn refresh(Session(handle): Session, setting: Setting) -> Response {
+        dispatch(&handle, Action::Refresh(setting.register)).await
+    }
+
+    /// Serve a cached value, or explain that it has not arrived yet.
+    ///
+    /// The three cached endpoints differ only in which field they read and what is missing when it is empty,
+    /// so the shape lives here once. `503` rather than `404`: the device sends all of these unprompted, so an
+    /// empty cache means early, not absent.
+    fn cached<T: Serialize>(value: Option<T>, missing: &str) -> Response {
+        match value {
+            Some(value) => axum::Json(value).into_response(),
+            None => problem(StatusCode::SERVICE_UNAVAILABLE, missing),
+        }
     }
 }
 
@@ -472,14 +680,6 @@ fn resolve(key: &str) -> Option<Register> {
         .map(|entry| entry.register)
 }
 
-/// The device named in the route is not connected.
-fn not_connected(device: &str) -> Response {
-    problem(
-        StatusCode::NOT_FOUND,
-        &format!("no connected device {device:?}; see /devices"),
-    )
-}
-
 /// A JSON error body, so a script does not have to parse prose.
 fn problem(code: StatusCode, detail: &str) -> Response {
     (code, axum::Json(serde_json::json!({ "error": detail }))).into_response()
@@ -498,10 +698,14 @@ mod tests {
     ) {
         let (requests_tx, requests_rx) = tokio::sync::mpsc::channel(4);
         let (settings_tx, settings_rx) = tokio::sync::watch::channel(Vec::new());
+        let (_identity_tx, identity_rx) = tokio::sync::watch::channel(None);
+        let (_telemetry_tx, telemetry_rx) = tokio::sync::watch::channel(None);
         (
             SessionHandle {
                 requests: requests_tx,
                 settings: settings_rx,
+                identity: identity_rx,
+                telemetry: telemetry_rx,
             },
             requests_rx,
             settings_tx,

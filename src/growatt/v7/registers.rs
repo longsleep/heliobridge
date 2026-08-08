@@ -194,8 +194,12 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::float(11, "battery_charge_power", Watt, Scaling::SIGNED, Verified),
         Entry::int(12, "battery_pack_count", Observed),
         Entry::float(13, "battery_soc_total", Percent, Scaling::UNIT, Verified),
-        Entry::float(16, "household_load_total", Watt, Scaling::SIGNED, Inferred),
-        Entry::float(17, "household_load_excl_groplug", Watt, Scaling::SIGNED, Inferred),
+        // Unsigned, not signed. Measured across 12 426 frames: the raw value ranges 0..442 and equals
+        // |ac_power| within 3 W in every one, reading 0 exactly when AC output is 0 — which the signed
+        // encoding would render as -30 000 W. The names are inherited from another implementation's map and
+        // remain unverified; the scaling no longer is.
+        Entry::float(16, "household_load_total", Watt, Scaling::UNIT, Inferred),
+        Entry::float(17, "household_load_excl_groplug", Watt, Scaling::UNIT, Inferred),
         Entry::text(21, "serial_number_part_1", 2, Observed),
         Entry::text(23, "serial_number_part_2", 2, Observed),
         Entry::text(25, "serial_number_part_3", 2, Observed),
