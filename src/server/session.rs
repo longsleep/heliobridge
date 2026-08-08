@@ -21,7 +21,7 @@ use tokio::time::Instant;
 
 use crate::control::{
     Action as ControlAction, ConfigView, IdentityView, Outcome, QUEUE_DEPTH as CONTROL_QUEUE_DEPTH, ReadingView,
-    Registration, Registry, Request as ControlRequest, SessionHandle, SettingView, TelemetryView,
+    Registration, Registry, Request as ControlRequest, SessionHandle, SettingView, StatusView, TelemetryView,
 };
 use crate::growatt::cloud::{CloudConfig, Message as CloudMessage, Relay};
 use crate::growatt::policy::{CloudCommands, Direction, Intent, Originator, Policy};
@@ -178,6 +178,8 @@ pub struct Session<S> {
     identity_out: Option<watch::Sender<Option<IdentityView>>>,
     /// Where to publish the most recent telemetry frame.
     telemetry_out: Option<watch::Sender<Option<TelemetryView>>>,
+    /// Where to publish what this session is doing: relay, clock, counts.
+    status_out: Option<watch::Sender<StatusView>>,
     /// Removes this session from the registry when dropped, including on the error paths.
     registration: Option<Registration>,
 }
@@ -273,6 +275,7 @@ where
             settings_out: None,
             identity_out: None,
             telemetry_out: None,
+            status_out: None,
             registration: None,
             reads: VecDeque::new(),
         }
@@ -602,6 +605,9 @@ where
                     }
                     self.log_telemetry(&telemetry);
                     self.publish_telemetry(&telemetry);
+                    // Cheap, and telemetry is the only regular tick a session has: it is what keeps the
+                    // clock comparison and the counts on the device resource current.
+                    self.publish_status();
                 }
                 Err(error) => {
                     self.stats.rejected = self.stats.rejected.saturating_add(1);
@@ -1045,6 +1051,7 @@ where
         let (settings_tx, settings_rx) = watch::channel(Vec::new());
         let (identity_tx, identity_rx) = watch::channel(None);
         let (telemetry_tx, telemetry_rx) = watch::channel(None);
+        let (status_tx, status_rx) = watch::channel(StatusView::default());
 
         self.registration = Some(registry.register(
             &device_id,
@@ -1053,12 +1060,15 @@ where
                 settings: settings_rx,
                 identity: identity_rx,
                 telemetry: telemetry_rx,
+                status: status_rx,
             },
         ));
         self.requests = Some(request_rx);
         self.settings_out = Some(settings_tx);
         self.identity_out = Some(identity_tx);
         self.telemetry_out = Some(telemetry_tx);
+        self.status_out = Some(status_tx);
+        self.publish_status();
 
         // An identity report arrives once per connect, and registration happens on CONNECT — so if this
         // session already has one, it was decoded before the API could see it. Republish rather than make a
@@ -1248,6 +1258,29 @@ where
             timestamp: telemetry.timestamp.map(|stamp| stamp.to_string()),
             readings,
         })));
+    }
+
+    /// Publish what this session is doing, for the device resource.
+    ///
+    /// Only what the session alone knows — the relay, the clock comparison, the counts. Everything else on
+    /// that resource is assembled from the identity report and the last telemetry frame, which are published
+    /// for their own routes, so a summary here would only give itself a way of going stale.
+    fn publish_status(&self) {
+        let Some(out) = self.status_out.as_ref() else {
+            return;
+        };
+        let skew = self
+            .device_time
+            .and_then(|theirs| Skew::between(self.clock.now(), theirs))
+            .map(Skew::seconds);
+        drop(out.send(StatusView {
+            relaying: self.relay.is_some(),
+            relay_mode: self.relay.is_some().then(|| self.policy.mode.as_str()),
+            device_time: self.device_time.map(|stamp| stamp.to_string()),
+            clock_skew_seconds: skew,
+            telemetry_frames: self.stats.telemetry,
+            reads: self.stats.reads,
+        }));
     }
 
     /// Hand a frame to the recorder, if one is configured.

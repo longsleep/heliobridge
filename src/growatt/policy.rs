@@ -304,6 +304,18 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// The mode's name, as the configuration spells it.
+    ///
+    /// Deliberately the same word `--relay-mode` takes, so a log line, an API response and the flag that set
+    /// it all read alike.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Controls => "controls",
+            Self::Observer => "observer",
+        }
+    }
+
     /// Whether the cloud is permitted to write datalogger configuration.
     ///
     /// This decides who owns the device's clock. The vendor server sets it with a configuration write, so if

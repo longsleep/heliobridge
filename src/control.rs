@@ -14,6 +14,29 @@
 //!      -H 'content-type: application/json' -d '{"value":100}'
 //! ```
 //!
+//! ```text
+//! GET  /healthz
+//! GET  /devices                              { "devices": [ … ] }
+//! GET  /devices/{device}                      what it is and what it is doing
+//! GET  /devices/{device}/identity             every config register it reports
+//! GET  /devices/{device}/telemetry            { "timestamp": …, "readings": [ … ] }
+//! GET  /devices/{device}/telemetry/{key}      by field name or register number
+//! GET  /devices/{device}/settings             { "settings": [ … ] }
+//! GET  /devices/{device}/settings/{key}
+//! PUT  /devices/{device}/settings/{key}       {"value": 100}
+//! POST /devices/{device}/settings/{key}/read
+//! ```
+//!
+//! # Shapes are consistent, so a client can be written against one
+//!
+//! A collection answers under a key naming it — `devices`, `settings`, `readings` — and a single resource
+//! answers as a bare object. Errors are `application/problem+json` (RFC 9457) with `status`, `title` and
+//! `detail`. Reads of cached state cost no device traffic; only `PUT` and `POST …/read` reach the device.
+//!
+//! Everything decoded is served, the serial and password fields included. This socket belongs to the
+//! device's owner and its routes name the serial already, so withholding their own data would only put
+//! fields that exist on the wire out of reach. Redaction applies to what gets committed, not to what runs.
+//!
 //! # Routes are scoped to a device
 //!
 //! One session per connection, each learning its own serial from CONNECT, and each relay connecting
@@ -247,6 +270,27 @@ pub struct TelemetryView {
     pub readings: Vec<ReadingView>,
 }
 
+/// What a session is doing, for the device resource.
+///
+/// The parts only the session knows: who owns the clock, whether the relay is up, and how much has come
+/// through. Everything else on the device resource is assembled from the identity report and the last
+/// telemetry frame, which are published anyway.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct StatusView {
+    /// Whether traffic is being relayed to the vendor cloud.
+    pub relaying: bool,
+    /// How much authority the cloud keeps, when relaying.
+    pub relay_mode: Option<&'static str>,
+    /// The device's own clock, as last reported.
+    pub device_time: Option<String>,
+    /// How far the device's clock is from this server's, in seconds. Positive means the device is ahead.
+    pub clock_skew_seconds: Option<i64>,
+    /// Telemetry frames decoded this session.
+    pub telemetry_frames: u64,
+    /// Settings read back this session.
+    pub reads: u64,
+}
+
 /// How the API reaches one device's session.
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
@@ -258,6 +302,8 @@ pub struct SessionHandle {
     pub identity: watch::Receiver<Option<IdentityView>>,
     /// The most recent telemetry frame. Absent until the first one arrives, about a second in.
     pub telemetry: watch::Receiver<Option<TelemetryView>>,
+    /// What the session is doing: relay, clock, counts.
+    pub status: watch::Receiver<StatusView>,
 }
 
 /// Which devices are connected, and how to reach each.
@@ -374,6 +420,7 @@ pub fn listen(path: &Path, registry: Registry) -> Result<(), ControlError> {
     let router = Router::new()
         .route("/healthz", get(Api::health))
         .route("/devices", get(Api::devices))
+        .route("/devices/{device}", get(Api::device))
         .route("/devices/{device}/identity", get(Api::identity))
         .route("/devices/{device}/telemetry", get(Api::telemetry))
         .route("/devices/{device}/telemetry/{key}", get(Api::reading))
@@ -439,19 +486,25 @@ impl IntoResponse for Rejection {
 /// Every device-scoped route began with the same three lines — look the serial up, answer "not connected"
 /// otherwise. That is a precondition rather than logic, and a precondition is what an extractor is for: a
 /// handler taking a `Session` cannot run without one, so a new route cannot forget the check.
-struct Session(SessionHandle);
+struct Session {
+    /// The session that can carry a request out.
+    handle: SessionHandle,
+    /// The serial it is registered under, so a handler can name the device it just answered about.
+    device: String,
+}
 
 impl FromRequestParts<Registry> for Session {
     type Rejection = Rejection;
 
     async fn from_request_parts(parts: &mut Parts, registry: &Registry) -> Result<Self, Self::Rejection> {
         let device = path_param(parts, "device").await?;
-        registry.handle(&device).map(Self).ok_or_else(|| {
+        let handle = registry.handle(&device).ok_or_else(|| {
             Rejection::new(
                 StatusCode::NOT_FOUND,
                 format!("no connected device {device:?}; see /devices"),
             )
-        })
+        })?;
+        Ok(Self { handle, device })
     }
 }
 
@@ -539,7 +592,7 @@ impl Api {
     ///
     /// Every field it reported, the serial and password included. From the report sent on every connect, so
     /// no device traffic.
-    async fn identity(Session(handle): Session) -> Response {
+    async fn identity(Session { handle, .. }: Session) -> Response {
         Self::cached(
             handle.identity.borrow().clone(),
             "no identity report yet; the device sends one on connect",
@@ -547,7 +600,7 @@ impl Api {
     }
 
     /// The most recent telemetry frame, every register it carried.
-    async fn telemetry(Session(handle): Session) -> Response {
+    async fn telemetry(Session { handle, .. }: Session) -> Response {
         Self::cached(
             handle.telemetry.borrow().clone(),
             "no telemetry yet; the device publishes about a second after connecting",
@@ -555,7 +608,7 @@ impl Api {
     }
 
     /// One telemetry reading, by field name or register number.
-    async fn reading(Session(handle): Session, Key(key): Key) -> Response {
+    async fn reading(Session { handle, .. }: Session, Key(key): Key) -> Response {
         let number = key.parse::<u16>().ok();
         let found = handle.telemetry.borrow().as_ref().and_then(|view| {
             view.readings
@@ -569,13 +622,42 @@ impl Api {
         }
     }
 
+    /// One device: what it is, what it is doing, and where it thinks it should connect.
+    ///
+    /// Assembled rather than stored — the identity report and the last telemetry frame are published for
+    /// their own routes anyway, and duplicating a summary of them would give it its own way of being stale.
+    async fn device(session: Session) -> Response {
+        let identity = session.handle.identity.borrow().clone();
+        let field = |name: &str| {
+            identity
+                .as_ref()
+                .and_then(|report| report.entries.iter().find(|entry| entry.name == Some(name)))
+                .map(|entry| entry.value.clone())
+        };
+        axum::Json(serde_json::json!({
+            "device": session.device,
+            "model": field("model_id"),
+            "firmware": field("sw_version"),
+            "hardware": field("hw_version"),
+            "endpoint": identity.as_ref().and_then(|report| report.endpoint.clone()),
+            "status": session.handle.status.borrow().clone(),
+            "last_telemetry": session
+                .handle
+                .telemetry
+                .borrow()
+                .as_ref()
+                .and_then(|view| view.timestamp.clone()),
+        }))
+        .into_response()
+    }
+
     /// Every setting a device's session knows, from its cache. No device traffic.
-    async fn settings(Session(handle): Session) -> Response {
-        axum::Json(handle.settings.borrow().clone()).into_response()
+    async fn settings(Session { handle, .. }: Session) -> Response {
+        axum::Json(serde_json::json!({ "settings": handle.settings.borrow().clone() })).into_response()
     }
 
     /// One setting from the cache.
-    async fn setting(Session(handle): Session, setting: Setting) -> Response {
+    async fn setting(Session { handle, .. }: Session, setting: Setting) -> Response {
         let found = handle
             .settings
             .borrow()
@@ -599,7 +681,7 @@ impl Api {
 
     /// Write a setting and report what the device ended up holding.
     async fn write(
-        Session(handle): Session,
+        Session { handle, .. }: Session,
         setting: Setting,
         body: Result<axum::Json<WriteBody>, axum::extract::rejection::JsonRejection>,
     ) -> Response {
@@ -620,7 +702,7 @@ impl Api {
     }
 
     /// Force a read of one register.
-    async fn refresh(Session(handle): Session, setting: Setting) -> Response {
+    async fn refresh(Session { handle, .. }: Session, setting: Setting) -> Response {
         dispatch(&handle, Action::Refresh(setting.register)).await
     }
 
@@ -682,12 +764,25 @@ fn resolve(key: &str) -> Option<Register> {
 
 /// A JSON error body, so a script does not have to parse prose.
 fn problem(code: StatusCode, detail: &str) -> Response {
-    (code, axum::Json(serde_json::json!({ "error": detail }))).into_response()
+    // RFC 9457, minus the members that would be inventions here: no `type` URI, because there is no
+    // documentation to point one at, and no `instance`, because a request to a local socket has no useful
+    // identifier. `title` comes from the status itself rather than being written twice per call site.
+    let body = serde_json::json!({
+        "status": code.as_u16(),
+        "title": code.canonical_reason().unwrap_or("Error"),
+        "detail": detail,
+    });
+    let mut response = (code, axum::Json(body)).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/problem+json"),
+    );
+    response
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Outcome, Registry, SessionHandle, SettingView, resolve};
+    use super::{Outcome, Registry, SessionHandle, SettingView, StatusView, resolve};
     use crate::model::{Raw, Register};
 
     /// A handle plus the ends a session would keep, so nothing is dropped mid-test.
@@ -700,12 +795,14 @@ mod tests {
         let (settings_tx, settings_rx) = tokio::sync::watch::channel(Vec::new());
         let (_identity_tx, identity_rx) = tokio::sync::watch::channel(None);
         let (_telemetry_tx, telemetry_rx) = tokio::sync::watch::channel(None);
+        let (_status_tx, status_rx) = tokio::sync::watch::channel(StatusView::default());
         (
             SessionHandle {
                 requests: requests_tx,
                 settings: settings_rx,
                 identity: identity_rx,
                 telemetry: telemetry_rx,
+                status: status_rx,
             },
             requests_rx,
             settings_tx,
