@@ -667,8 +667,8 @@ impl Api {
 
         match found {
             Some(view) => axum::Json(view).into_response(),
-            // Known register, no value yet: the startup read-back has not reached it, which is a different
-            // thing from it not existing.
+            // Known register, no value: either the startup read-back has not reached it, or it belongs to a
+            // slot beyond `--slots`, which nothing reads. Both are "not available", which is what this says.
             None => problem(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &format!(
