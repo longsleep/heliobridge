@@ -582,6 +582,114 @@ pub const HOLDING_REGISTERS: &[HoldingRegister] = {
     ]
 };
 
+// --- config registers: the datalogger's own settings ------------------------------------------------
+
+/// One entry in the config register map.
+///
+/// A third address space, and the one most easily confused with the others: numbers overlap and mean
+/// something else — config 31 is the clock, holding 31 is nothing. Values are ASCII whatever the field
+/// means, so a port arrives as `"7006"` rather than as two octets.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct ConfigRegister {
+    /// The register number, which is the key in the identity report's TLV list.
+    pub register: Register,
+    /// Field name, following the specification's Appendix C.
+    pub name: &'static str,
+    /// What the value means, and how it should be treated.
+    pub role: Role,
+    /// How well the meaning is established.
+    pub confidence: Confidence,
+}
+
+/// What a config register is for.
+///
+/// Drives presentation rather than decoding — every value is text on the wire. The distinction that
+/// matters is which of them a consumer should show, and which are inert or identifying.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum Role {
+    /// Identifies the unit: serial, password, the MAC-shaped constant.
+    ///
+    /// Reported like any other field — this is the owner's own device. The distinction is that these are
+    /// what must be redacted out of a captured frame before it becomes a committed test fixture.
+    Identity,
+    /// Static device metadata worth showing once — model, firmware, hardware revision.
+    Metadata,
+    /// A value that changes while running, worth watching.
+    Dynamic,
+    /// Where the datalogger connects, and how it resolves it.
+    Endpoint,
+    /// Reported but not describing the live system, or not understood at all.
+    Inert,
+}
+
+impl Role {
+    /// A short label for a log line.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Metadata => "metadata",
+            Self::Dynamic => "dynamic",
+            Self::Endpoint => "endpoint",
+            Self::Inert => "inert",
+        }
+    }
+}
+
+impl ConfigRegister {
+    /// Look up a config register by the key used in an identity report.
+    pub fn lookup(register: Register) -> Option<&'static Self> {
+        CONFIG_REGISTERS.iter().find(|entry| entry.register == register)
+    }
+
+    /// Look up a config register by its documented name.
+    pub fn lookup_name(name: &str) -> Option<&'static Self> {
+        CONFIG_REGISTERS.iter().find(|entry| entry.name == name)
+    }
+
+    const fn new(register: u16, name: &'static str, role: Role, confidence: Confidence) -> Self {
+        Self {
+            register: Register(register),
+            name,
+            role,
+            confidence,
+        }
+    }
+}
+
+/// Config registers as reported in the identity frame, per the specification's Appendix C.
+///
+/// Not exhaustive by construction — one device reported these, and a parser must carry an unrecognised key
+/// rather than reject the frame. Absent here does not mean absent from the protocol.
+pub const CONFIG_REGISTERS: &[ConfigRegister] = {
+    use Confidence::{Inferred, Observed, Verified};
+    use ConfigRegister as Entry;
+    use Role::{Dynamic, Endpoint, Identity, Inert, Metadata};
+
+    &[
+        Entry::new(4, "data_interval", Dynamic, Verified),
+        Entry::new(7, "password", Identity, Observed),
+        Entry::new(8, "serial_number", Identity, Verified),
+        Entry::new(9, "protocol_version", Metadata, Observed),
+        Entry::new(12, "dns_ip", Endpoint, Observed),
+        Entry::new(13, "device_type", Metadata, Observed),
+        // Reported 192.168.5.1 while the device was actually addressed elsewhere, and unchanged across a
+        // power cycle. Inert defaults, and a client must not use them to reach the device.
+        Entry::new(14, "local_ip", Inert, Observed),
+        Entry::new(16, "mac_address", Identity, Observed),
+        Entry::new(17, "remote_ip", Endpoint, Verified),
+        Entry::new(18, "remote_port", Endpoint, Verified),
+        Entry::new(19, "remote_url", Endpoint, Verified),
+        Entry::new(20, "model_id", Metadata, Observed),
+        Entry::new(21, "sw_version", Metadata, Verified),
+        Entry::new(22, "hw_version", Metadata, Observed),
+        Entry::new(25, "subnet_mask", Inert, Observed),
+        Entry::new(26, "default_gateway", Inert, Observed),
+        Entry::new(30, "timezone", Metadata, Verified),
+        Entry::new(31, "datetime", Dynamic, Verified),
+        Entry::new(76, "wifi_signal", Dynamic, Inferred),
+    ]
+};
+
 #[cfg(test)]
 mod tests {
     use super::{BATTERY_STATUS_LABELS, INPUT_BASE_OFFSET, INPUT_REGISTERS, InputRegister, Kind, WORK_MODE_LABELS};

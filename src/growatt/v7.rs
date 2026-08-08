@@ -9,8 +9,10 @@ pub mod classify;
 pub mod decode;
 pub mod encode;
 pub mod frame;
+pub mod identity;
 pub mod registers;
 
 pub use decode::{Telemetry, Timestamp};
 pub use encode::{Command, EncodeError, SlotConfig, SlotField, WritableRegister};
 pub use frame::{Frame, FrameError, MessageType};
+pub use identity::Identity;

@@ -28,7 +28,8 @@ use crate::growatt::policy::{CloudCommands, Direction, Intent, Originator, Polic
 use crate::growatt::v7::decode::{FromFrame, ReadResponse, Telemetry, WriteAck};
 use crate::growatt::v7::encode::{Command, EncodeError};
 use crate::growatt::v7::frame::{Frame, MessageType};
-use crate::growatt::v7::registers::HoldingRegister;
+use crate::growatt::v7::identity::Identity;
+use crate::growatt::v7::registers::{HoldingRegister, Role as ConfigRole};
 use crate::growatt::{Codec, peek_version};
 use crate::model::{Confidence, Hex, Raw, Register, Timestamp, Unit};
 use crate::mqtt::{Packet, PacketStream, Publish, QoS, StreamError};
@@ -149,6 +150,8 @@ pub struct Session<S> {
     policy: Policy,
     /// Cloud commands awaiting an answer, so answers to ours are not forwarded.
     cloud_commands: CloudCommands,
+    /// What the datalogger last said about itself: firmware, model, signal, endpoint.
+    identity: Option<Identity>,
     recorder: Option<Recorder>,
     slots: u16,
     /// Registers waiting to be read, each knowing why.
@@ -253,6 +256,7 @@ where
             relay: None,
             policy: Policy::default(),
             cloud_commands: CloudCommands::default(),
+            identity: None,
             recorder: None,
             slots: 1,
 
@@ -613,10 +617,15 @@ where
 
             // Known message types this codec cannot decode yet. Counted and named so their arrival is
             // visible rather than silent.
-            MessageType::SettingsSnapshot
-            | MessageType::IdentityReport
-            | MessageType::ExtendedTelemetry
-            | MessageType::TimePush => {
+            MessageType::IdentityReport => match Identity::from_frame(frame) {
+                Ok(identity) => self.accept_identity(identity),
+                Err(error) => {
+                    self.stats.rejected = self.stats.rejected.saturating_add(1);
+                    tracing::warn!(%error, "could not decode the identity report");
+                }
+            },
+
+            MessageType::SettingsSnapshot | MessageType::ExtendedTelemetry | MessageType::TimePush => {
                 self.stats.undecoded = self.stats.undecoded.saturating_add(1);
                 tracing::info!(
                     %message_type,
@@ -884,6 +893,43 @@ where
         self.publish_settings();
         self.settle(read, response.raw);
         self.start_next_read();
+    }
+
+    /// Record what the datalogger says about itself.
+    ///
+    /// Logged as a summary rather than in full, and kept for consumers that want the metadata — the firmware
+    /// version for a device page, the signal strength as a diagnostic, the endpoint the device believes it
+    /// should dial. The frame also carries the serial, a password field and a MAC-shaped constant, which is
+    /// why neither the log line nor anything published walks the entries directly.
+    fn accept_identity(&mut self, identity: Identity) {
+        if identity.truncated {
+            // Not fatal — the entries that parsed are kept — but it means the layout is not what this build
+            // expects, and that is worth knowing about before the values are trusted.
+            tracing::warn!(
+                declared = identity.declared,
+                parsed = identity.entries.len(),
+                "the identity report ended early; treating the entries that parsed as all there are"
+            );
+        }
+        tracing::info!(summary = %identity, "datalogger identity");
+
+        // Every entry at trace, on the same target as the per-register telemetry values. The summary is one
+        // line by design, and one line cannot answer "did all 32 fields decode, and as what" — which is the
+        // question when a report from an unfamiliar unit arrives.
+        if tracing::enabled!(target: TARGET_VALUES, tracing::Level::TRACE) {
+            for entry in &identity.entries {
+                tracing::trace!(
+                    target: TARGET_VALUES,
+                    register = entry.register.number(),
+                    name = entry.name().unwrap_or("<undocumented>"),
+                    role = entry.role().map_or("unknown", ConfigRole::as_str),
+                    value = %entry.value,
+                    "config"
+                );
+            }
+        }
+
+        self.identity = Some(identity);
     }
 
     /// Note the device's answer to a write.

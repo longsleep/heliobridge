@@ -22,8 +22,18 @@ genuine frame and is usable as a decoder input. Each was checked before being wr
 of the real serial or any 8-octet substring of it, correct placeholder count, `Length = total − 8`,
 and a valid CRC-16/MODBUS.
 
-Nothing else in these frames identifies the device. The remaining contents are register values —
+Nothing else in a telemetry frame identifies the device. The remaining contents are register values —
 instantaneous power, state of charge, temperatures, energy counters — plus a timestamp.
+
+**The identity report needs more than the serial removed.** It carries a password field and a MAC-shaped
+constant as well, so the values of config registers 7 and 16 are overwritten with `X`. The length is kept
+identical, which matters: every TLV offset, every declared length and the frame length stay exactly what the
+device sent, so the fixture still tests the layout rather than a rebuilt approximation of it.
+
+Redaction is a property of **these files**, not of the software. `heliobridge` reports every field it
+decodes, the serial included — it runs on the owner's own machine, against their own device, behind a Unix
+socket whose routes already name the serial. What must not happen is a captured frame reaching version
+control unchanged.
 
 ## The fixtures
 
@@ -63,9 +73,31 @@ output. These carry the serial once, in the device ID field.
 `write-range-default-output-power.bin` is the most valuable of these. The vendor does not write
 `default_output_power` as itself: it writes a **range covering register 321**, whose meaning is unknown,
 with a zero in it. An encoder that writes register 322 alone produces a different frame, and only a
-comparison against a vendor-generated frame catches that. The same argument applies to `time-push.bin`,
-whose body begins with eight octets of which three pairs remain unexplained — reproducing them is only
-verifiable against the real thing.
+comparison against a vendor-generated frame catches that.
+
+`time-push.bin` earned its place the same way, before its body was understood. Its leading eight octets were
+reproduced as an opaque constant and verified only by byte equality; they are now known to be a config-space
+TLV — entry count, entry length, register 31, value length — which is how the clock turned out to be an
+instance of a config write rather than a message of its own. The byte-equality test kept working across that
+explanation, which is the point of writing it that way.
+
+## Device identity
+
+| File | Octets | Contents |
+|---|---|---|
+| `identity-report-32-entries.bin` | 401 | `0xFE19`, the config registers as a TLV list: 32 entries in 361 octets |
+
+The frame the device sends on every connect. Its body is a 2-octet entry count, one pad octet, then entries
+of `register(2) length(2) value`, and the values are **ASCII** whatever the field means — the MQTT port
+arrives as `"7006"`.
+
+Worth having as a fixture for two reasons. It pins the layout: 32 declared entries consume the body exactly,
+so an off-by-one in the preamble or the entry header shows up as a leftover rather than as a plausible parse.
+And it is the only frame carrying the firmware version, the model and the endpoint the device believes it
+should dial — the last of which is how a broker retarget would ever be confirmed.
+
+The specification called the leading `0x0020` a subtype meaning "full configuration". It is not: it is the
+entry count, which a single-entry report (`0x0001`) makes obvious. There is one message shape, not two.
 
 Byte equality against these is a stronger claim than any self-consistency check: it says the encoder
 agrees with the server it replaces, not merely with itself.
