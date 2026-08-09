@@ -497,16 +497,9 @@ fn the_energy_counters_agree_with_the_days_conditions() {
         assert!((0.0..=10.0).contains(&value), "{name} is implausible at {value} kWh");
     }
 
-    // The pair holds one value while no GroPlug is attached, exactly as the household-load pair does.
-    // A divergence here would mean an accessory is contributing, not that the decode is wrong.
-    close(
-        telemetry
-            .value("ac_output_energy_today_excl_groplug")
-            .expect("the excluding-accessories counter"),
-        output,
-        "the pair's two halves",
-        "night",
-    );
+    // The household-load pair does hold one value while no GroPlug is attached. Registers 81 and 82 look
+    // like the same arrangement in this fixture and are not: they separate under grid import, so only the
+    // pair with documented names is asserted here.
     close(
         telemetry.value("household_load_excl_groplug").expect("household load"),
         telemetry.value("household_load_total").expect("household load"),

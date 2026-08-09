@@ -273,18 +273,13 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
             Scaling::TENTHS,
             Verified,
         ),
-        // 81 and 82 hold the same value in every frame, which is what the 16/17 pair does and for the
-        // same reason: the device reports a measurement both including and excluding what Growatt's
-        // GroPlug accessories contribute, and none are attached here. Naming 81 is the cautious part —
-        // the reference installation never imported, so nothing separates AC output from energy exported.
-        Entry::float(81, "ac_output_energy_today", KilowattHour, Scaling::TENTHS, Observed),
-        Entry::float(
-            82,
-            "ac_output_energy_today_excl_groplug",
-            KilowattHour,
-            Scaling::TENTHS,
-            Inferred,
-        ),
+        // 81 tracked 82 exactly across 21 700 frames and then separated the moment the device was made to
+        // charge from the grid: 81 advanced 35 units for 31.4 Wh imported, 82 did not move. So they are two
+        // quantities, and 81 is not understood — the scale fitting its behaviour under import is a hundred
+        // times the one fitting its behaviour while exporting.
+        Entry::float(81, "unknown_81", NoUnit, Scaling::UNIT, Inferred),
+        // 82 is the half that behaves consistently: it advances with AC output and ignores grid import.
+        Entry::float(82, "ac_output_energy_today", KilowattHour, Scaling::TENTHS, Observed),
         Entry::float(90, "charge_limit_upper", Percent, Scaling::UNIT, Verified),
         Entry::float(91, "charge_limit_lower", Percent, Scaling::UNIT, Verified),
         Entry::float(92, "pv1_voltage", Volt, Scaling::HUNDREDTHS, Observed),

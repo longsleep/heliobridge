@@ -332,7 +332,6 @@ const NAMED: &[(&str, &str)] = &[
     ("battery_charge_energy_today", "Battery charged today"),
     ("battery_discharge_energy_today", "Battery discharged today"),
     ("ac_output_energy_today", "AC output today"),
-    ("ac_output_energy_today_2", "AC output today (duplicate)"),
     ("energy_today", "Energy today"),
     ("pv_power_total", "Solar power"),
     ("household_load_total", "Household load"),
