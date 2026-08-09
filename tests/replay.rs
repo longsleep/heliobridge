@@ -497,11 +497,20 @@ fn the_energy_counters_agree_with_the_days_conditions() {
         assert!((0.0..=10.0).contains(&value), "{name} is implausible at {value} kWh");
     }
 
-    // The duplicated pair holds one value, exactly as the household-load pair does.
+    // The pair holds one value while no GroPlug is attached, exactly as the household-load pair does.
+    // A divergence here would mean an accessory is contributing, not that the decode is wrong.
     close(
-        telemetry.value("ac_output_energy_today_2").expect("duplicate"),
+        telemetry
+            .value("ac_output_energy_today_excl_groplug")
+            .expect("the excluding-accessories counter"),
         output,
-        "duplicate of the AC output counter",
+        "the pair's two halves",
+        "night",
+    );
+    close(
+        telemetry.value("household_load_excl_groplug").expect("household load"),
+        telemetry.value("household_load_total").expect("household load"),
+        "the household-load pair's two halves",
         "night",
     );
 }

@@ -227,6 +227,11 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         // remain unverified; the scaling no longer is.
         Entry::float(16, "household_load_total", Watt, Scaling::UNIT, Inferred),
         Entry::float(17, "household_load_excl_groplug", Watt, Scaling::UNIT, Inferred),
+        // A second signed-power pair, holding a constant 30000 — exactly 0 W — throughout the capture,
+        // and absent from every published map. The shape fits the same accessory story: power that only
+        // a GroPlug would contribute. Carried as unknown rather than named on that resemblance alone.
+        Entry::float(19, "unknown_19", Watt, Scaling::SIGNED, Inferred),
+        Entry::float(20, "unknown_20", Watt, Scaling::SIGNED, Inferred),
         Entry::text(21, "serial_number_part_1", 2, Observed),
         Entry::text(23, "serial_number_part_2", 2, Observed),
         Entry::text(25, "serial_number_part_3", 2, Observed),
@@ -268,10 +273,18 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
             Scaling::TENTHS,
             Verified,
         ),
-        // 81 and 82 hold the same value in every frame, as 16 and 17 do. Named for what is certain: the
-        // reference installation never imported, so nothing separates AC output from energy exported.
+        // 81 and 82 hold the same value in every frame, which is what the 16/17 pair does and for the
+        // same reason: the device reports a measurement both including and excluding what Growatt's
+        // GroPlug accessories contribute, and none are attached here. Naming 81 is the cautious part —
+        // the reference installation never imported, so nothing separates AC output from energy exported.
         Entry::float(81, "ac_output_energy_today", KilowattHour, Scaling::TENTHS, Observed),
-        Entry::float(82, "ac_output_energy_today_2", KilowattHour, Scaling::TENTHS, Observed),
+        Entry::float(
+            82,
+            "ac_output_energy_today_excl_groplug",
+            KilowattHour,
+            Scaling::TENTHS,
+            Inferred,
+        ),
         Entry::float(90, "charge_limit_upper", Percent, Scaling::UNIT, Verified),
         Entry::float(91, "charge_limit_lower", Percent, Scaling::UNIT, Verified),
         Entry::float(92, "pv1_voltage", Volt, Scaling::HUNDREDTHS, Observed),
