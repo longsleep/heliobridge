@@ -262,6 +262,54 @@ impl Publication {
     }
 }
 
+/// Somewhere to publish, cloneable so every task that has something to say holds one.
+///
+/// Separate from [`Broker`] because publishing and reading events have different owners: one task pumps
+/// the event stream while one task per device publishes.
+///
+/// Cloning shares the queue and not the drop count. The queue is what keeps a stalled broker away from a
+/// device session — nothing here ever waits — and each holder counting its own drops is the number worth
+/// reporting, since a global total would say a message was lost without saying whose.
+#[derive(Debug, Clone)]
+pub struct Publications {
+    sender: mpsc::Sender<Publication>,
+    dropped: u64,
+}
+
+impl Publications {
+    /// A queue with nothing behind it, and the receiving end.
+    ///
+    /// What [`Broker::connect`] builds internally, exposed because publishing is worth exercising without a
+    /// broker: whoever holds the receiver sees exactly what would have gone out, in order.
+    pub fn channel(depth: usize) -> (Self, mpsc::Receiver<Publication>) {
+        let (sender, receiver) = mpsc::channel(depth);
+        (Self { sender, dropped: 0 }, receiver)
+    }
+
+    /// Queue a message, without waiting.
+    ///
+    /// Returns whether it was queued. A full queue means the broker is not keeping up, so the message is
+    /// dropped and counted rather than allowed to apply backpressure to a device session.
+    pub fn try_publish(&mut self, publication: Publication) -> bool {
+        // The value comes back out of the error, so the ordinary path clones nothing.
+        let Err(rejected) = self.sender.try_send(publication) else {
+            return true;
+        };
+        self.dropped = self.dropped.saturating_add(1);
+        tracing::warn!(
+            topic = %rejected.into_inner().topic,
+            dropped = self.dropped,
+            "dropped a message: the broker is not keeping up"
+        );
+        false
+    }
+
+    /// How many publications this handle dropped for a broker that was not keeping up.
+    pub const fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
 /// Something that happened on the broker connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -282,9 +330,8 @@ pub enum Event {
 /// orderly shutdown.
 #[derive(Debug)]
 pub struct Broker {
-    publications: mpsc::Sender<Publication>,
+    publications: Publications,
     events: mpsc::Receiver<Event>,
-    dropped: u64,
 }
 
 impl Broker {
@@ -300,38 +347,30 @@ impl Broker {
     pub fn connect(config: BrokerConfig) -> Result<Self, BrokerError> {
         let task = BrokerTask::new(config)?;
 
-        let (publications_tx, publications_rx) = mpsc::channel(QUEUE_DEPTH);
+        let (publications, publications_rx) = Publications::channel(QUEUE_DEPTH);
         let (events_tx, events_rx) = mpsc::channel(QUEUE_DEPTH);
 
         tokio::spawn(task.run(publications_rx, events_tx));
 
         Ok(Self {
-            publications: publications_tx,
+            publications,
             events: events_rx,
-            dropped: 0,
         })
     }
 
-    /// Queue a message, without waiting.
-    ///
-    /// Returns whether it was queued. A full queue means the broker is not keeping up; the message is
-    /// dropped rather than allowed to apply backpressure to a device session.
+    /// A handle for publishing, for a task that has something to say but no interest in events.
+    pub fn publications(&self) -> Publications {
+        self.publications.clone()
+    }
+
+    /// Queue a message, without waiting. See [`Publications::try_publish`].
     pub fn try_publish(&mut self, publication: Publication) -> bool {
-        if self.publications.try_send(publication).is_ok() {
-            return true;
-        }
-        self.dropped = self.dropped.saturating_add(1);
-        false
+        self.publications.try_publish(publication)
     }
 
     /// The next thing that happened, or `None` once the client has stopped.
     pub async fn next_event(&mut self) -> Option<Event> {
         self.events.recv().await
-    }
-
-    /// How many publications were dropped for a broker that was not keeping up.
-    pub const fn dropped(&self) -> u64 {
-        self.dropped
     }
 }
 

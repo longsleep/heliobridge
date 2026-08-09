@@ -16,10 +16,15 @@
 //!
 //! - [`broker`] — the MQTT client itself: connect, retry, publish, subscribe. It knows nothing about
 //!   Home Assistant and would serve any broker; it lives here because nothing else needs it yet.
+//! - [`topics`] — what everything is called on the broker.
 //! - [`entity`] — which Home Assistant entity each register becomes, derived from the register maps.
-//! - [`publisher`] — what to say and when: topic names, availability, and the task that reacts to
-//!   devices arriving and leaving.
+//! - [`discovery`] — the retained messages announcing those entities.
+//! - [`state`] — the JSON objects their values arrive in.
+//! - [`publisher`] — what to say and when: one task holding the broker connection, and one per device.
 
 pub mod broker;
+pub mod discovery;
 pub mod entity;
 pub mod publisher;
+pub mod state;
+pub mod topics;

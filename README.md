@@ -10,7 +10,8 @@ vendor cloud, and keep the device working on your own network.
 
 ## Status
 
-The device talks to it. What is missing is the last hop to Home Assistant.
+The device talks to it, and Home Assistant shows it. What is missing is accepting commands back from
+Home Assistant — settings are written through the control API today.
 
 **Working, verified against real hardware:**
 
@@ -31,10 +32,15 @@ The device talks to it. What is missing is the last hop to Home Assistant.
 - **Optionally relays to the vendor cloud**, so the phone app keeps working — with a policy
   deciding how much authority the cloud keeps.
 - **Records raw frames** for later analysis, including the ones the relay policy refused.
+- **Publishes to Home Assistant** over your own broker, with MQTT autodiscovery. Sixty-odd entities
+  per device, derived from the register maps rather than from a second list, and two availability
+  topics — this program's own as a last will, the device's own as a telemetry watchdog — so a reading
+  goes `unavailable` instead of flat-lining when the device drops off. Nothing publishes a substitute
+  value, which is what keeps the Energy dashboard honest.
 
-**Not done yet:** publishing to your broker with Home Assistant autodiscovery. That is the headline
-feature and it is the next piece of work. Until then this is a decoder and a control API, not a
-Home Assistant integration.
+**Not done yet:** commands *from* Home Assistant. The entities are read-only there for now; the
+`switch`, `number`, `select` and `text` components are published, and the topic they write to is
+subscribed, but a command arriving is logged rather than applied.
 
 Also unimplemented: **retargeting the device's broker endpoint** by writing its config registers,
 which would remove the need for the DNS override below. The protocol for it is understood; it stays
@@ -62,11 +68,31 @@ environment variable; `--help` documents each one in full.
 | `HELIOBRIDGE_STATE_DIR` | `/var/lib/heliobridge` | Generated certificate and cached state |
 | `HELIOBRIDGE_CONTROL_SOCKET` | off | Unix socket for the control API, mode 0600 |
 | `HELIOBRIDGE_SLOTS` | `1` | How many of the nine schedule slots to expose |
+| `HELIOBRIDGE_MQTT_URL` | off | Broker to publish to: `mqtt://host[:port]` or `mqtts://host[:port]` |
+| `HELIOBRIDGE_MQTT_USER` / `_PASS` | *(unset)* | Broker credentials |
+| `HELIOBRIDGE_MQTT_PASS_FILE` | *(unset)* | File holding the password, read at startup. Takes precedence over `_PASS` |
+| `HELIOBRIDGE_MQTT_CLIENT_CERT` / `_KEY` | *(unset)* | Client certificate, for a broker that authenticates by one |
+| `HELIOBRIDGE_MQTT_BASE` | `heliobridge` | Root of this program's own topics |
+| `HELIOBRIDGE_MQTT_DISCOVERY_PREFIX` | `homeassistant` | Root Home Assistant watches for discovery |
+| `HELIOBRIDGE_MQTT_INSTANCE` | the host name | Distinguishes this bridge from another on the same broker |
+| `HELIOBRIDGE_ALLOW_WRITES` | `true` | `false` publishes every setting as a read-only sensor |
+| `HELIOBRIDGE_OFFLINE_AFTER` | `30` | Seconds without telemetry before the device is reported absent |
 | `HELIOBRIDGE_CLOUD_RELAY` | off | Relay to the vendor cloud |
 | `HELIOBRIDGE_RELAY_MODE` | `controls` | How much authority the cloud keeps |
 | `HELIOBRIDGE_RELAY_ANSWERS` | `cloud-only` | Which answers to earlier commands reach the cloud |
 | `HELIOBRIDGE_RECORD_DIR` | off | Record raw frames for analysis |
 | `HELIOBRIDGE_LOG` | `info` | Tracing filter, per subsystem |
+
+A relative `HELIOBRIDGE_MQTT_PASS_FILE` is resolved inside `$CREDENTIALS_DIRECTORY`, which systemd sets
+for a unit using `LoadCredential=`:
+
+```ini
+LoadCredential=mqtt-pass:/etc/heliobridge/mqtt.pass
+Environment=HELIOBRIDGE_MQTT_PASS_FILE=mqtt-pass
+```
+
+An absolute path is used as given. Trailing newlines are stripped. A file that cannot be read is a startup
+failure.
 
 ### Standard variables
 
@@ -110,6 +136,47 @@ the app writes whole register ranges back from that picture.
 
 Worth remembering in every mode: "the cloud" is anyone who can reach the vendor broker knowing this
 serial.
+
+## Home Assistant
+
+Set `HELIOBRIDGE_MQTT_URL` and the device appears through MQTT autodiscovery. Entities are derived from
+the register maps, so a register gaining a name gains an entity.
+
+```
+heliobridge/<serial>/state              telemetry, JSON, one publish per cycle
+heliobridge/<serial>/settings           holding-register values, retained
+heliobridge/<serial>/status             connected, and when the last frame arrived — retained
+heliobridge/<serial>/set                commands, JSON  {"slot1_output_power": 100}
+heliobridge/<serial>/availability       online | offline — the device
+heliobridge/bridge/<instance>/availability   online | offline — this program, as a last will
+homeassistant/<component>/heliobridge/<serial>_<field>/config   discovery, retained
+```
+
+Each entity reads one field out of the shared object with a `value_template`, so a telemetry cycle is one
+publish rather than sixty. Discovery is retained and republished on every broker connection, which makes a
+broker restart, a network blip and a first start the same case; an entity that leaves the catalogue is
+withdrawn with an empty payload rather than left behind.
+
+**Two availability topics, listed by every reading with `availability_mode: all`.** This program dying is a
+last will, which the broker publishes for us. A *device* going away is something only this program can see,
+so it says so itself — after `HELIOBRIDGE_OFFLINE_AFTER` seconds without a telemetry frame, since the
+device's own MQTT keepalive is 420 s and a half-open connection would otherwise leave stale readings on a
+dashboard for seven minutes.
+
+Nothing publishes a substitute value. No zero, no repeat of the last reading: on a `total_increasing` energy
+sensor a zero reads as a counter reset and the next real value is counted as a day's worth of new energy, and
+a repeated value is a flat line indistinguishable from a real one. The entity goes `unavailable` and Home
+Assistant records a gap. Two entities carry only *this program's* availability, so they keep working through
+an outage and say how stale everything else is: **Device connected** and **Last update**.
+
+For the Energy dashboard: `pv_energy_total` as solar production, `battery_charge_energy_today` and
+`battery_discharge_energy_today` as the battery pair. The grid slots need a house meter — this device has no
+meter between the house and the grid, so it cannot separate self-consumption from what crossed the boundary.
+
+Several devices may share one broker: every device-facing topic and every `unique_id` carries the serial.
+`HELIOBRIDGE_MQTT_INSTANCE` distinguishes two *bridges* on one broker, and appears in one topic only — this
+program's own availability, where a shared name would make one bridge's shutdown mark another's entities
+unavailable.
 
 ## Control API
 

@@ -3,6 +3,7 @@
 //! `clap` derive gives the environment variables, `--help`, validation and defaults from one
 //! definition. Every variable is prefixed `HELIOBRIDGE_`.
 
+use core::time::Duration;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -10,6 +11,8 @@ use clap::Parser;
 
 use crate::growatt::cloud::{self, CloudConfig};
 use crate::growatt::policy::{Answers, Mode, Policy};
+use crate::homeassistant::publisher::{self, PublisherOptions};
+use crate::homeassistant::topics::{self, Topics};
 use crate::record::{self, RecorderConfig};
 
 /// Default device-facing listener address.
@@ -105,6 +108,38 @@ pub struct Config {
     /// PEM private key matching `--mqtt-client-cert`.
     #[arg(long, env = "HELIOBRIDGE_MQTT_CLIENT_KEY")]
     pub mqtt_client_key: Option<PathBuf>,
+
+    /// Root of this program's own topics on the broker.
+    #[arg(long, env = "HELIOBRIDGE_MQTT_BASE", default_value = "heliobridge")]
+    pub mqtt_base: String,
+
+    /// Root Home Assistant watches for discovery messages.
+    ///
+    /// Change it only to match a Home Assistant that was configured with a non-default prefix.
+    #[arg(long, env = "HELIOBRIDGE_MQTT_DISCOVERY_PREFIX", default_value = "homeassistant")]
+    pub mqtt_discovery_prefix: String,
+
+    /// What distinguishes this bridge from another on the same broker. Defaults to the host name.
+    ///
+    /// It appears in one topic only — this program's own availability — since everything else is keyed by
+    /// device serial. Two bridges sharing it would mark each other's entities unavailable on shutdown.
+    #[arg(long, env = "HELIOBRIDGE_MQTT_INSTANCE")]
+    pub mqtt_instance: Option<String>,
+
+    /// Offer settings as Home Assistant controls rather than as read-only sensors.
+    ///
+    /// `false` publishes every setting as a plain sensor and accepts no commands, which is what to run
+    /// alongside another controller so two writers are not fighting over the same registers.
+    #[arg(long, env = "HELIOBRIDGE_ALLOW_WRITES", default_value_t = true, action = clap::ArgAction::Set)]
+    pub allow_writes: bool,
+
+    /// Seconds without a telemetry frame before the device is reported absent.
+    ///
+    /// Telemetry arrives every five seconds, so the default is six missed cycles. It exists because a
+    /// half-open connection looks alive: the device's own MQTT keepalive is 420 s, and waiting for that
+    /// would leave stale readings on a dashboard for seven minutes.
+    #[arg(long, env = "HELIOBRIDGE_OFFLINE_AFTER", default_value_t = publisher::OFFLINE_AFTER.as_secs())]
+    pub offline_after: u64,
 
     /// Relay device traffic to the Growatt cloud, so the vendor app keeps working.
     ///
@@ -246,6 +281,24 @@ impl Config {
             (None, None) => Ok(None),
             (Some(_), None) => Err("--mqtt-client-cert needs --mqtt-client-key".to_owned()),
             (None, Some(_)) => Err("--mqtt-client-key needs --mqtt-client-cert".to_owned()),
+        }
+    }
+
+    /// What everything is called on the broker.
+    pub fn topics(&self) -> Topics {
+        Topics {
+            base: self.mqtt_base.clone(),
+            discovery_prefix: self.mqtt_discovery_prefix.clone(),
+            instance: self.mqtt_instance.clone().unwrap_or_else(topics::default_instance),
+        }
+    }
+
+    /// What gets published, as against where.
+    pub const fn publishing(&self) -> PublisherOptions {
+        PublisherOptions {
+            slots: self.slots,
+            writable: self.allow_writes,
+            offline_after: Duration::from_secs(self.offline_after),
         }
     }
 

@@ -11,7 +11,7 @@ use heliobridge::config::{Config, LogFormat};
 use heliobridge::control::{self, Registry};
 use heliobridge::growatt::cloud::CloudRelay;
 use heliobridge::homeassistant::broker::{BrokerConfig, BrokerUrl};
-use heliobridge::homeassistant::publisher::{Publisher, Topics};
+use heliobridge::homeassistant::publisher::Publisher;
 use heliobridge::mqtt::{ClientTls, Trust};
 use heliobridge::record::Recorder;
 use heliobridge::server;
@@ -189,10 +189,25 @@ impl<'a> Bridge<'a> {
             "publishing to Home Assistant"
         );
 
+        let topics = self.config.topics();
+        let options = self.config.publishing();
+        tracing::info!(
+            base = %topics.base,
+            discovery_prefix = %topics.discovery_prefix,
+            instance = %topics.instance,
+            slots = options.slots,
+            writable = options.writable,
+            offline_after_s = options.offline_after.as_secs(),
+            "Home Assistant topics"
+        );
+        if !options.writable {
+            tracing::info!("writes are refused: every setting is published as a read-only sensor");
+        }
+
         let registry = self.registry.take().unwrap_or_default();
         let publisher = self
             .runtime
-            .block_on(async { Publisher::start(broker, Topics::default(), registry.clone()) })
+            .block_on(async { Publisher::start(broker, topics, registry.clone(), options) })
             .map_err(|error| format!("broker: {}", chain(&error)))?;
         self.runtime.spawn(publisher.run());
 
