@@ -134,11 +134,15 @@ pub struct Config {
     #[arg(long, env = "HELIOBRIDGE_ALLOW_WRITES", default_value_t = true, action = clap::ArgAction::Set)]
     pub allow_writes: bool,
 
-    /// Allow `power_plus` to be written.
+    /// Allow `power_plus` to be written from Home Assistant.
     ///
-    /// `false` publishes it as a read-only sensor and refuses any command naming it, in either direction, so
-    /// it cannot be changed from here. It stays visible: whether it is on is worth seeing even where this
-    /// bridge may not set it, since the vendor app still can.
+    /// `false` publishes it as a read-only sensor and refuses any command naming it, in either direction. It
+    /// stays visible: whether it is on is worth seeing even where this bridge may not set it, since the
+    /// vendor app still can.
+    ///
+    /// Like `--allow-writes`, this governs the Home Assistant surface. The control socket is the owner's own
+    /// interface — mode 0600, and the one place that already serves the serial and the password — and it
+    /// writes every allowlisted setting whatever this says.
     #[arg(long, env = "HELIOBRIDGE_ALLOW_POWER_PLUS", default_value_t = true, action = clap::ArgAction::Set)]
     pub allow_power_plus: bool,
 
