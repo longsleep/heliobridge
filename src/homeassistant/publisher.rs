@@ -17,6 +17,7 @@ use tokio::sync::watch;
 
 use crate::control::{Connected, Registry};
 use crate::homeassistant::broker::{Broker, BrokerConfig, Event, Publication};
+use crate::homeassistant::entity::Component;
 use crate::mqtt::{QoS, Will};
 
 /// Payload for an availability topic when the thing is present.
@@ -26,12 +27,28 @@ pub const ONLINE: &[u8] = b"online";
 pub const OFFLINE: &[u8] = b"offline";
 
 /// How the topics are named.
+///
+/// # One broker may carry several bridges
+///
+/// Nothing here assumes it is the only instance. Every device-facing topic and every entity identifier
+/// carries the device serial, which is unique to the hardware, so two bridges serving different devices
+/// never write to the same place — and two bridges serving the *same* device is a misconfiguration no
+/// naming scheme can rescue.
+///
+/// The one topic that is not about a device is this program's own availability, so that one carries
+/// [`Self::instance`] instead. A shared name there would be worse than useless: one bridge stopping would
+/// mark another's entities unavailable.
 #[derive(Debug, Clone)]
 pub struct Topics {
     /// Root for this program's own topics.
     pub base: String,
     /// Root Home Assistant watches for discovery.
     pub discovery_prefix: String,
+    /// What distinguishes this bridge from another on the same broker.
+    ///
+    /// Defaults to the host name, which is stable across restarts — an identifier that changed each time
+    /// would leave a retained availability topic behind on every restart.
+    pub instance: String,
 }
 
 impl Default for Topics {
@@ -39,17 +56,52 @@ impl Default for Topics {
         Self {
             base: "heliobridge".to_owned(),
             discovery_prefix: "homeassistant".to_owned(),
+            instance: default_instance(),
         }
+    }
+}
+
+/// This host's name, or a fixed fallback where it cannot be read or is not usable in a topic.
+fn default_instance() -> String {
+    let host = gethostname::gethostname().to_string_lossy().into_owned();
+    let cleaned: String = host
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    if cleaned.is_empty() {
+        "bridge".to_owned()
+    } else {
+        cleaned
     }
 }
 
 impl Topics {
     /// Where this program reports whether *it* is running.
     ///
-    /// Separate from any device, and the one topic that is a last will: the broker publishes it when this
+    /// Scoped to this instance, and the one topic that is a last will: the broker publishes it when this
     /// connection dies without a goodbye.
     pub fn bridge_availability(&self) -> String {
-        format!("{}/bridge/availability", self.base)
+        format!("{}/bridge/{}/availability", self.base, self.instance)
+    }
+
+    /// Where an entity's discovery message goes.
+    ///
+    /// `<prefix>/<component>/<node>/<object>/config`, with the base topic as the node so an object
+    /// identifier cannot collide with another integration's, and the serial in the object so two devices
+    /// cannot collide with each other.
+    pub fn discovery(&self, component: Component, device: &str, key: &str) -> String {
+        format!(
+            "{}/{component}/{}/{device}_{key}/config",
+            self.discovery_prefix, self.base
+        )
+    }
+
+    /// The identifier Home Assistant remembers an entity by.
+    ///
+    /// It must be unique across everything the broker carries and stable across restarts, so it is built
+    /// from the same parts as the discovery topic.
+    pub fn unique_id(&self, device: &str, key: &str) -> String {
+        format!("{}_{device}_{key}", self.base)
     }
 
     /// Where a device's presence is reported.
@@ -202,7 +254,9 @@ impl Publisher {
     /// Carry out a command that arrived on a device's command topic.
     fn handle_command(&self, device: &str, payload: &[u8]) {
         if self.registry.handle(device).is_none() {
-            tracing::warn!(%device, "a command arrived for a device that is not connected");
+            // Expected on a broker carrying more than one bridge: the command topic is a wildcard, so
+            // every bridge sees every device's commands and answers only for its own.
+            tracing::debug!(%device, "ignoring a command for a device this bridge does not serve");
             return;
         }
         // Applying it belongs to the next step; recorded here so the subscription is visibly wired.
@@ -226,11 +280,93 @@ pub const SETTLE: Duration = Duration::from_millis(250);
 #[cfg(test)]
 mod tests {
     use super::Topics;
+    use crate::homeassistant::entity::Component;
+
+    /// Two bridges on one broker, distinguished only by their instance name.
+    fn two_instances() -> (Topics, Topics) {
+        let first = Topics {
+            instance: "attic".to_owned(),
+            ..Topics::default()
+        };
+        let second = Topics {
+            instance: "shed".to_owned(),
+            ..Topics::default()
+        };
+        (first, second)
+    }
+
+    #[test]
+    fn two_bridges_share_every_device_topic_but_not_their_own() {
+        // A device topic is keyed by serial, so whichever bridge serves that device writes to the same
+        // place — there is only ever one. Availability of the bridge itself is per instance: shared, one
+        // bridge stopping would mark another's entities unavailable.
+        let (attic, shed) = two_instances();
+
+        assert_eq!(attic.state("0EXAMPLE00000001"), shed.state("0EXAMPLE00000001"));
+        assert_eq!(
+            attic.device_availability("0EXAMPLE00000001"),
+            shed.device_availability("0EXAMPLE00000001")
+        );
+        assert_ne!(attic.bridge_availability(), shed.bridge_availability());
+        assert_eq!(attic.bridge_availability(), "heliobridge/bridge/attic/availability");
+    }
+
+    #[test]
+    fn each_bridge_wills_only_its_own_availability() {
+        let (attic, shed) = two_instances();
+        assert_eq!(attic.will().topic, attic.bridge_availability());
+        assert_ne!(attic.will().topic, shed.will().topic);
+    }
+
+    #[test]
+    fn entity_identity_is_the_devices_not_the_bridges() {
+        // Two bridges must describe the same device identically: a unique_id that varied by instance
+        // would make Home Assistant create a second set of entities after the device moved bridges.
+        let (attic, shed) = two_instances();
+        for topics in [&attic, &shed] {
+            assert_eq!(
+                topics.discovery(Component::Sensor, "0EXAMPLE00000001", "ac_power"),
+                "homeassistant/sensor/heliobridge/0EXAMPLE00000001_ac_power/config"
+            );
+            assert_eq!(
+                topics.unique_id("0EXAMPLE00000001", "ac_power"),
+                "heliobridge_0EXAMPLE00000001_ac_power"
+            );
+        }
+    }
+
+    #[test]
+    fn two_devices_never_share_an_identifier() {
+        let topics = Topics::default();
+        assert_ne!(
+            topics.unique_id("0EXAMPLE00000001", "ac_power"),
+            topics.unique_id("0EXAMPLE00000002", "ac_power")
+        );
+        assert_ne!(
+            topics.discovery(Component::Sensor, "0EXAMPLE00000001", "ac_power"),
+            topics.discovery(Component::Sensor, "0EXAMPLE00000002", "ac_power")
+        );
+    }
+
+    #[test]
+    fn the_default_instance_is_usable_in_a_topic() {
+        // Whatever the host is called, the result has to be a legal topic segment: no slashes, no wildcard
+        // characters, and never empty.
+        let instance = super::default_instance();
+        assert!(!instance.is_empty());
+        assert!(
+            !instance.contains(['/', '+', '#']),
+            "unusable instance name: {instance}"
+        );
+    }
 
     #[test]
     fn topics_are_built_from_one_base() {
         let topics = Topics::default();
-        assert_eq!(topics.bridge_availability(), "heliobridge/bridge/availability");
+        assert_eq!(
+            topics.bridge_availability(),
+            format!("heliobridge/bridge/{}/availability", topics.instance)
+        );
         assert_eq!(
             topics.device_availability("0EXAMPLE00000001"),
             "heliobridge/0EXAMPLE00000001/availability"
@@ -270,8 +406,9 @@ mod tests {
 
     #[test]
     fn the_will_is_retained_so_a_late_subscriber_learns_the_bridge_is_gone() {
-        let will = Topics::default().will();
-        assert_eq!(will.topic, "heliobridge/bridge/availability");
+        let topics = Topics::default();
+        let will = topics.will();
+        assert_eq!(will.topic, topics.bridge_availability());
         assert_eq!(will.payload, b"offline");
         assert!(will.retain);
     }
@@ -281,8 +418,9 @@ mod tests {
         let topics = Topics {
             base: "solar".to_owned(),
             discovery_prefix: "ha".to_owned(),
+            instance: "roof".to_owned(),
         };
-        assert_eq!(topics.bridge_availability(), "solar/bridge/availability");
+        assert_eq!(topics.bridge_availability(), "solar/bridge/roof/availability");
         assert_eq!(topics.command_filter(), "solar/+/set");
         assert_eq!(topics.device_of_command("solar/X/set").as_deref(), Some("X"));
         assert_eq!(topics.device_of_command("heliobridge/X/set"), None);
