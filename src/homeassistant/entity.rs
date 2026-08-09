@@ -14,6 +14,7 @@ use core::fmt;
 use std::collections::HashSet;
 
 use crate::growatt::v7::registers::{Domain, HoldingRegister, INPUT_REGISTERS, InputRegister, Kind, SLOT_COUNT};
+use crate::homeassistant::command::Permitted;
 use crate::model::{Scaling, Unit};
 
 /// The Home Assistant component an entity is published as.
@@ -383,8 +384,12 @@ pub const BATTERY_PACKS: u16 = 4;
 pub struct Catalogue {
     /// How many schedule slots get entities, 1–9. Each adds five.
     pub slots: u16,
-    /// Whether settings are offered as controls or only as readings.
-    pub writable: bool,
+    /// Which settings may be written, and so which are offered as controls.
+    ///
+    /// The same value the command topic is checked against, so a control is published exactly when a
+    /// command for it would be honoured. A setting that may not be written still appears — as a plain
+    /// reading, since whether it is on remains worth seeing even where this bridge may not change it.
+    pub permitted: Permitted,
     /// How many battery packs get entities.
     ///
     /// What the device reports, and **one** until it has: it is a battery, so it has at least that. There
@@ -397,7 +402,7 @@ impl Default for Catalogue {
     fn default() -> Self {
         Self {
             slots: 1,
-            writable: true,
+            permitted: Permitted::default(),
             packs: 1,
         }
     }
@@ -423,7 +428,11 @@ impl Catalogue {
                 if reported.contains(register.name) {
                     entity.source = Source::Telemetry;
                 }
-                if self.writable { entity } else { entity.into_read_only() }
+                if self.permitted.allows(register.name) {
+                    entity
+                } else {
+                    entity.into_read_only()
+                }
             })
             .collect();
 
@@ -450,13 +459,18 @@ impl Catalogue {
     pub fn everything() -> Vec<Entity> {
         let widest = Self {
             slots: SLOT_COUNT,
-            writable: true,
+            permitted: Permitted::default(),
             packs: BATTERY_PACKS,
         };
+        // Two passes cover every component a setting can be published as: with writes refused, each control
+        // becomes a sensor, and that includes the one setting whose reachability is configurable on its own.
         let mut all = widest.entities();
         all.extend(
             Self {
-                writable: false,
+                permitted: Permitted {
+                    writes: false,
+                    ..widest.permitted
+                },
                 ..widest
             }
             .entities(),

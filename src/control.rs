@@ -339,6 +339,26 @@ pub struct StatusView {
     pub reads: u64,
 }
 
+/// Why an action could not be carried out.
+///
+/// About reaching the session, not about what the device did with it — a device that refused or clamped a
+/// write answers with an [`Outcome`] saying so, which is a success here.
+#[derive(Debug, Snafu, PartialEq, Eq)]
+#[snafu(visibility(pub))]
+pub enum RequestError {
+    /// The session already has as many commands queued as it will take.
+    #[snafu(display("the session's command queue is full"))]
+    Busy,
+
+    /// The session ended before answering.
+    #[snafu(display("the device session ended before answering"))]
+    Ended,
+
+    /// The device never answered.
+    #[snafu(display("no answer within {}s", REQUEST_TIMEOUT.as_secs()))]
+    TimedOut,
+}
+
 /// How the API reaches one device's session.
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
@@ -352,6 +372,31 @@ pub struct SessionHandle {
     pub telemetry: watch::Receiver<Option<TelemetryView>>,
     /// What the session is doing: relay, clock, counts.
     pub status: watch::Receiver<StatusView>,
+}
+
+impl SessionHandle {
+    /// Hand an action to the session and wait for what the device did.
+    ///
+    /// The one path from any interface to the device, so a write from Home Assistant gets the same read-back
+    /// confirmation as one from `curl` and neither can grow its own idea of what happened.
+    ///
+    /// # Errors
+    ///
+    /// [`RequestError`] if the session could not be reached or did not answer. A device that *refused* or
+    /// clamped the write answers with an [`Outcome`] instead, since that is something it did rather than
+    /// something that went wrong.
+    pub async fn carry_out(&self, action: Action) -> Result<Outcome, RequestError> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .try_send(Request { action, reply })
+            .map_err(|_ignored| RequestError::Busy)?;
+
+        match tokio::time::timeout(REQUEST_TIMEOUT, answer).await {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(_)) => Err(RequestError::Ended),
+            Err(_) => Err(RequestError::TimedOut),
+        }
+    }
 }
 
 /// Which devices are connected, as published on every change.
@@ -1017,15 +1062,10 @@ impl Api {
     }
 }
 
-/// Hand an action to a session and wait for its outcome.
+/// Hand an action to a session and render its outcome as HTTP.
 async fn dispatch(handle: &SessionHandle, action: Action) -> Response {
-    let (reply, answer) = oneshot::channel();
-    if handle.requests.try_send(Request { action, reply }).is_err() {
-        return problem(StatusCode::SERVICE_UNAVAILABLE, "the session's command queue is full");
-    }
-
-    match tokio::time::timeout(REQUEST_TIMEOUT, answer).await {
-        Ok(Ok(outcome)) => {
+    match handle.carry_out(action).await {
+        Ok(outcome) => {
             let code = if outcome.confirmed {
                 StatusCode::OK
             } else {
@@ -1035,14 +1075,10 @@ async fn dispatch(handle: &SessionHandle, action: Action) -> Response {
             };
             (code, axum::Json(outcome)).into_response()
         }
-        Ok(Err(_)) => problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the device session ended before answering",
-        ),
-        Err(_) => problem(
-            StatusCode::GATEWAY_TIMEOUT,
-            &format!("no answer within {}s", REQUEST_TIMEOUT.as_secs()),
-        ),
+        // A timeout is the gateway's, not this server's: the request was accepted and the device upstream
+        // did not answer.
+        Err(error @ RequestError::TimedOut) => problem(StatusCode::GATEWAY_TIMEOUT, &error.to_string()),
+        Err(error) => problem(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
     }
 }
 

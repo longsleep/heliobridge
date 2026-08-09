@@ -11,6 +11,7 @@ use heliobridge::config::{Config, LogFormat};
 use heliobridge::control::{self, Registry};
 use heliobridge::growatt::cloud::CloudRelay;
 use heliobridge::homeassistant::broker::{BrokerConfig, BrokerUrl};
+use heliobridge::homeassistant::command;
 use heliobridge::homeassistant::publisher::Publisher;
 use heliobridge::mqtt::{ClientTls, Trust};
 use heliobridge::record::Recorder;
@@ -196,12 +197,19 @@ impl<'a> Bridge<'a> {
             discovery_prefix = %topics.discovery_prefix,
             instance = %topics.instance,
             slots = options.slots,
-            writable = options.writable,
+            writable = options.permitted.writes,
             offline_after_s = options.offline_after.as_secs(),
             "Home Assistant topics"
         );
-        if !options.writable {
+        // Each is worth its own line: a setting that silently will not move is the kind of thing someone
+        // spends an afternoon on before checking the configuration.
+        if !options.permitted.writes {
             tracing::info!("writes are refused: every setting is published as a read-only sensor");
+        } else if !options.permitted.power_plus {
+            tracing::info!(
+                setting = command::POWER_PLUS,
+                "this setting is published as a read-only sensor and commands naming it are refused"
+            );
         }
 
         let registry = self.registry.take().unwrap_or_default();

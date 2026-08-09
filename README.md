@@ -10,8 +10,7 @@ vendor cloud, and keep the device working on your own network.
 
 ## Status
 
-The device talks to it, and Home Assistant shows it. What is missing is accepting commands back from
-Home Assistant — settings are written through the control API today.
+The device talks to it, and Home Assistant both shows it and drives it.
 
 **Working, verified against real hardware:**
 
@@ -38,9 +37,9 @@ Home Assistant — settings are written through the control API today.
   goes `unavailable` instead of flat-lining when the device drops off. Nothing publishes a substitute
   value, which is what keeps the Energy dashboard honest.
 
-**Not done yet:** commands *from* Home Assistant. The entities are read-only there for now; the
-`switch`, `number`, `select` and `text` components are published, and the topic they write to is
-subscribed, but a command arriving is logged rather than applied.
+- **Accepts commands from Home Assistant**, through the same allowlist and the same read-back as the
+  control API, so what appears in Home Assistant afterwards is what the device stored rather than what
+  it was asked for.
 
 Also unimplemented: **retargeting the device's broker endpoint** by writing its config registers,
 which would remove the need for the DNS override below. The protocol for it is understood; it stays
@@ -75,7 +74,8 @@ environment variable; `--help` documents each one in full.
 | `HELIOBRIDGE_MQTT_BASE` | `heliobridge` | Root of this program's own topics |
 | `HELIOBRIDGE_MQTT_DISCOVERY_PREFIX` | `homeassistant` | Root Home Assistant watches for discovery |
 | `HELIOBRIDGE_MQTT_INSTANCE` | the host name | Distinguishes this bridge from another on the same broker |
-| `HELIOBRIDGE_ALLOW_WRITES` | `true` | `false` publishes every setting as a read-only sensor |
+| `HELIOBRIDGE_ALLOW_WRITES` | `true` | `false` publishes every setting as a read-only sensor and refuses every command |
+| `HELIOBRIDGE_ALLOW_POWER_PLUS` | `true` | `false` does the same for `power_plus` alone |
 | `HELIOBRIDGE_OFFLINE_AFTER` | `30` | Seconds without telemetry before the device is reported absent |
 | `HELIOBRIDGE_CLOUD_RELAY` | off | Relay to the vendor cloud |
 | `HELIOBRIDGE_RELAY_MODE` | `controls` | How much authority the cloud keeps |
@@ -168,6 +168,27 @@ sensor a zero reads as a counter reset and the next real value is counted as a d
 a repeated value is a flat line indistinguishable from a real one. The entity goes `unavailable` and Home
 Assistant records a gap. Two entities carry only *this program's* availability, so they keep working through
 an outage and say how stale everything else is: **Device connected** and **Last update**.
+
+**Commands** arrive as a JSON object on `heliobridge/<serial>/set`, naming a setting and a value — which is
+what the discovery messages tell Home Assistant to send, and what `mosquitto_pub` can send by hand:
+
+```json
+{"slot1_output_power": 100}
+{"grid_power_allowed": 1}
+{"slot1_work_mode": "smart_self_use"}
+{"slot1_start_time": "23:59"}
+```
+
+A command goes through the same allowlist and the same read-back as the control API. The value republished
+afterwards is what the device *stored*, which is not always what was asked: it clamps silently rather than
+rejecting, so asking for more than a setting's ceiling shows up as the lower figure. A value outside a
+register's documented range is refused before anything is sent, and a payload naming something unknown is
+logged with the reason rather than being coerced into a register. One bad field refuses the whole payload.
+
+`HELIOBRIDGE_ALLOW_WRITES=false` publishes every setting as a read-only sensor and refuses every command;
+`HELIOBRIDGE_ALLOW_POWER_PLUS=false` does the same for that one setting, which stays visible as a sensor.
+Both close the entity and the command topic together, so a retained or hand-published command cannot reach
+a control that was not offered.
 
 For the Energy dashboard: `pv_energy_total` as solar production, `battery_charge_energy_today` and
 `battery_discharge_energy_today` as the battery pair. The grid slots need a house meter — this device has no

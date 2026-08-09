@@ -296,7 +296,8 @@ pub const fn is_control(component: Component) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{DeviceBlock, Discovery, TIME_PATTERN, is_control};
-    use crate::homeassistant::entity::{Catalogue, Entity, Presence};
+    use crate::homeassistant::command::Permitted;
+    use crate::homeassistant::entity::{Catalogue, Component, Entity, Presence};
     use crate::homeassistant::topics::Topics;
     use serde_json::Value;
 
@@ -560,7 +561,10 @@ mod tests {
     fn refusing_writes_leaves_readings_rather_than_controls() {
         // What HELIOBRIDGE_ALLOW_WRITES=false produces: still worth seeing, nothing to touch.
         for entity in (Catalogue {
-            writable: false,
+            permitted: Permitted {
+                writes: false,
+                ..Permitted::default()
+            },
             ..Catalogue::default()
         })
         .entities()
@@ -573,5 +577,39 @@ mod tests {
             );
             assert!(!is_control(entity.component), "{} is still a control", entity.key);
         }
+    }
+
+    #[test]
+    fn one_setting_can_be_left_as_a_reading_while_the_rest_stay_writable() {
+        // The control is not offered, and the command topic it would have written to is not named — so
+        // Home Assistant has nothing to send even before the command handler refuses it.
+        let catalogue = Catalogue {
+            permitted: Permitted {
+                power_plus: false,
+                ..Permitted::default()
+            },
+            ..Catalogue::default()
+        };
+        let entities = catalogue.entities();
+
+        let power_plus = entities
+            .iter()
+            .find(|entity| entity.key == "power_plus")
+            .expect("still published");
+        assert_eq!(power_plus.component, Component::Sensor);
+        assert!(payload(power_plus).get("command_topic").is_none());
+        // Visible, so whether it is on can still be read.
+        assert_eq!(
+            payload(power_plus)["state_topic"],
+            "heliobridge/0EXAMPLE00000001/settings"
+        );
+
+        // Every other switch is untouched.
+        let always_on = entities
+            .iter()
+            .find(|entity| entity.key == "always_on")
+            .expect("published");
+        assert_eq!(always_on.component, Component::Switch);
+        assert!(payload(always_on).get("command_topic").is_some());
     }
 }

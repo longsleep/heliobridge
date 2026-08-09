@@ -23,6 +23,7 @@
 //! - [`publisher`] — what to say and when: one task holding the broker connection, and one per device.
 
 pub mod broker;
+pub mod command;
 pub mod discovery;
 pub mod entity;
 pub mod publisher;

@@ -24,8 +24,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
-use crate::control::{Connected, Registry, SessionHandle, TelemetryView};
+use crate::control::{Action as ControlAction, Connected, Registry, SessionHandle, TelemetryView};
 use crate::homeassistant::broker::{Broker, BrokerConfig, BrokerError, Event, Publication, Publications};
+use crate::homeassistant::command::{Change, Permitted};
 use crate::homeassistant::discovery::{DeviceBlock, Discovery};
 use crate::homeassistant::entity::{Catalogue, Component, Entity};
 use crate::homeassistant::state::{Fields, StatePayload};
@@ -48,8 +49,12 @@ const FAREWELL_DEPTH: usize = 16;
 pub struct PublisherOptions {
     /// How many schedule slots get entities, 1–9.
     pub slots: u16,
-    /// Whether settings are offered as controls rather than as readings.
-    pub writable: bool,
+    /// What a command topic may change.
+    ///
+    /// The same answer decides both halves: a setting that may not be written is not published as a
+    /// control, and a command naming it is refused. Publishing a control that would be refused, or
+    /// accepting a command for a control that was never offered, are the two ways for those to disagree.
+    pub permitted: Permitted,
     /// How long without a telemetry frame before the device is reported absent.
     pub offline_after: Duration,
 }
@@ -58,7 +63,7 @@ impl Default for PublisherOptions {
     fn default() -> Self {
         Self {
             slots: 1,
-            writable: true,
+            permitted: Permitted::default(),
             offline_after: OFFLINE_AFTER,
         }
     }
@@ -241,15 +246,36 @@ impl Publisher {
     }
 
     /// Carry out a command that arrived on a device's command topic.
+    ///
+    /// Parsed here so a refusal is logged next to the message that caused it, and applied in a task of its
+    /// own because a write waits for the device to be read back — up to twenty seconds, which is far too
+    /// long to hold a loop that is also publishing telemetry.
+    ///
+    /// Nothing is published in reply. The read-back updates the session's settings cache, the link watching
+    /// it publishes the confirmed value, and Home Assistant learns what the device actually stored rather
+    /// than what it was asked for.
     fn handle_command(&self, device: &str, payload: &[u8]) {
-        if self.registry.handle(device).is_none() {
+        let Some(session) = self.registry.handle(device) else {
             // Expected on a broker carrying more than one bridge: the command topic is a wildcard, so
             // every bridge sees every device's commands and answers only for its own.
             tracing::debug!(%device, "ignoring a command for a device this bridge does not serve");
             return;
-        }
-        // Applying it belongs to the next step; recorded here so the subscription is visibly wired.
-        tracing::info!(%device, bytes = payload.len(), "a command arrived for a device");
+        };
+
+        let changes = match Change::from_payload(payload, self.options.permitted) {
+            Ok(changes) => changes,
+            Err(error) => {
+                tracing::warn!(%device, %error, "refusing a command");
+                return;
+            }
+        };
+
+        let device = device.to_owned();
+        tokio::spawn(async move {
+            for change in changes {
+                apply(&session, &device, change).await;
+            }
+        });
     }
 
     /// Queue a publication.
@@ -452,7 +478,7 @@ impl Link {
         let device = DeviceBlock::new(&self.device, self.session.identity.borrow().as_ref());
         let catalogue = Catalogue {
             slots: self.options.slots,
-            writable: self.options.writable,
+            permitted: self.options.permitted,
             packs: self.packs(),
         };
         if self
@@ -581,6 +607,60 @@ impl Link {
             return;
         }
         self.publications.try_publish(publication);
+    }
+}
+
+/// Apply one change and log what the device made of it.
+///
+/// The outcome is not published from here. A write is followed by a read-back, which updates the session's
+/// settings cache, which the device's link is watching — so the value Home Assistant sees is the one the
+/// device actually holds, by the same path as any other settings change.
+async fn apply(session: &SessionHandle, device: &str, change: Change) {
+    let also_read = change.also_read();
+    tracing::info!(%device, setting = %change.key, "applying a command from Home Assistant");
+
+    match session.carry_out(ControlAction::Apply(change.command)).await {
+        Ok(outcome) if outcome.confirmed => {
+            tracing::info!(%device, setting = %change.key, value = ?outcome.value, "the device stored it");
+        }
+        // Not an error: the device silently clamps rather than rejecting, and reporting what it *did* store
+        // is the whole reason a write is read back. Home Assistant will show the stored value.
+        Ok(outcome) => {
+            tracing::warn!(
+                %device,
+                setting = %change.key,
+                requested = ?outcome.requested,
+                stored = ?outcome.stored,
+                "the device did not store what was asked"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%device, setting = %change.key, %error, "the command could not be carried out");
+            return;
+        }
+    }
+
+    // A gating flag moves another register with it, with no write to that register at all. Read it rather
+    // than model the dependency, so the published value is the device's own.
+    if let Some(register) = also_read {
+        match session.carry_out(ControlAction::Refresh(register)).await {
+            Ok(outcome) => {
+                tracing::info!(
+                    %device,
+                    register = register.number(),
+                    value = ?outcome.value,
+                    "re-read the register the flag gates"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %device,
+                    register = register.number(),
+                    %error,
+                    "could not re-read the register the flag gates; its published value may be stale"
+                );
+            }
+        }
     }
 }
 
@@ -1029,7 +1109,7 @@ mod tests {
         assert_eq!(OFFLINE_AFTER.as_secs(), 30);
         assert_eq!(PublisherOptions::default().offline_after, OFFLINE_AFTER);
         assert_eq!(PublisherOptions::default().slots, 1);
-        assert!(PublisherOptions::default().writable);
+        assert!(PublisherOptions::default().permitted.writes);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use clap::Parser;
 
 use crate::growatt::cloud::{self, CloudConfig};
 use crate::growatt::policy::{Answers, Mode, Policy};
+use crate::homeassistant::command::Permitted;
 use crate::homeassistant::publisher::{self, PublisherOptions};
 use crate::homeassistant::topics::{self, Topics};
 use crate::record::{self, RecorderConfig};
@@ -132,6 +133,14 @@ pub struct Config {
     /// alongside another controller so two writers are not fighting over the same registers.
     #[arg(long, env = "HELIOBRIDGE_ALLOW_WRITES", default_value_t = true, action = clap::ArgAction::Set)]
     pub allow_writes: bool,
+
+    /// Allow `power_plus` to be written.
+    ///
+    /// `false` publishes it as a read-only sensor and refuses any command naming it, in either direction, so
+    /// it cannot be changed from here. It stays visible: whether it is on is worth seeing even where this
+    /// bridge may not set it, since the vendor app still can.
+    #[arg(long, env = "HELIOBRIDGE_ALLOW_POWER_PLUS", default_value_t = true, action = clap::ArgAction::Set)]
+    pub allow_power_plus: bool,
 
     /// Seconds without a telemetry frame before the device is reported absent.
     ///
@@ -297,7 +306,10 @@ impl Config {
     pub const fn publishing(&self) -> PublisherOptions {
         PublisherOptions {
             slots: self.slots,
-            writable: self.allow_writes,
+            permitted: Permitted {
+                writes: self.allow_writes,
+                power_plus: self.allow_power_plus,
+            },
             offline_after: Duration::from_secs(self.offline_after),
         }
     }
@@ -360,7 +372,8 @@ mod tests {
         // The defaults for the rest still have to be sane, since they are read as soon as one is named.
         let publishing = config.publishing();
         assert_eq!(publishing.slots, 1);
-        assert!(publishing.writable);
+        assert!(publishing.permitted.writes);
+        assert!(publishing.permitted.power_plus);
         assert_eq!(publishing.offline_after, super::publisher::OFFLINE_AFTER);
         assert_eq!(config.topics().base, "heliobridge");
         assert_eq!(config.topics().discovery_prefix, "homeassistant");
