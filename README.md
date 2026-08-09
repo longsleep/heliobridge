@@ -60,11 +60,18 @@ keeps working while everything is decoded locally.
 One binary, no configuration file. Every option is a flag with a matching `HELIOBRIDGE_*`
 environment variable; `--help` documents each one in full.
 
+**Clearing a variable is the same as leaving it out.** `HELIOBRIDGE_MQTT_URL=` turns publishing off,
+`HELIOBRIDGE_RECORD_DIR=` turns recording off, and a setting with a default falls back to it. The two
+allowlists are the exception: empty is already their value, meaning admit everything.
+
+The state directory holds the generated certificate, which the device does not verify and which is
+regenerated when missing. Point `HELIOBRIDGE_STATE_DIR` somewhere durable to keep one across reboots.
+
 | Variable | Default | What it does |
 |---|---|---|
 | `HELIOBRIDGE_LISTEN` | `0.0.0.0:7006` | Device-facing TLS listener |
 | `HELIOBRIDGE_TLS_CERT` / `_KEY` | generated | Certificate presented to the device |
-| `HELIOBRIDGE_STATE_DIR` | `/var/lib/heliobridge` | Generated certificate and cached state |
+| `HELIOBRIDGE_STATE_DIR` | `$TMPDIR/heliobridge` | Generated certificate and cached state |
 | `HELIOBRIDGE_CONTROL_SOCKET` | off | Unix socket for the control API, mode 0600 |
 | `HELIOBRIDGE_ALLOW_FROM` | any | Addresses and networks the device may connect from |
 | `HELIOBRIDGE_ALLOW_DEVICES` | any | Device serials to serve |

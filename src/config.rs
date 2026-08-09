@@ -20,8 +20,28 @@ use crate::server::access::{Devices, Peers};
 /// Default device-facing listener address.
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:7006";
 
-/// Default state directory.
-pub const DEFAULT_STATE_DIR: &str = "/var/lib/heliobridge";
+/// Directory name used under the temporary directory when no state directory is given.
+pub const STATE_DIR_NAME: &str = "heliobridge";
+
+/// Where generated state goes when nothing says otherwise.
+///
+/// Under the system temporary directory, so a first run works with no directory to create and no privilege
+/// to acquire. What lives there is the generated certificate, which the device does not verify and which is
+/// regenerated whenever it is missing — losing it costs a reconnect, not a reprovisioning.
+///
+/// A deployment that wants it kept says so: `HELIOBRIDGE_STATE_DIR=/var/lib/heliobridge`.
+pub fn default_state_dir() -> PathBuf {
+    std::env::temp_dir().join(STATE_DIR_NAME)
+}
+
+/// Default root for this program's own topics.
+pub const DEFAULT_MQTT_BASE: &str = "heliobridge";
+
+/// Default root Home Assistant watches for discovery.
+pub const DEFAULT_DISCOVERY_PREFIX: &str = "homeassistant";
+
+/// Default tracing filter.
+pub const DEFAULT_LOG: &str = "info";
 
 /// A local MQTT bridge for the Growatt Nexa 2000.
 #[derive(Debug, Clone, Parser)]
@@ -35,15 +55,18 @@ pub struct Config {
     pub listen: SocketAddr,
 
     /// PEM certificate to present to the device. Generated on first run if unset.
-    #[arg(long, env = "HELIOBRIDGE_TLS_CERT")]
+    #[arg(long, env = "HELIOBRIDGE_TLS_CERT", value_parser = path_allowing_empty)]
     pub tls_cert: Option<PathBuf>,
 
     /// PEM private key matching `--tls-cert`.
-    #[arg(long, env = "HELIOBRIDGE_TLS_KEY")]
+    #[arg(long, env = "HELIOBRIDGE_TLS_KEY", value_parser = path_allowing_empty)]
     pub tls_key: Option<PathBuf>,
 
     /// Where to keep the generated certificate and cached state.
-    #[arg(long, env = "HELIOBRIDGE_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
+    ///
+    /// Defaults under the system temporary directory, which survives restarts of this program but not
+    /// always a reboot. Point it somewhere durable to keep one certificate across reboots.
+    #[arg(long, env = "HELIOBRIDGE_STATE_DIR", default_value_os_t = default_state_dir(), value_parser = path_allowing_empty)]
     pub state_dir: PathBuf,
 
     /// Addresses and networks the device may connect from. Empty accepts any.
@@ -73,14 +96,14 @@ pub struct Config {
     ///
     /// Writes `up.bin`, `down.bin`, `inject.bin` and `blocked.bin`: raw octets exactly as they crossed the
     /// socket, so a later, better decoder can re-read them.
-    #[arg(long, env = "HELIOBRIDGE_RECORD_DIR")]
+    #[arg(long, env = "HELIOBRIDGE_RECORD_DIR", value_parser = path_allowing_empty)]
     pub record_dir: Option<PathBuf>,
 
     /// Serve the control API on this Unix socket. Off unless set.
     ///
     /// HTTP, so it is reachable with `curl --unix-socket`. Routes are scoped by device, e.g.
     /// `/devices/<serial>/settings/slot1_output_power`. Created mode 0600; there is no network listener.
-    #[arg(long, env = "HELIOBRIDGE_CONTROL_SOCKET")]
+    #[arg(long, env = "HELIOBRIDGE_CONTROL_SOCKET", value_parser = path_allowing_empty)]
     pub control_socket: Option<PathBuf>,
 
     /// Cap per recording stream, in bytes.
@@ -121,27 +144,27 @@ pub struct Config {
     /// A relative path is resolved inside `$CREDENTIALS_DIRECTORY` when systemd provides one, so
     /// `LoadCredential=mqtt-pass:/etc/heliobridge/mqtt.pass` pairs with `--mqtt-pass-file mqtt-pass`.
     /// Trailing newlines are stripped. Takes precedence over `--mqtt-pass`.
-    #[arg(long, env = "HELIOBRIDGE_MQTT_PASS_FILE")]
+    #[arg(long, env = "HELIOBRIDGE_MQTT_PASS_FILE", value_parser = path_allowing_empty)]
     pub mqtt_pass_file: Option<PathBuf>,
 
     /// PEM certificate chain to present to the broker, for a broker that authenticates by certificate.
     ///
     /// Only meaningful with `mqtts://`. Requires `--mqtt-client-key`.
-    #[arg(long, env = "HELIOBRIDGE_MQTT_CLIENT_CERT")]
+    #[arg(long, env = "HELIOBRIDGE_MQTT_CLIENT_CERT", value_parser = path_allowing_empty)]
     pub mqtt_client_cert: Option<PathBuf>,
 
     /// PEM private key matching `--mqtt-client-cert`.
-    #[arg(long, env = "HELIOBRIDGE_MQTT_CLIENT_KEY")]
+    #[arg(long, env = "HELIOBRIDGE_MQTT_CLIENT_KEY", value_parser = path_allowing_empty)]
     pub mqtt_client_key: Option<PathBuf>,
 
     /// Root of this program's own topics on the broker.
-    #[arg(long, env = "HELIOBRIDGE_MQTT_BASE", default_value = "heliobridge")]
+    #[arg(long, env = "HELIOBRIDGE_MQTT_BASE", default_value = DEFAULT_MQTT_BASE)]
     pub mqtt_base: String,
 
     /// Root Home Assistant watches for discovery messages.
     ///
     /// Change it only to match a Home Assistant that was configured with a non-default prefix.
-    #[arg(long, env = "HELIOBRIDGE_MQTT_DISCOVERY_PREFIX", default_value = "homeassistant")]
+    #[arg(long, env = "HELIOBRIDGE_MQTT_DISCOVERY_PREFIX", default_value = DEFAULT_DISCOVERY_PREFIX)]
     pub mqtt_discovery_prefix: String,
 
     /// What distinguishes this bridge from another on the same broker. Defaults to the host name.
@@ -233,12 +256,40 @@ pub struct Config {
     pub relay_answers: Answers,
 
     /// Tracing filter, per subsystem. Falls back to `RUST_LOG`.
-    #[arg(long, env = "HELIOBRIDGE_LOG", default_value = "info")]
+    #[arg(long, env = "HELIOBRIDGE_LOG", default_value = DEFAULT_LOG)]
     pub log: String,
 
     /// Log format.
     #[arg(long, env = "HELIOBRIDGE_LOG_FORMAT", default_value = "text")]
     pub log_format: LogFormat,
+}
+
+/// Accept a path written as an empty string, leaving [`Config::ignoring_empty`] to treat it as absent.
+///
+/// clap's own path parser refuses an empty value, which is what made a cleared variable mean "error" for a
+/// setting that names a path and "off" for one that does not.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "clap requires a value parser to return a Result; this one accepts everything a path can be, \
+              which is the whole point of replacing the one that refuses an empty value."
+)]
+fn path_allowing_empty(value: &str) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(value))
+}
+
+/// A setting given as an empty string, treated as one that was not given.
+fn given(value: Option<String>) -> Option<String> {
+    value.filter(|text| !text.is_empty())
+}
+
+/// The same, for a setting that names a path.
+fn given_path(value: Option<PathBuf>) -> Option<PathBuf> {
+    value.filter(|path| !path.as_os_str().is_empty())
+}
+
+/// A defaulted setting, falling back to its default when cleared.
+fn given_or(value: String, default: &str) -> String {
+    if value.is_empty() { default.to_owned() } else { value }
 }
 
 /// How log records are rendered.
@@ -253,7 +304,38 @@ pub enum LogFormat {
 impl Config {
     /// Parse from the environment and the command line.
     pub fn from_env() -> Self {
-        Self::parse()
+        Self::parse().ignoring_empty()
+    }
+
+    /// Treat a setting cleared to an empty string as one that was never given.
+    ///
+    /// A variable that is always *set* and sometimes empty is how the container world configures things:
+    /// Compose materialises every key in the `.env` file, so `HELIOBRIDGE_MQTT_URL=` is the only way to turn
+    /// publishing off short of maintaining two files. Absence is not available there.
+    ///
+    /// So empty means the same as absent: an optional setting is off, and one with a default falls back to
+    /// it. The two allowlists are untouched, because empty is already their meaningful value — it is how
+    /// they say "admit everything".
+    #[must_use]
+    fn ignoring_empty(mut self) -> Self {
+        self.tls_cert = given_path(self.tls_cert);
+        self.tls_key = given_path(self.tls_key);
+        self.record_dir = given_path(self.record_dir);
+        self.control_socket = given_path(self.control_socket);
+        self.mqtt_url = given(self.mqtt_url);
+        self.mqtt_user = given(self.mqtt_user);
+        self.mqtt_pass = given(self.mqtt_pass);
+        self.mqtt_pass_file = given_path(self.mqtt_pass_file);
+        self.mqtt_client_cert = given_path(self.mqtt_client_cert);
+        self.mqtt_client_key = given_path(self.mqtt_client_key);
+        self.mqtt_instance = given(self.mqtt_instance);
+
+        self.state_dir = given_path(Some(self.state_dir)).unwrap_or_else(default_state_dir);
+        self.mqtt_base = given_or(self.mqtt_base, DEFAULT_MQTT_BASE);
+        self.mqtt_discovery_prefix = given_or(self.mqtt_discovery_prefix, DEFAULT_DISCOVERY_PREFIX);
+        self.cloud_host = given_or(self.cloud_host, cloud::DEFAULT_HOST);
+        self.log = given_or(self.log, DEFAULT_LOG);
+        self
     }
 
     /// Whether this server should push its wall-clock time to the device.
@@ -385,7 +467,10 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answers, Config, DEFAULT_LISTEN, LogFormat, Mode};
+    use super::{
+        Answers, Config, DEFAULT_DISCOVERY_PREFIX, DEFAULT_LISTEN, DEFAULT_LOG, DEFAULT_MQTT_BASE, LogFormat, Mode,
+        default_state_dir,
+    };
     use clap::Parser as _;
 
     fn parse(flags: &[&str]) -> Config {
@@ -421,6 +506,78 @@ mod tests {
         assert_eq!(config.topics().base, "heliobridge");
         assert_eq!(config.topics().discovery_prefix, "homeassistant");
         assert!(!config.topics().instance.is_empty());
+    }
+
+    #[test]
+    fn clearing_a_setting_turns_it_off_exactly_as_leaving_it_out_would() {
+        // Compose materialises every key in the `.env` file, so a variable is always set and an empty value
+        // is the only way to turn something off. Absence is not available there.
+        let cleared = parse(&[
+            "--mqtt-url",
+            "",
+            "--mqtt-user",
+            "",
+            "--mqtt-pass",
+            "",
+            "--mqtt-pass-file",
+            "",
+            "--mqtt-instance",
+            "",
+            "--record-dir",
+            "",
+            "--control-socket",
+            "",
+            "--tls-cert",
+            "",
+            "--tls-key",
+            "",
+            "--mqtt-client-cert",
+            "",
+            "--mqtt-client-key",
+            "",
+        ])
+        .ignoring_empty();
+
+        assert!(cleared.mqtt_url.is_none(), "publishing is off");
+        assert!(cleared.record_dir.is_none(), "recording is off");
+        assert!(cleared.control_socket.is_none(), "the control API is off");
+        assert!(cleared.tls_pair().expect("neither half is set").is_none());
+        assert!(cleared.mqtt_client_identity().expect("neither half is set").is_none());
+        assert_eq!(cleared.mqtt_password().expect("nothing to read"), None);
+        assert!(cleared.mqtt_user.is_none() && cleared.mqtt_instance.is_none());
+    }
+
+    #[test]
+    fn clearing_a_defaulted_setting_falls_back_to_its_default() {
+        let cleared = parse(&[
+            "--mqtt-base",
+            "",
+            "--mqtt-discovery-prefix",
+            "",
+            "--state-dir",
+            "",
+            "--cloud-host",
+            "",
+            "--log",
+            "",
+        ])
+        .ignoring_empty();
+
+        assert_eq!(cleared.mqtt_base, DEFAULT_MQTT_BASE);
+        assert_eq!(cleared.mqtt_discovery_prefix, DEFAULT_DISCOVERY_PREFIX);
+        assert_eq!(cleared.state_dir, default_state_dir());
+        assert_eq!(cleared.log, DEFAULT_LOG);
+        assert!(!cleared.cloud_host.is_empty());
+        // An empty base would make every published topic start with a slash.
+        assert_eq!(cleared.topics().base, DEFAULT_MQTT_BASE);
+    }
+
+    #[test]
+    fn an_allowlist_keeps_its_empty_value_because_that_is_what_it_means() {
+        // The exception. Empty is already the documented value here: admit everything.
+        let config = parse(&["--allow-from", "", "--allow-devices", ""]).ignoring_empty();
+        assert!(config.peers().expect("empty parses").is_open());
+        assert!(config.devices().is_open());
     }
 
     #[test]
