@@ -73,7 +73,7 @@ impl StatePayload {
         )
     }
 
-    /// What this bridge knows about the device rather than from it.
+    /// What this bridge knows about the device rather than from it, plus which build knows it.
     ///
     /// `last_update` is left out entirely until a frame has arrived, rather than being sent as null or as a
     /// zero time: an absent field renders empty, which Home Assistant treats as no update, so the sensor
@@ -84,6 +84,9 @@ impl StatePayload {
             "connected".to_owned(),
             json!(String::from_utf8_lossy(if connected { ONLINE } else { OFFLINE })),
         );
+        // A constant for the life of the process, so it rides along with the topic that is published
+        // whenever this bridge's view of the device changes rather than needing one of its own.
+        object.insert("bridge_version".to_owned(), json!(crate::VERSION));
         if let Some(stamp) = last_update {
             object.insert("last_update".to_owned(), json!(stamp));
         }
@@ -275,6 +278,18 @@ mod tests {
         let reporting = StatePayload::status(true, Some("2026-08-09T12:00:00+02:00"));
         assert_eq!(reporting.get("connected"), Some(&json!("online")));
         assert_eq!(reporting.get("last_update"), Some(&json!("2026-08-09T12:00:00+02:00")));
+    }
+
+    #[test]
+    fn status_says_which_build_produced_the_readings() {
+        // Every field on the device page is this program's interpretation of a register, so which build did
+        // the interpreting belongs there — and it has to be true whether or not the device is present.
+        for connected in [true, false] {
+            assert_eq!(
+                StatePayload::status(connected, None).get("bridge_version"),
+                Some(&json!(crate::VERSION))
+            );
+        }
     }
 
     #[test]

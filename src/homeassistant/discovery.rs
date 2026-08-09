@@ -354,7 +354,7 @@ mod tests {
     fn the_entities_that_report_an_outage_list_only_the_bridge() {
         // If either listed the device's availability it would go unavailable exactly when it became worth
         // reading, which is the failure this whole distinction exists to avoid.
-        for key in ["connected", "last_update"] {
+        for key in ["connected", "last_update", "bridge_version"] {
             let entity = entity(key);
             assert_eq!(entity.presence, Presence::Bridge, "{key}");
             let config = payload(&entity);
@@ -364,10 +364,16 @@ mod tests {
                 "{key}"
             );
             assert_eq!(config["state_topic"], "heliobridge/0EXAMPLE00000001/status", "{key}");
-            // Ordinary entities rather than diagnostics: they qualify every reading on the page, so they
-            // are read beside them rather than in a collapsed block.
-            assert!(config.get("entity_category").is_none(), "{key}");
         }
+
+        // Presence and category are separate judgements. These two qualify every reading on the page — how
+        // current is it, and is there a device behind it — so they are read beside those readings rather
+        // than in a collapsed block.
+        for key in ["connected", "last_update"] {
+            assert!(payload(&entity(key)).get("entity_category").is_none(), "{key}");
+        }
+        // Which build did the decoding is about the software, so it belongs with the other versions.
+        assert_eq!(payload(&entity("bridge_version"))["entity_category"], "diagnostic");
     }
 
     #[test]

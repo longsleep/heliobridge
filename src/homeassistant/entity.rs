@@ -261,9 +261,9 @@ impl Entity {
 
     /// Whether the device is reporting.
     ///
-    /// One of the two entities that must survive the outage they describe, hence [`Presence::Bridge`], and
-    /// an ordinary entity rather than a diagnostic for the same reason as [`Self::last_update`]: it
-    /// qualifies every reading on the page, so it belongs beside them.
+    /// One of the entities that must survive the outage it describes, hence [`Presence::Bridge`], and an
+    /// ordinary entity rather than a diagnostic for the same reason as [`Self::last_update`]: it qualifies
+    /// every reading on the page, so it belongs beside them.
     pub fn connected() -> Self {
         Self {
             key: "connected",
@@ -297,6 +297,32 @@ impl Entity {
             category: None,
             precision: None,
             // No state class: Home Assistant refuses one on a timestamp, and there is nothing to average.
+            shape: Shape::Reading(None),
+            source: Source::Status,
+            presence: Presence::Bridge,
+        }
+    }
+
+    /// Which build of this program produced the readings.
+    ///
+    /// A diagnostic, unlike the other two on the status topic: it says nothing about the energy or about
+    /// how current anything is. It is here because a device page that reports a firmware version and a
+    /// hardware version, and stays silent about the software actually doing the decoding, sends the reader
+    /// looking in the wrong place. Every field on that page is this program's interpretation of a register.
+    ///
+    /// [`Presence::Bridge`] for the obvious reason: it describes the bridge, so a device that has gone away
+    /// has no bearing on whether it is true.
+    pub fn bridge_version() -> Self {
+        Self {
+            key: "bridge_version",
+            // Named for the program rather than "Bridge version", which on a page full of the *device's*
+            // versions would read as another of them.
+            name: "Heliobridge version".to_owned(),
+            component: Component::Sensor,
+            device_class: None,
+            unit: None,
+            category: Some(Category::Diagnostic),
+            precision: None,
             shape: Shape::Reading(None),
             source: Source::Status,
             presence: Presence::Bridge,
@@ -410,7 +436,7 @@ impl Catalogue {
 
         readings
             .chain(settings)
-            .chain([Entity::connected(), Entity::last_update()])
+            .chain([Entity::connected(), Entity::last_update(), Entity::bridge_version()])
             .collect()
     }
 

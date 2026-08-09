@@ -200,6 +200,29 @@ GET  /devices/{device}/actions
 POST /devices/{device}/actions/{key}           restart the datalogger, clear its log
 ```
 
+## Building for another machine
+
+`cargo build --release` links against the build host's glibc, so the result will not start on a distribution
+older than that host. The release targets are **musl** instead, which links statically: one binary per
+architecture, running on any Linux of that architecture.
+
+```sh
+cargo install cargo-zigbuild
+pip install ziglang        # or Zig from ziglang.org, or a package manager
+
+cargo zigbuild --release --target x86_64-unknown-linux-musl
+cargo zigbuild --release --target aarch64-unknown-linux-musl
+```
+
+Both targets install with the toolchain, and the command is the same for either — including the host's own
+architecture, so there is one recipe rather than one per machine.
+
+Zig is there because the crypto provider that rustls and rcgen pull in compiles C and assembly, which a
+cross build needs a C toolchain for. Zig ships a complete one for every target and `cargo-zigbuild` puts it
+where cargo expects a linker; the alternative is a separate C cross compiler per architecture, and nothing
+packages one for aarch64-musl. Installed as a Python package, Zig has no `zig` executable, so
+`cargo-zigbuild` finds it through `python3 -m ziglang` — put the environment holding it on `PATH`.
+
 ## Design
 
 - Library plus thin binary. The protocol layer is pure `bytes → values` with no I/O, so it is

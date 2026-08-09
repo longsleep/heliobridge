@@ -4,3 +4,10 @@
 channel = "1.97.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
+# Release targets, so building for another machine needs no separate `rustup target add`. The host's own
+# target is implicit. Both are musl, which links statically: one binary per architecture that runs on any
+# Linux of that architecture, rather than one that needs a glibc no older than the build host's.
+#
+# Both are built with `cargo zigbuild`, which supplies the C toolchain the crypto provider needs — the same
+# command whatever the host is. See the README.
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

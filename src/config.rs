@@ -350,6 +350,24 @@ mod tests {
     }
 
     #[test]
+    fn publishing_to_home_assistant_is_off_until_a_broker_is_named() {
+        // A supported mode, not a degraded one: the device server and the control API are useful on their
+        // own, and that is how the protocol work was done. Nothing may dial a broker that was never named.
+        let config = parse(&[]);
+        assert!(config.mqtt_url.is_none());
+        assert!(config.mqtt_user.is_none() && config.mqtt_pass.is_none());
+
+        // The defaults for the rest still have to be sane, since they are read as soon as one is named.
+        let publishing = config.publishing();
+        assert_eq!(publishing.slots, 1);
+        assert!(publishing.writable);
+        assert_eq!(publishing.offline_after, super::publisher::OFFLINE_AFTER);
+        assert_eq!(config.topics().base, "heliobridge");
+        assert_eq!(config.topics().discovery_prefix, "homeassistant");
+        assert!(!config.topics().instance.is_empty());
+    }
+
+    #[test]
     fn an_incomplete_tls_pair_is_an_error_not_a_silent_fallback() {
         let config = parse(&["--tls-cert", "/tmp/a.crt"]);
         assert!(config.tls_pair().is_err());
