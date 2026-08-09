@@ -257,7 +257,11 @@ fn diagnostic(name: &str, confidence: Confidence) -> Option<Category> {
         || name.contains("serial")
         || name.contains("status")
         || name.contains("cell")
-        || name.contains("household");
+        || name.contains("household")
+        // A bitfield of fault conditions belongs with the diagnostics whatever its confidence becomes.
+        // Naming it here rather than relying on the confidence test keeps it off the dashboard if a bit
+        // is ever promoted.
+        || name.contains("fault");
     (equipment || confidence == Confidence::Observed).then_some(Category::Diagnostic)
 }
 
@@ -458,6 +462,19 @@ mod tests {
             }
             other => panic!("expected a temperature, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_fault_words_are_published_as_diagnostics() {
+        // Bitfields with two of forty-eight bits identified: worth exposing so a fault is visible at all,
+        // but not on the dashboard, and with no unit or state class to imply they are measurements.
+        for key in ["internal_faults", "grid_faults", "output_faults"] {
+            let entity = reading(key);
+            assert_eq!(entity.category, Some(Category::Diagnostic), "{key}");
+            assert_eq!(entity.unit, None, "{key}");
+            assert_eq!(entity.device_class, None, "{key}");
+        }
+        assert_eq!(reading("grid_faults").name, "Grid faults");
     }
 
     #[test]

@@ -202,19 +202,33 @@ fn signed_registers_decode_negative_when_exporting() {
 }
 
 #[test]
-fn ac_power_and_its_high_resolution_twin_agree() {
-    // The two are one measurement, not two: register 116 has ten times the resolution and the
-    // opposite sign convention. They are not latched together, so allow a small sampling skew.
+fn ac_power_agrees_with_the_on_grid_power_while_grid_tied() {
+    // Register 5 reports whichever output is live; 116 reports only the grid. Every fixture was captured
+    // grid-tied, so the two describe the same flow at ten times the resolution and opposite sign. They are
+    // not latched together, so a small sampling skew is allowed.
+    //
+    // They part company off-grid, where 116 reads zero while register 5 keeps reporting what the device's
+    // own socket delivers — which is why 116 is not named as a higher-resolution copy of register 5.
     for fixture in FIXTURES {
         let frame = Frame::parse(fixture.wire).expect("parse");
         let telemetry = Telemetry::from_frame(&frame).expect("decode");
         let ac = telemetry.value("ac_power").expect("register 5");
-        let hires = telemetry.value("ac_power_hires").expect("register 116");
+        let on_grid = telemetry.value("on_grid_power").expect("register 116");
         assert!(
-            (-hires.trunc() - ac).abs() <= 1.0,
-            "{}: ac_power {ac} and ac_power_hires {hires} disagree beyond sampling skew",
+            (-on_grid.trunc() - ac).abs() <= 1.0,
+            "{}: ac_power {ac} and on_grid_power {on_grid} disagree beyond sampling skew",
             fixture.file
         );
+
+        // Grid-tied, so the off-grid triple must be idle.
+        for name in ["off_grid_voltage", "off_grid_current", "off_grid_power"] {
+            let value = telemetry.value(name).unwrap_or_else(|| panic!("{name} missing"));
+            assert!(
+                value.abs() < 0.05,
+                "{}: {name} reads {value} on a grid-tied frame",
+                fixture.file
+            );
+        }
     }
 }
 

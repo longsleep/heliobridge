@@ -214,6 +214,17 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
     use Unit::{Ampere, Celsius, KilowattHour, None as NoUnit, Percent, Volt, Watt};
 
     &[
+        // Three flags words of active conditions, zero on a healthy device and self-clearing. Two bits
+        // have been produced deliberately and identified: `grid_faults` bit 2 while the grid was switched
+        // off, `output_faults` bit 10 while an overload had shut the off-grid socket down. The rest are
+        // named only by aligning Growatt's own table for hybrid storage against those two, so each word
+        // is named for what most of its bits concern rather than for any single one.
+        //
+        // Carried as integers rather than enumerations, so a consumer sees the whole word and can report
+        // one it does not recognise verbatim.
+        Entry::int(2, "internal_faults", Observed),
+        Entry::int(3, "grid_faults", Observed),
+        Entry::int(4, "output_faults", Observed),
         Entry::float(5, "ac_power", Watt, Scaling::SIGNED, Verified),
         Entry::float(7, "pv_power_total", Watt, Scaling::UNIT, Verified),
         Entry::enumerated(8, "work_mode", WORK_MODE_LABELS, Verified),
@@ -300,12 +311,18 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::float(107, "pv4_current", Ampere, Scaling::HUNDREDTHS, Observed),
         Entry::float(108, "pv4_temp", Celsius, Scaling::HUNDREDTHS, Observed),
         // 110, 111 and 117 use the signed-power encoding, so they are probably power values.
-        Entry::float(110, "unknown_110", NoUnit, Scaling::SIGNED, Inferred),
-        Entry::float(111, "unknown_111", NoUnit, Scaling::SIGNED, Inferred),
+        // The off-grid output: what the device's own socket delivers, and zero in every frame until the
+        // device is put into off-grid mode. Established by connecting a lamp, then two: voltage held
+        // 230.0 V, current and power both roughly doubled, and 111 matched |ac_power| to the decimal.
+        Entry::float(109, "off_grid_voltage", Volt, Scaling::TENTHS, Verified),
+        Entry::float(110, "off_grid_current", Ampere, Scaling::new(0.01, -300.0), Verified),
+        Entry::float(111, "off_grid_power", Watt, Scaling::new(0.1, -3000.0), Verified),
         Entry::float(112, "unknown_112", NoUnit, Scaling::UNIT, Inferred),
         Entry::float(114, "unknown_114", NoUnit, Scaling::UNIT, Inferred),
         Entry::float(115, "grid_voltage", Volt, Scaling::HUNDREDTHS, Observed),
-        Entry::float(116, "ac_power_hires", Watt, Scaling::new(0.1, -3000.0), Verified),
+        // The on-grid half: zero while the device runs off-grid, which is what separates it from
+        // register 5. Register 5 reports whichever output is live; this one only the grid.
+        Entry::float(116, "on_grid_power", Watt, Scaling::new(0.1, -3000.0), Verified),
         Entry::float(117, "unknown_117", NoUnit, Scaling::SIGNED, Inferred),
         // Two registers reading 0x0E0C and 0x0E0B, i.e. plain integers rather than the ASCII a
         // version string would be. A pair of component version numbers is the best available
