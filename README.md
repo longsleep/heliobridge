@@ -68,6 +68,29 @@ environment variable; `--help` documents each one in full.
 | `HELIOBRIDGE_RECORD_DIR` | off | Record raw frames for analysis |
 | `HELIOBRIDGE_LOG` | `info` | Tracing filter, per subsystem |
 
+### Standard variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TZ` | the host's zone | The zone the device's clock is set to |
+| `SSL_CERT_FILE` | *(unset)* | A PEM bundle replacing the shipped trust anchors for outbound TLS |
+| `SSL_CERT_DIR` | *(unset)* | A directory of them, same effect |
+
+The device is sent local wall time, not UTC, so `TZ` sets the time the device runs on and the times its
+schedule slots fire. Set it where the process is defined; a container defaults to `UTC`.
+
+```sh
+TZ=Europe/Berlin heliobridge
+```
+
+Mozilla's roots ship in the binary. `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces them entirely — use it to
+trust a private authority, such as a broker with a self-signed certificate. Naming a store that holds no
+usable certificate is a startup failure.
+
+```sh
+SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt heliobridge
+```
+
 ### Relay modes
 
 In every mode the vendor app keeps **displaying** correctly. What differs is what it may change:
