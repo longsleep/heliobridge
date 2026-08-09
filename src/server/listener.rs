@@ -21,7 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
 use crate::control::Registry;
-use crate::growatt::cloud::CloudConfig;
+use crate::growatt::cloud::CloudRelay;
 use crate::growatt::policy::Policy;
 use crate::record::Recorder;
 use crate::server::session::Session;
@@ -54,7 +54,7 @@ pub struct SessionOptions {
     pub time_push: bool,
 
     /// Relay traffic to the vendor cloud, so the phone app keeps working.
-    pub cloud: Option<CloudConfig>,
+    pub cloud: Option<CloudRelay>,
 
     /// What the relay carries in each direction. Ignored unless `cloud` is set.
     pub policy: Policy,
@@ -204,8 +204,9 @@ fn flatten(error: &dyn std::error::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::SessionOptions;
-    use crate::growatt::cloud::CloudConfig;
+    use crate::growatt::cloud::{CloudConfig, CloudRelay};
     use crate::growatt::policy::Policy;
+    use crate::mqtt::Trust;
 
     #[test]
     fn defaults_relay_nothing_record_nothing_and_push_time() {
@@ -222,7 +223,10 @@ mod tests {
         // policy decision, and this type only carries it.
         let options = SessionOptions {
             time_push: false,
-            cloud: Some(CloudConfig::default()),
+            cloud: Some(CloudRelay {
+                endpoint: CloudConfig::default(),
+                tls: Trust::BuiltIn.client_tls().expect("the shipped roots load"),
+            }),
             policy: Policy::OPEN,
             recorder: None,
             slots: 1,

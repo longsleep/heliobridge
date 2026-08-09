@@ -16,6 +16,10 @@
 //! reconnects. Nothing this program talks to needs them.
 
 use core::fmt;
+use std::sync::Arc;
+
+use rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::TlsConnector;
 
 /// Protocol name in the CONNECT variable header.
 pub const PROTOCOL_NAME: &str = "MQTT";
@@ -69,6 +73,149 @@ pub enum CodecError {
         /// The length asked for.
         len: usize,
     },
+}
+
+/// Why outbound TLS could not be configured.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TrustError {
+    /// The environment named a trust store, and it held nothing usable.
+    #[error("the trust store named by SSL_CERT_FILE or SSL_CERT_DIR holds no usable certificate{}",
+        if .problems.is_empty() { String::new() } else { format!(": {}", .problems.join("; ")) })]
+    NoAnchors {
+        /// What the loader complained about, if anything.
+        problems: Vec<String>,
+    },
+}
+
+/// Which certificate authorities outbound TLS trusts.
+///
+/// Shared by both places this program is a TLS client: the vendor cloud when relaying, and a Home
+/// Assistant broker reached over `mqtts`. The device itself verifies nothing, which is what makes the
+/// whole project possible, but that is no reason to be equally lax in the other direction.
+///
+/// The switch lives here rather than in a library because no crate offers this combination:
+/// `webpki-roots` is a static list that reads no environment, and `rustls-native-certs` is
+/// platform-or-environment with no compiled-in fallback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Trust {
+    /// Mozilla's roots, compiled into the binary. The default, so the program needs nothing from the host
+    /// and behaves identically on a distribution, in a container, or from a scratch image.
+    #[default]
+    BuiltIn,
+    /// The store named by `SSL_CERT_FILE` or `SSL_CERT_DIR`, replacing the shipped roots entirely.
+    ///
+    /// Those are the variables every other TLS program on the machine honours, so trusting a private
+    /// authority — the usual case for a self-hosted broker — needs no setting peculiar to this program.
+    /// The store named need not be the system's; it is whichever file or directory the operator names.
+    Named,
+}
+
+impl Trust {
+    /// What the environment asks for.
+    pub fn configured() -> Self {
+        let named = ["SSL_CERT_FILE", "SSL_CERT_DIR"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+        if named { Self::Named } else { Self::BuiltIn }
+    }
+
+    /// The root store this describes.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError::NoAnchors`] if a named store holds nothing usable. Fatal rather than falling back to
+    /// the shipped roots, which would mean trusting authorities the operator had just replaced.
+    pub fn roots(self) -> Result<RootCertStore, TrustError> {
+        match self {
+            Self::BuiltIn => Ok(RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            }),
+            // `rustls-native-certs` reads only the named paths once either variable is set, so this never
+            // silently mixes in the platform's own store.
+            Self::Named => {
+                let found = rustls_native_certs::load_native_certs();
+                let mut roots = RootCertStore::empty();
+                let (_, unparsable) = roots.add_parsable_certificates(found.certs);
+
+                if roots.is_empty() {
+                    return Err(TrustError::NoAnchors {
+                        problems: found.errors.iter().map(ToString::to_string).collect(),
+                    });
+                }
+                if unparsable > 0 || !found.errors.is_empty() {
+                    tracing::warn!(unparsable, problems = ?found.errors, "parts of the trust store could not be read");
+                }
+                Ok(roots)
+            }
+        }
+    }
+
+    /// Load these anchors into a shareable TLS configuration.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError`], as [`Self::roots`].
+    pub fn client_tls(self) -> Result<ClientTls, TrustError> {
+        let roots = self.roots()?;
+        tracing::info!(
+            trust = self.as_str(),
+            anchors = roots.len(),
+            "outbound TLS trust anchors loaded"
+        );
+        Ok(ClientTls {
+            config: Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            ),
+            trust: self,
+        })
+    }
+
+    /// How to name this in a log line.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BuiltIn => "built-in",
+            Self::Named => "SSL_CERT_FILE/SSL_CERT_DIR",
+        }
+    }
+}
+
+/// The TLS configuration for outbound connections, ready to use.
+///
+/// Built once at startup and handed to whatever needs it — the cloud relay, the Home Assistant broker —
+/// as a cheap clone of one shared [`ClientConfig`]. Assembling that config parses every trust anchor, so
+/// building one per connection would repeat the work on every device reconnect and every broker retry.
+/// More importantly, passing one value around is what makes "everything trusts the same authorities" a
+/// property of the program rather than a convention each call site has to remember.
+#[derive(Debug, Clone)]
+pub struct ClientTls {
+    config: Arc<ClientConfig>,
+    trust: Trust,
+}
+
+impl ClientTls {
+    /// Load the trust anchors the environment asks for.
+    ///
+    /// Call once, at startup, so a misconfigured trust store is reported before anything connects rather
+    /// than on every retry afterwards.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError`], as [`Trust::roots`].
+    pub fn from_env() -> Result<Self, TrustError> {
+        Trust::configured().client_tls()
+    }
+
+    /// A connector for one outbound connection. Cheap: it shares the configuration.
+    pub fn connector(&self) -> TlsConnector {
+        TlsConnector::from(Arc::clone(&self.config))
+    }
+
+    /// Where these anchors came from.
+    pub const fn trust(&self) -> Trust {
+        self.trust
+    }
 }
 
 /// The CONNECT flags octet.
@@ -976,9 +1123,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
-        CodecError, Connect, ConnectFlags, PROTOCOL_LEVEL, Packet, PacketStream, Publish, QoS, Reader, Subscribe, Will,
-        Writer,
+        CodecError, Connect, ConnectFlags, PROTOCOL_LEVEL, Packet, PacketStream, Publish, QoS, Reader, Subscribe,
+        Trust, Will, Writer,
     };
 
     const SERIAL: &str = "0EXAMPLE00000001";
@@ -1306,6 +1455,39 @@ mod tests {
         assert_eq!(flags.will_qos(), Ok(QoS::AtLeastOnce));
         // Will + will-QoS-1 + will-retain + clean-session, and nothing else.
         assert_eq!(flags.bits(), 0x04 | 0x08 | 0x20 | 0x02);
+    }
+
+    #[test]
+    fn the_shipped_roots_are_a_real_store() {
+        // Independent of the environment: this is the list compiled into the binary, and the size check is
+        // what would catch a `webpki-roots` feature combination that yielded an empty one.
+        let roots = Trust::BuiltIn.roots().expect("the shipped roots load");
+        assert!(roots.len() > 50, "only {} anchors", roots.len());
+    }
+
+    #[test]
+    fn the_environment_decides_which_store_is_used() {
+        // Asserted against the environment as it actually is, because that is the whole contract: naming a
+        // store in either variable switches away from the shipped roots, and naming neither keeps them.
+        let named = ["SSL_CERT_FILE", "SSL_CERT_DIR"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+        let expected = if named { Trust::Named } else { Trust::BuiltIn };
+        assert_eq!(Trust::configured(), expected);
+    }
+
+    #[test]
+    fn one_configuration_is_shared_rather_than_rebuilt() {
+        // The property the type exists for: cloning a `ClientTls` must not parse the anchors again. Two
+        // clones must point at the same underlying configuration, not merely at equal ones. Built from an
+        // explicit `Trust` so the test does not depend on the host having a system store.
+        let tls = Trust::BuiltIn.client_tls().expect("the shipped roots load");
+        let second = tls.clone();
+        assert!(
+            Arc::ptr_eq(&tls.config, &second.config),
+            "a clone rebuilt the configuration instead of sharing it"
+        );
+        assert_eq!(second.trust(), Trust::BuiltIn);
     }
 
     #[test]

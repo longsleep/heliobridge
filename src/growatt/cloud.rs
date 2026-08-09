@@ -28,17 +28,14 @@
 //! waiting for.
 
 use core::time::Duration;
-use std::sync::Arc;
 
 use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore};
 use snafu::Snafu;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
-use crate::mqtt::{Connect, PROTOCOL_LEVEL, Packet, PacketStream, Publish, QoS, Subscribe};
+use crate::mqtt::{ClientTls, Connect, PROTOCOL_LEVEL, Packet, PacketStream, Publish, QoS, Subscribe};
 
 /// Default cloud endpoint.
 pub const DEFAULT_HOST: &str = "mqtt.growatt.com";
@@ -122,22 +119,19 @@ impl CloudConfig {
             host: self.host.clone(),
         })
     }
+}
 
-    /// TLS trust anchors from `webpki-roots`.
-    ///
-    /// The device verifies nothing, which is what makes this whole project possible — but that is no
-    /// reason for this program to be equally lax when *it* is the client. The cloud presents a real chain.
-    ///
-    /// An associated function rather than a method: the anchors do not depend on which endpoint is being
-    /// reached, and pretending otherwise would suggest they might.
-    pub fn tls_config() -> ClientConfig {
-        let roots = RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
-    }
+/// Everything the relay needs: where to reach the cloud, and whom to trust when doing it.
+///
+/// The two travel together because a relay cannot be started without both, and because the TLS
+/// configuration is loaded once for the process — pairing them here is what stops a caller from
+/// accidentally building a second one per device connection.
+#[derive(Debug, Clone)]
+pub struct CloudRelay {
+    /// The endpoint to dial.
+    pub endpoint: CloudConfig,
+    /// The process's one outbound TLS configuration.
+    pub tls: ClientTls,
 }
 
 /// One MQTT publish, moving in either direction through the relay.
@@ -178,12 +172,15 @@ pub struct Relay {
 impl Relay {
     /// Start a relay for one device session.
     ///
+    /// The TLS configuration comes in already built rather than being made here: a relay is created per
+    /// device connection, and parsing every trust anchor on each reconnect would be waste.
+    ///
     /// # Errors
     ///
     /// [`RelayError::InvalidHost`] if the configured host cannot be a TLS server name. Failures to
     /// *connect* are not errors here: the task retries, and the session continues either way.
-    pub fn start(device_id: &str, config: CloudConfig) -> Result<Self, RelayError> {
-        let task = RelayTask::new(device_id, config)?;
+    pub fn start(device_id: &str, cloud: CloudRelay) -> Result<Self, RelayError> {
+        let task = RelayTask::new(device_id, cloud)?;
 
         let (to_cloud_tx, to_cloud_rx) = mpsc::channel(QUEUE_DEPTH);
         let (from_cloud_tx, from_cloud_rx) = mpsc::channel(QUEUE_DEPTH);
@@ -228,7 +225,7 @@ struct RelayTask {
     device_id: String,
     config: CloudConfig,
     server_name: ServerName<'static>,
-    tls: Arc<ClientConfig>,
+    tls: ClientTls,
 }
 
 /// Why one relay connection ended.
@@ -240,14 +237,13 @@ enum Outcome {
 }
 
 impl RelayTask {
-    fn new(device_id: &str, config: CloudConfig) -> Result<Self, RelayError> {
-        let server_name = config.server_name()?;
-        let tls = Arc::new(CloudConfig::tls_config());
+    fn new(device_id: &str, cloud: CloudRelay) -> Result<Self, RelayError> {
+        let server_name = cloud.endpoint.server_name()?;
         Ok(Self {
             device_id: device_id.to_owned(),
-            config,
+            config: cloud.endpoint,
             server_name,
-            tls,
+            tls: cloud.tls,
         })
     }
 
@@ -299,7 +295,7 @@ impl RelayTask {
             .map_err(|error| format!("tcp connect: {error}"))?;
         drop(tcp.set_nodelay(true));
 
-        let connector = TlsConnector::from(Arc::clone(&self.tls));
+        let connector = self.tls.connector();
         let tls = connector
             .connect(self.server_name.clone(), tcp)
             .await
@@ -480,10 +476,20 @@ impl RelayTask {
 
 #[cfg(test)]
 mod tests {
-    use super::{CloudConfig, DEFAULT_HOST, DEFAULT_PORT, DEVICE_PASSWORD, KEEPALIVE_SECS, Message, Relay, RelayTask};
-    use crate::mqtt::{Packet, QoS};
+    use super::{
+        CloudConfig, CloudRelay, DEFAULT_HOST, DEFAULT_PORT, DEVICE_PASSWORD, KEEPALIVE_SECS, Message, Relay, RelayTask,
+    };
+    use crate::mqtt::{Packet, QoS, Trust};
 
     const SERIAL: &str = "0EXAMPLE00000001";
+
+    /// A relay configuration pointing at `endpoint`, trusting whatever the environment says.
+    fn relay_to(endpoint: CloudConfig) -> CloudRelay {
+        CloudRelay {
+            endpoint,
+            tls: Trust::BuiltIn.client_tls().expect("the shipped roots load"),
+        }
+    }
 
     #[test]
     fn defaults_point_at_the_vendor_endpoint() {
@@ -500,13 +506,13 @@ mod tests {
             port: 7006,
         };
         assert!(config.server_name().is_err());
-        assert!(Relay::start(SERIAL, config).is_err());
+        assert!(Relay::start(SERIAL, relay_to(config)).is_err());
     }
 
     #[test]
     fn the_upstream_connect_impersonates_the_device() {
         // The relay's identity upstream must be the device's, not its own.
-        let task = RelayTask::new(SERIAL, CloudConfig::default()).expect("valid config");
+        let task = RelayTask::new(SERIAL, relay_to(CloudConfig::default())).expect("valid config");
         let wire = task.upstream_connect().encode().expect("encode");
 
         let (decoded, _) = Packet::decode(&wire).expect("decode").expect("complete");
@@ -527,7 +533,7 @@ mod tests {
 
     #[test]
     fn an_uplink_publish_uses_the_device_topic_and_a_fresh_packet_id() {
-        let task = RelayTask::new(SERIAL, CloudConfig::default()).expect("valid config");
+        let task = RelayTask::new(SERIAL, relay_to(CloudConfig::default())).expect("valid config");
         let mut packet_id = 2;
 
         match task.uplink_publish(Message::uplink(vec![1, 2, 3], QoS::AtLeastOnce), &mut packet_id) {
@@ -550,7 +556,7 @@ mod tests {
 
     #[test]
     fn an_explicit_topic_is_preserved() {
-        let task = RelayTask::new(SERIAL, CloudConfig::default()).expect("valid config");
+        let task = RelayTask::new(SERIAL, relay_to(CloudConfig::default())).expect("valid config");
         let mut packet_id = 2;
         let message = Message {
             topic: "c/33/other".to_owned(),
@@ -571,7 +577,7 @@ mod tests {
             host: "cloud.invalid".to_owned(),
             port: 7006,
         };
-        let mut relay = Relay::start(SERIAL, config).expect("valid host name");
+        let mut relay = Relay::start(SERIAL, relay_to(config)).expect("valid host name");
 
         let mut queued = 0u64;
         for _ in 0..super::QUEUE_DEPTH.saturating_mul(4) {

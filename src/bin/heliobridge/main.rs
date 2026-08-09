@@ -8,6 +8,8 @@ use std::process::ExitCode;
 use heliobridge::VERSION;
 use heliobridge::config::{Config, LogFormat};
 use heliobridge::control::{self, Registry};
+use heliobridge::growatt::cloud::CloudRelay;
+use heliobridge::mqtt::ClientTls;
 use heliobridge::record::Recorder;
 use heliobridge::server;
 use tracing_subscriber::EnvFilter;
@@ -46,8 +48,17 @@ fn run(config: &Config) -> Result<(), String> {
         .build()
         .map_err(|error| format!("could not start the async runtime: {error}"))?;
 
-    let cloud = config.cloud();
-    if let Some(endpoint) = cloud.as_ref() {
+    // One TLS configuration for everything this program dials — the vendor cloud, and later the Home
+    // Assistant broker. Loaded here so a trust store the operator named but that cannot be read is
+    // reported at startup, not on every reconnection attempt.
+    let client_tls = ClientTls::from_env().map_err(|error| format!("outbound TLS: {}", chain(&error)))?;
+
+    let cloud = config.cloud().map(|endpoint| CloudRelay {
+        endpoint,
+        tls: client_tls.clone(),
+    });
+    if let Some(relay) = cloud.as_ref() {
+        let endpoint = &relay.endpoint;
         // Checked here so a bad host name fails at startup rather than on every reconnection attempt.
         endpoint
             .server_name()

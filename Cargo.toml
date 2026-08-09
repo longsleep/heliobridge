@@ -59,6 +59,7 @@ webpki-roots = "1.0.9"
 # RSA-2048 self-signed certificate with CN `*.growatt.com`, and matching what is known to work
 # keeps TLS from being a variable when something else goes wrong.
 rcgen = { version = "0.14.8", features = ["aws_lc_rs"] }
+rustls-native-certs = "0.8"
 
 [dev-dependencies]
 # `test-util` gives the paused clock, so a test can prove the 4.5-second time push fires without

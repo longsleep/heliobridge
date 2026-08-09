@@ -23,7 +23,7 @@ use crate::control::{
     Action as ControlAction, ConfigView, IdentityView, Outcome, QUEUE_DEPTH as CONTROL_QUEUE_DEPTH, ReadingView,
     Registration, Registry, Request as ControlRequest, SessionHandle, SettingView, StatusView, TelemetryView,
 };
-use crate::growatt::cloud::{CloudConfig, Message as CloudMessage, Relay};
+use crate::growatt::cloud::{CloudRelay, Message as CloudMessage, Relay};
 use crate::growatt::policy::{CloudCommands, Direction, Intent, Originator, Policy};
 use crate::growatt::v7::decode::{FromFrame, ReadResponse, Telemetry, WriteAck};
 use crate::growatt::v7::encode::{Command, EncodeError};
@@ -146,7 +146,7 @@ pub struct Session<S> {
     next_packet_id: u16,
     device_time: Option<Timestamp>,
     warned_about_skew: bool,
-    cloud: Option<CloudConfig>,
+    cloud: Option<CloudRelay>,
     relay: Option<Relay>,
     /// What the relay carries in each direction. Consulted only while relaying.
     policy: Policy,
@@ -328,7 +328,7 @@ where
     /// The relay cannot start until the device's serial is known, so this stores the configuration and the
     /// connection is made from CONNECT.
     #[must_use]
-    pub fn with_cloud(mut self, cloud: Option<CloudConfig>) -> Self {
+    pub fn with_cloud(mut self, cloud: Option<CloudRelay>) -> Self {
         self.cloud = cloud;
         self
     }
