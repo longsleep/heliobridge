@@ -354,21 +354,73 @@ pub struct SessionHandle {
     pub status: watch::Receiver<StatusView>,
 }
 
+/// Which devices are connected, as published on every change.
+///
+/// A type rather than a bare `Vec<String>` so it can grow — when each device connected, which peer it
+/// came from, how many sessions it has had — without changing the signature of everything that watches
+/// it. Subscribers ask it questions instead of indexing a vector.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Connected {
+    /// Device serials, sorted, so equality is meaningful and output is stable.
+    devices: Vec<String>,
+}
+
+impl Connected {
+    /// The connected serials, in a stable order.
+    pub fn devices(&self) -> &[String] {
+        &self.devices
+    }
+
+    /// Whether a device is connected.
+    pub fn contains(&self, device: &str) -> bool {
+        self.devices.iter().any(|known| known == device)
+    }
+
+    /// How many devices are connected.
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    /// Whether nothing is connected.
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+}
+
 /// Which devices are connected, and how to reach each.
 ///
 /// Shared between the API and every session. A session registers itself once its serial is known, and
 /// removes itself when it ends — by [`Registration`]'s `Drop`, so it happens on the error paths too.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Registry {
     inner: Arc<Mutex<Inner>>,
+    /// Announces the connected set on every change, so a publisher can react rather than poll.
+    changes: watch::Sender<Connected>,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner::default())),
+            changes: watch::Sender::new(Connected::default()),
+        }
+    }
 }
 
 /// The registry's contents: each device's handle, tagged with which registration owns it.
 #[derive(Debug, Default)]
 struct Inner {
-    devices: HashMap<String, (u64, SessionHandle)>,
+    devices: HashMap<String, (Epoch, SessionHandle)>,
     next_epoch: u64,
 }
+
+/// Which registration owns a device's entry.
+///
+/// A registration removes the entry on drop only if it is still the one that put it there. Without that,
+/// the ordering on a reconnect — new session registers, old session's guard drops a moment later — would
+/// delete the live entry and leave a connected device unaddressable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Epoch(u64);
 
 impl Registry {
     /// An empty registry.
@@ -385,21 +437,58 @@ impl Registry {
     /// current one**. Without that, the ordering on a reconnect — new session registers, then the old
     /// session's guard drops — would delete the live entry and leave a connected device unaddressable.
     pub fn register(&self, device_id: &str, handle: SessionHandle) -> Registration {
+        // One counter for every device rather than one per device. An epoch is only ever compared against
+        // the entry under the *same* key, so process-wide uniqueness is more than enough: device A holding
+        // 0, 3, 7 while B holds 1, 2 answers "is this entry still mine" as well as contiguous numbering.
         let epoch = match self.inner.lock() {
             Ok(mut inner) => {
-                let epoch = inner.next_epoch;
-                inner.next_epoch = inner.next_epoch.saturating_add(1);
-                inner.devices.insert(device_id.to_owned(), (epoch, handle));
-                epoch
+                let epoch = Epoch(inner.next_epoch);
+                // Distinctness is the whole property, so the counter refuses to issue rather than repeat.
+                // Reaching the end takes 2^64 reconnects.
+                match inner.next_epoch.checked_add(1) {
+                    Some(next) => {
+                        inner.next_epoch = next;
+                        inner.devices.insert(device_id.to_owned(), (epoch, handle));
+                        Some(epoch)
+                    }
+                    None => None,
+                }
             }
-            Err(_) => 0,
+            // Nothing was inserted, so this registration owns no entry and must remove none.
+            Err(_) => None,
         };
+        if epoch.is_none() {
+            tracing::error!(device = %device_id, "could not register the device; it will not be addressable");
+        }
+        self.announce();
 
         Registration {
             registry: self.clone(),
             device_id: device_id.to_owned(),
             epoch,
         }
+    }
+
+    /// Watch the connected set, for anything that must react to a device arriving or leaving.
+    ///
+    /// A `watch` rather than a broadcast: a subscriber wants the current set, not the history of how it
+    /// got there, and one that falls behind should catch up to the truth rather than replay.
+    pub fn watch(&self) -> watch::Receiver<Connected> {
+        self.changes.subscribe()
+    }
+
+    /// Publish the connected set, skipping the wake-up when nothing changed.
+    fn announce(&self) {
+        let connected = Connected {
+            devices: self.devices(),
+        };
+        self.changes.send_if_modified(|current| {
+            if *current == connected {
+                return false;
+            }
+            *current = connected;
+            true
+        });
     }
 
     /// Find a device's session.
@@ -424,21 +513,24 @@ impl Registry {
 pub struct Registration {
     registry: Registry,
     device_id: String,
-    epoch: u64,
+    /// `None` when registration did not take effect, in which case this owns no entry and removes none.
+    epoch: Option<Epoch>,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        if let Ok(mut inner) = self.registry.inner.lock() {
+        if let (Some(epoch), Ok(mut inner)) = (self.epoch, self.registry.inner.lock())
             // Only if this registration is still the current one for the device.
-            if inner
+            && inner
                 .devices
                 .get(&self.device_id)
-                .is_some_and(|(epoch, _)| *epoch == self.epoch)
-            {
-                inner.devices.remove(&self.device_id);
-            }
+                .is_some_and(|(current, _)| *current == epoch)
+        {
+            inner.devices.remove(&self.device_id);
         }
+        // Outside the lock, and unconditional: `announce` compares before sending, so a drop that removed
+        // nothing — the reconnect case, where a newer registration already owns the entry — is silent.
+        self.registry.announce();
     }
 }
 
@@ -1067,6 +1159,68 @@ mod tests {
             registry.devices(),
             vec!["0EXAMPLE00000001".to_owned()],
             "the replacement should survive the old registration going away"
+        );
+    }
+
+    #[test]
+    fn devices_reconnect_independently_of_each_other() {
+        // Epochs come from one counter shared by every device, so a device's own epochs are not
+        // contiguous. What must hold is that each entry is owned by the registration that inserted it,
+        // whatever numbers the others consumed in between.
+        let registry = Registry::new();
+        let (a1, _ra1, _sa1) = handle();
+        let (b1, _rb1, _sb1) = handle();
+        let (a2, _ra2, _sa2) = handle();
+
+        let a_old = registry.register("0EXAMPLE0000000A", a1);
+        let _b = registry.register("0EXAMPLE0000000B", b1);
+        let _a_new = registry.register("0EXAMPLE0000000A", a2);
+
+        // A's replacement took epoch 2, with B's registration holding 1 in between.
+        drop(a_old);
+        assert_eq!(
+            registry.devices(),
+            vec!["0EXAMPLE0000000A".to_owned(), "0EXAMPLE0000000B".to_owned()],
+            "dropping A's old registration must leave both devices addressable"
+        );
+    }
+
+    #[test]
+    fn the_connected_set_is_published_as_it_changes() {
+        let registry = Registry::new();
+        let mut watch = registry.watch();
+        assert!(watch.borrow_and_update().is_empty());
+
+        let (first, _rx, _s) = handle();
+        let registration = registry.register("0EXAMPLE00000001", first);
+        assert!(watch.has_changed().expect("the sender outlives this"));
+        let connected = watch.borrow_and_update().clone();
+        assert_eq!(connected.len(), 1);
+        assert!(connected.contains("0EXAMPLE00000001"));
+
+        drop(registration);
+        assert!(watch.has_changed().expect("the sender outlives this"));
+        assert!(watch.borrow_and_update().is_empty());
+    }
+
+    #[test]
+    fn a_replaced_registration_going_away_publishes_nothing() {
+        // A reconnect leaves the connected set unchanged, so a subscriber should not be woken to be told
+        // the same thing twice.
+        let registry = Registry::new();
+        let (first, _rx1, _s1) = handle();
+        let old = registry.register("0EXAMPLE00000001", first);
+
+        let mut watch = registry.watch();
+        watch.borrow_and_update();
+
+        let (second, _rx2, _s2) = handle();
+        let _new = registry.register("0EXAMPLE00000001", second);
+        drop(old);
+
+        assert!(
+            !watch.has_changed().expect("the sender outlives this"),
+            "the set never changed, so nothing should have been published"
         );
     }
 
