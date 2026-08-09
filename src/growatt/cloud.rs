@@ -335,6 +335,9 @@ impl RelayTask {
             password: Some(DEVICE_PASSWORD.to_vec()),
             keepalive: KEEPALIVE_SECS,
             clean_session: false,
+            // The device sets no will, so neither does the relay: it connects upstream *as* the device,
+            // and a will the genuine device never sends would be a difference the cloud could see.
+            will: None,
         })
     }
 

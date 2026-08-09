@@ -1552,6 +1552,7 @@ mod tests {
             password: Some(b"Growatt".to_vec()),
             keepalive: 420,
             clean_session: false,
+            will: None,
         })
         .encode()
         .expect("encode")

@@ -6,8 +6,14 @@
 //! the most critical path in the program. When the device does something unexpected, the parser is
 //! readable.
 //!
-//! What is **not** implemented, because the device never uses it: QoS 2, retained messages, wildcard
-//! subscriptions, topic aliases, will messages, and session state across reconnects.
+//! The codec serves both roles this program plays. Facing the device it is a server; facing the vendor
+//! cloud and the Home Assistant broker it is a client, which is why every packet type encodes and decodes
+//! in both directions. Two features exist only for the client side — **retained messages** and **will
+//! messages** — because Home Assistant discovery is retained and availability is a last will. The device
+//! uses neither.
+//!
+//! What is **not** implemented: QoS 2, wildcard subscriptions, topic aliases, and session state across
+//! reconnects. Nothing this program talks to needs them.
 
 use core::fmt;
 
@@ -63,6 +69,149 @@ pub enum CodecError {
         /// The length asked for.
         len: usize,
     },
+}
+
+/// The CONNECT flags octet.
+///
+/// A named view of one byte whose bits are otherwise indistinguishable from each other. Six of the
+/// eight are meaningful, and two of those only qualify a seventh: the will QoS and will-retain bits mean
+/// nothing unless the will flag is set.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub struct ConnectFlags(u8);
+
+impl ConnectFlags {
+    /// Start a fresh session rather than resuming one.
+    const CLEAN_SESSION: u8 = 0x02;
+    /// A will topic and message follow the client identifier.
+    const WILL: u8 = 0x04;
+    /// The broker retains the will message.
+    const WILL_RETAIN: u8 = 0x20;
+    /// A password follows.
+    const PASSWORD: u8 = 0x40;
+    /// A username follows.
+    const USERNAME: u8 = 0x80;
+    /// Bits 3–4 hold the will's delivery guarantee.
+    const WILL_QOS_SHIFT: u8 = 3;
+
+    /// Read the octet as it arrived.
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    /// The octet to put on the wire.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// The flags describing a given CONNECT.
+    fn of(connect: &Connect) -> Self {
+        let mut bits = 0x00u8;
+        if connect.username.is_some() {
+            bits |= Self::USERNAME;
+        }
+        if connect.password.is_some() {
+            bits |= Self::PASSWORD;
+        }
+        if connect.clean_session {
+            bits |= Self::CLEAN_SESSION;
+        }
+        if let Some(will) = connect.will.as_ref() {
+            bits |= Self::WILL;
+            bits |= will.qos.bits() << Self::WILL_QOS_SHIFT;
+            if will.retain {
+                bits |= Self::WILL_RETAIN;
+            }
+        }
+        Self(bits)
+    }
+
+    /// Whether a username follows the will fields.
+    pub const fn has_username(self) -> bool {
+        self.0 & Self::USERNAME != 0
+    }
+
+    /// Whether a password follows the username.
+    pub const fn has_password(self) -> bool {
+        self.0 & Self::PASSWORD != 0
+    }
+
+    /// Whether a will topic and message follow the client identifier.
+    pub const fn has_will(self) -> bool {
+        self.0 & Self::WILL != 0
+    }
+
+    /// Whether the broker should retain the will message.
+    pub const fn will_retain(self) -> bool {
+        self.0 & Self::WILL_RETAIN != 0
+    }
+
+    /// Whether the client asked for a fresh session.
+    pub const fn clean_session(self) -> bool {
+        self.0 & Self::CLEAN_SESSION != 0
+    }
+
+    /// The will's delivery guarantee.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::UnsupportedQoS`] if the two bits say 2 or 3.
+    pub const fn will_qos(self) -> Result<QoS, CodecError> {
+        QoS::from_bits((self.0 >> Self::WILL_QOS_SHIFT) & 0x03)
+    }
+}
+
+/// The PUBLISH flags nibble, in the low four bits of the fixed header's first octet.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub struct PublishFlags(u8);
+
+impl PublishFlags {
+    /// The broker retains this message as the topic's last known value.
+    const RETAIN: u8 = 0x01;
+    /// A redelivery of a message already sent.
+    const DUP: u8 = 0x08;
+    /// Bits 1–2 hold the delivery guarantee.
+    const QOS_SHIFT: u8 = 1;
+
+    /// Read the nibble as it arrived.
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    /// The nibble to put on the wire.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// The flags describing a given PUBLISH.
+    const fn of(publish: &Publish) -> Self {
+        let mut bits = publish.qos.bits() << Self::QOS_SHIFT;
+        if publish.retain {
+            bits |= Self::RETAIN;
+        }
+        if publish.dup {
+            bits |= Self::DUP;
+        }
+        Self(bits)
+    }
+
+    /// Whether this is the topic's retained value.
+    pub const fn retain(self) -> bool {
+        self.0 & Self::RETAIN != 0
+    }
+
+    /// Whether this is a redelivery.
+    pub const fn dup(self) -> bool {
+        self.0 & Self::DUP != 0
+    }
+
+    /// The delivery guarantee.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::UnsupportedQoS`] if the two bits say 2 or 3.
+    pub const fn qos(self) -> Result<QoS, CodecError> {
+        QoS::from_bits((self.0 >> Self::QOS_SHIFT) & 0x03)
+    }
 }
 
 /// Delivery guarantee. The device uses QoS 1 for its uplink and subscribes at QoS 1.
@@ -122,6 +271,25 @@ pub struct Connect {
     pub keepalive: u16,
     /// Whether the clean-session flag was set. The device does **not** set it.
     pub clean_session: bool,
+    /// What the broker should publish if this connection dies without a DISCONNECT.
+    ///
+    /// The device sets none, so this is `None` on every CONNECT this program receives. It is set on the
+    /// CONNECT this program *sends* to a Home Assistant broker, where it is the entire availability
+    /// mechanism: a bridge that is killed cannot announce its own absence, so the broker does it.
+    pub will: Option<Will>,
+}
+
+/// A last-will message, published by the broker when a connection drops uncleanly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Will {
+    /// Topic to publish on.
+    pub topic: String,
+    /// Payload to publish.
+    pub payload: Vec<u8>,
+    /// Delivery guarantee for the will publish.
+    pub qos: QoS,
+    /// Whether the broker retains it, so a subscriber connecting later still sees it.
+    pub retain: bool,
 }
 
 /// A PUBLISH packet.
@@ -360,10 +528,10 @@ impl Connect {
             kind: "CONNECT",
             field: "protocol level",
         })?;
-        let flags = reader.u8().ok_or(CodecError::Truncated {
+        let flags = ConnectFlags::from_bits(reader.u8().ok_or(CodecError::Truncated {
             kind: "CONNECT",
             field: "connect flags",
-        })?;
+        })?);
         let keepalive = reader.u16().ok_or(CodecError::Truncated {
             kind: "CONNECT",
             field: "keepalive",
@@ -371,22 +539,33 @@ impl Connect {
 
         let client_id = reader.utf8_string("client identifier")?;
 
-        if flags & 0x04 != 0 {
-            // The device sets no will. Skip the fields rather than fail, so a future firmware that does
-            // set one still connects. The reads are for their side effect on the cursor.
-            let _will_topic = reader.string();
-            let _will_message = reader.string();
-        }
-
-        let username = if flags & 0x80 == 0 {
-            None
+        // The device sets no will, so this is `None` on every CONNECT received here. Decoded rather than
+        // skipped so a round trip stays exact for anything that does set one, and because this program
+        // sends a will of its own to the Home Assistant broker.
+        let will = if flags.has_will() {
+            Some(Will {
+                topic: reader.utf8_string("will topic")?,
+                payload: reader
+                    .string()
+                    .ok_or(CodecError::Truncated {
+                        kind: "CONNECT",
+                        field: "will message",
+                    })?
+                    .to_vec(),
+                qos: flags.will_qos()?,
+                retain: flags.will_retain(),
+            })
         } else {
-            Some(reader.utf8_string("username")?)
+            None
         };
 
-        let password = if flags & 0x40 == 0 {
-            None
+        let username = if flags.has_username() {
+            Some(reader.utf8_string("username")?)
         } else {
+            None
+        };
+
+        let password = if flags.has_password() {
             Some(
                 reader
                     .string()
@@ -396,6 +575,8 @@ impl Connect {
                     })?
                     .to_vec(),
             )
+        } else {
+            None
         };
 
         Ok(Self {
@@ -404,29 +585,24 @@ impl Connect {
             username,
             password,
             keepalive,
-            clean_session: flags & 0x02 != 0,
+            clean_session: flags.clean_session(),
+            will,
         })
     }
 
     /// Encode the body, without the fixed header.
     fn encode_body(&self) -> Vec<u8> {
-        let mut flags = 0x00u8;
-        if self.username.is_some() {
-            flags |= 0x80;
-        }
-        if self.password.is_some() {
-            flags |= 0x40;
-        }
-        if self.clean_session {
-            flags |= 0x02;
-        }
-
         let mut writer = Writer::new();
         writer.string(PROTOCOL_NAME);
         writer.u8(self.protocol_level);
-        writer.u8(flags);
+        writer.u8(ConnectFlags::of(self).bits());
         writer.u16(self.keepalive);
         writer.string(&self.client_id);
+        // Order is fixed by the protocol: will fields, then username, then password.
+        if let Some(will) = self.will.as_ref() {
+            writer.string(&will.topic);
+            writer.bytes(&will.payload);
+        }
         if let Some(username) = self.username.as_deref() {
             writer.string(username);
         }
@@ -444,7 +620,8 @@ impl Publish {
     ///
     /// [`CodecError::UnsupportedQoS`] for QoS 2, or [`CodecError::Truncated`] / [`CodecError::NotUtf8`].
     pub fn decode(body: &[u8], flags: u8) -> Result<Self, CodecError> {
-        let qos = QoS::from_bits((flags >> 1) & 0x03)?;
+        let flags = PublishFlags::from_bits(flags);
+        let qos = flags.qos()?;
         let mut reader = Reader::new(body);
         let topic = reader.utf8_string("topic")?;
 
@@ -460,8 +637,8 @@ impl Publish {
         Ok(Self {
             topic,
             qos,
-            retain: flags & 0x01 != 0,
-            dup: flags & 0x08 != 0,
+            retain: flags.retain(),
+            dup: flags.dup(),
             packet_id,
             payload: reader.rest().to_vec(),
         })
@@ -469,14 +646,7 @@ impl Publish {
 
     /// The flags nibble this publish needs in its fixed header.
     const fn flags(&self) -> u8 {
-        let mut flags = self.qos.bits() << 1;
-        if self.retain {
-            flags |= 0x01;
-        }
-        if self.dup {
-            flags |= 0x08;
-        }
-        flags
+        PublishFlags::of(self).bits()
     }
 
     /// Encode the body, without the fixed header.
@@ -806,7 +976,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{CodecError, Connect, Packet, PacketStream, Publish, QoS, Reader, Subscribe, Writer};
+    use super::{
+        CodecError, Connect, ConnectFlags, PROTOCOL_LEVEL, Packet, PacketStream, Publish, QoS, Reader, Subscribe, Will,
+        Writer,
+    };
 
     const SERIAL: &str = "0EXAMPLE00000001";
 
@@ -860,9 +1033,11 @@ mod tests {
                 password,
                 keepalive,
                 clean_session,
+                will,
             }) => {
                 assert_eq!(protocol_level, 4);
                 assert_eq!(client_id, SERIAL);
+                assert_eq!(will, None, "the device sets no last will");
                 assert_eq!(username.as_deref(), Some(SERIAL));
                 assert_eq!(password.as_deref(), Some(b"Growatt".as_slice()));
                 assert_eq!(keepalive, 420);
@@ -1079,6 +1254,72 @@ mod tests {
         let (decoded, used) = Packet::decode(&wire).expect("decode").expect("complete");
         assert_eq!(used, wire.len());
         assert_eq!(decoded, Packet::Subscribe(original));
+    }
+
+    #[test]
+    fn a_connect_carrying_a_will_round_trips() {
+        // The will is what a broker publishes when this program dies without saying goodbye, so it is
+        // the availability mechanism for Home Assistant. Nothing else in this codebase sends one, which
+        // is exactly why it needs a test of its own.
+        let original = Connect {
+            protocol_level: PROTOCOL_LEVEL,
+            client_id: "heliobridge".to_owned(),
+            username: Some("ha".to_owned()),
+            password: Some(b"secret".to_vec()),
+            keepalive: 60,
+            clean_session: true,
+            will: Some(Will {
+                topic: "heliobridge/0EXAMPLE00000001/availability".to_owned(),
+                payload: b"offline".to_vec(),
+                qos: QoS::AtLeastOnce,
+                retain: true,
+            }),
+        };
+        let wire = Packet::Connect(original.clone()).encode().expect("encode");
+        let (decoded, used) = Packet::decode(&wire).expect("decode").expect("complete");
+        assert_eq!(used, wire.len());
+        assert_eq!(decoded, Packet::Connect(original));
+    }
+
+    #[test]
+    fn the_will_flags_describe_the_will() {
+        let flags = ConnectFlags::of(&Connect {
+            protocol_level: PROTOCOL_LEVEL,
+            client_id: "heliobridge".to_owned(),
+            username: None,
+            password: None,
+            keepalive: 60,
+            clean_session: true,
+            will: Some(Will {
+                topic: "t".to_owned(),
+                payload: b"offline".to_vec(),
+                qos: QoS::AtLeastOnce,
+                retain: true,
+            }),
+        });
+
+        assert!(flags.has_will());
+        assert!(flags.will_retain());
+        assert!(flags.clean_session());
+        assert!(!flags.has_username());
+        assert!(!flags.has_password());
+        assert_eq!(flags.will_qos(), Ok(QoS::AtLeastOnce));
+        // Will + will-QoS-1 + will-retain + clean-session, and nothing else.
+        assert_eq!(flags.bits(), 0x04 | 0x08 | 0x20 | 0x02);
+    }
+
+    #[test]
+    fn a_will_that_is_absent_leaves_every_will_bit_clear() {
+        // The guard on the device's own CONNECT: the relay re-encodes it upstream, so a stray will bit
+        // would be a difference the vendor cloud could see.
+        let (packet, _) = Packet::decode(&device_connect()).expect("decode").expect("complete");
+        let Packet::Connect(connect) = packet else {
+            panic!("not a CONNECT");
+        };
+        let flags = ConnectFlags::of(&connect);
+        assert!(!flags.has_will());
+        assert!(!flags.will_retain());
+        assert_eq!(flags.will_qos(), Ok(QoS::AtMostOnce));
     }
 
     #[test]
