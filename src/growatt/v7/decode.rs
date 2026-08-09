@@ -327,12 +327,20 @@ impl<'a> InputBlock<'a> {
     /// still yields the fields it does carry.
     pub fn read(self, entry: &'static InputRegister) -> Option<Reading> {
         let offset = entry.offset();
-        let raw = self.frame.u16_at(offset)?;
+        let mut raw = self.frame.u16_at(offset)?;
         let value = match entry.kind {
             Kind::Text { registers } => {
                 let len = usize::from(registers).saturating_mul(2);
                 let octets = self.frame.bytes_at(offset, len)?;
                 Value::Text(octets.iter().copied().take_while(|b| *b != 0).map(char::from).collect())
+            }
+            Kind::Float32 => {
+                let low = self.frame.u16_at(offset.checked_add(2)?)?;
+                let wide = (u32::from(raw.get()) << 16) | u32::from(low.get());
+                // `raw` reports the low half, which is the register other maps name and the whole value
+                // while the high half is zero. The scaled value is the one to trust either way.
+                raw = low;
+                Value::Float(entry.scaling.apply_u32(wide))
             }
             Kind::Int | Kind::Float | Kind::Enum(_) => entry.decode(raw),
         };

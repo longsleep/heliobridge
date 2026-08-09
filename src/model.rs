@@ -285,6 +285,14 @@ impl Scaling {
         f64::from(raw.get()).mul_add(self.multiplier, self.delta)
     }
 
+    /// The same, for a raw value that spans two registers.
+    ///
+    /// Separate from [`Self::apply`] because [`Raw`] is a single register by definition, and widening it
+    /// would make every setting in the holding map claim a range it does not have.
+    pub fn apply_u32(self, raw: u32) -> f64 {
+        f64::from(raw).mul_add(self.multiplier, self.delta)
+    }
+
     /// Whether this scaling encodes a signed quantity via a negative delta.
     pub fn is_signed(self) -> bool {
         self.delta < 0.0

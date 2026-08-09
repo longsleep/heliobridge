@@ -472,3 +472,67 @@ fn a_buffered_replay_is_older_than_the_telemetry_it_arrived_with() {
         "replayed {replayed} should predate {current}"
     );
 }
+
+#[test]
+fn the_energy_counters_agree_with_the_days_conditions() {
+    // The counters identified from the capture, checked against the fixture they were found in. The
+    // night-discharge frame is the end of a day that produced 3.2 kWh, of which 1.7 went into the battery
+    // and 1.5 left as AC output.
+    let frame = Frame::parse(FIXTURES[0].wire).expect("parse");
+    let telemetry = Telemetry::from_frame(&frame).expect("decode");
+
+    close(
+        telemetry.value("pv_energy_today").expect("pv"),
+        0.9,
+        "pv today",
+        "night",
+    );
+    let charged = telemetry.value("battery_charge_energy_today").expect("charged");
+    let discharged = telemetry.value("battery_discharge_energy_today").expect("discharged");
+    let output = telemetry.value("ac_output_energy_today").expect("output");
+
+    // Everything a daily counter reports must be at or below the day's production, and none may be
+    // negative — the sanity check that a wrong scaling or a wrong offset would fail.
+    for (name, value) in [("charged", charged), ("discharged", discharged), ("ac output", output)] {
+        assert!((0.0..=10.0).contains(&value), "{name} is implausible at {value} kWh");
+    }
+
+    // The duplicated pair holds one value, exactly as the household-load pair does.
+    close(
+        telemetry.value("ac_output_energy_today_2").expect("duplicate"),
+        output,
+        "duplicate of the AC output counter",
+        "night",
+    );
+}
+
+#[test]
+fn a_thirty_two_bit_counter_reads_both_of_its_registers() {
+    // The high half is zero at these magnitudes, so the value must equal a plain read of the low half —
+    // and the raw reported alongside it must be that low half, which is the register other maps name.
+    let frame = Frame::parse(FIXTURES[0].wire).expect("parse");
+    let telemetry = Telemetry::from_frame(&frame).expect("decode");
+
+    let reading = telemetry.get("pv_energy_today").expect("pv energy today");
+    assert_eq!(reading.register, Register(71), "the entry names the high half");
+    close(
+        reading.as_f64().expect("numeric"),
+        f64::from(reading.raw.get()) * 0.1,
+        "the 32-bit value against a plain read of its low half",
+        "night",
+    );
+
+    // Registers 71..78 are four counters, not eight: nothing else may claim the high halves.
+    for high in [73u16, 75, 77] {
+        assert!(
+            telemetry.readings.iter().any(|r| r.register == Register(high)),
+            "register {high} should be the high half of a counter"
+        );
+    }
+    for low in [72u16, 74, 76, 78] {
+        assert!(
+            !telemetry.readings.iter().any(|r| r.register == Register(low)),
+            "register {low} is a low half and must not be a reading of its own"
+        );
+    }
+}

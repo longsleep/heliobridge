@@ -179,7 +179,7 @@ impl Entity {
 
         // A label has no quantity behind it. Home Assistant rejects a state class on one, and there is
         // nothing to average or accumulate in a work mode in any case.
-        let numeric = matches!(register.kind, Kind::Int | Kind::Float);
+        let numeric = matches!(register.kind, Kind::Int | Kind::Float | Kind::Float32);
         let device_class = numeric
             .then(|| device_class(register.name, register.unit))
             .flatten()
@@ -194,6 +194,18 @@ impl Entity {
             category: diagnostic(register.name, register.confidence),
             shape: Shape::Reading(numeric.then(|| state_class(device_class))),
         })
+    }
+
+    /// The battery pack this entity describes, if it describes one.
+    ///
+    /// Packs are numbered from 1, and the device reports how many are attached. A pack that is not
+    /// attached still occupies its registers, and they read zero — which becomes 0 % for a state of charge
+    /// and **−273.1 °C** for a temperature, since zero kelvin is what the temperature scaling makes of a
+    /// zero raw value. Publishing absolute zero as a reading is worse than publishing nothing.
+    pub fn battery_pack(&self) -> Option<u16> {
+        let rest = self.key.strip_prefix("battery")?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
     }
 
     /// Whether this entity accepts commands.
@@ -263,31 +275,75 @@ fn symbol(unit: Unit) -> Option<&'static str> {
 /// spelled out instead, because the device page is where someone decides whether to touch it — and one of
 /// these disconnects the inverter from the grid.
 fn label(name: &str) -> String {
-    match name {
-        "off_grid_mode" => return "Off-grid mode (stops AC output)".to_owned(),
-        "power_plus" => return "Power+ (raises the output ceiling)".to_owned(),
-        "anti_backflow_enabled" => return "Export limitation".to_owned(),
-        "anti_backflow_power_percent" => return "Export limit".to_owned(),
-        "ac_output_always_on" => return "AC output always on".to_owned(),
-        "grid_power_allowed" => return "Grid charging allowed".to_owned(),
-        _ => {}
+    if let Some(spelled) = NAMED.iter().find(|(field, _)| *field == name) {
+        return spelled.1.to_owned();
     }
 
-    let mut words = name.split('_');
     let mut out = String::with_capacity(name.len());
-    if let Some(first) = words.next() {
-        let mut characters = first.chars();
-        if let Some(initial) = characters.next() {
-            out.extend(initial.to_uppercase());
-            out.push_str(characters.as_str());
+    for (index, word) in name.split('_').enumerate() {
+        if index > 0 {
+            out.push(' ');
         }
-    }
-    for word in words {
-        out.push(' ');
-        out.push_str(word);
+        out.push_str(&word_label(word, index == 0));
     }
     out
 }
+
+/// One word of a field name, capitalised as a person would write it.
+fn word_label(word: &str, first: bool) -> String {
+    // An acronym stays an acronym wherever it appears, including where a digit is stuck to it: `pv1`
+    // reads as `PV1`, not `Pv1`.
+    let letters: String = word.chars().take_while(char::is_ascii_alphabetic).collect();
+    if ACRONYMS.contains(&letters.as_str()) {
+        let mut out = letters.to_uppercase();
+        out.push_str(word.get(letters.len()..).unwrap_or_default());
+        return out;
+    }
+
+    let mut characters = word.chars();
+    match characters.next() {
+        Some(initial) if first => {
+            let mut out: String = initial.to_uppercase().collect();
+            out.push_str(characters.as_str());
+            out
+        }
+        _ => word.to_owned(),
+    }
+}
+
+/// Words that are acronyms rather than words, whatever their position.
+const ACRONYMS: &[&str] = &["ac", "dc", "pv", "soc", "soh", "usb", "id", "ip"];
+
+/// Fields whose name would read badly or understate what they do.
+///
+/// Two of these matter beyond tidiness: the device page is where someone decides whether to touch a
+/// switch, and one of them disconnects the inverter from the grid.
+const NAMED: &[(&str, &str)] = &[
+    ("off_grid_mode", "Off-grid mode (stops AC output)"),
+    ("power_plus", "Power+ (raises the output ceiling)"),
+    ("anti_backflow_enabled", "Export limitation"),
+    ("anti_backflow_power_percent", "Export limit"),
+    ("grid_power_allowed", "Grid charging allowed"),
+    ("always_on", "Always on"),
+    ("battery_soc_total", "Battery state of charge"),
+    ("battery_soh", "Battery health"),
+    ("battery_charge_status", "Battery status"),
+    ("battery_charge_power", "Battery power"),
+    ("battery_charge_energy_today", "Battery charged today"),
+    ("battery_discharge_energy_today", "Battery discharged today"),
+    ("ac_output_energy_today", "AC output today"),
+    ("ac_output_energy_today_2", "AC output today (duplicate)"),
+    ("energy_today", "Energy today"),
+    ("pv_power_total", "Solar power"),
+    ("household_load_total", "Household load"),
+    ("household_load_excl_groplug", "Household load, excluding plugs"),
+    ("charge_limit_upper", "Charge limit, upper"),
+    ("charge_limit_lower", "Charge limit, lower"),
+    ("default_output_power", "Output power"),
+    ("device_temp", "Device temperature"),
+    ("battery1_temp", "Battery temperature"),
+    ("wifi_signal", "Wi-Fi signal"),
+];
 
 #[cfg(test)]
 mod tests {
@@ -355,7 +411,7 @@ mod tests {
         // A `total_increasing` reading that is not a counter would make the Energy dashboard read a fall
         // as a reset and count the next value as fresh energy.
         assert_eq!(
-            reading("energy_today").shape,
+            reading("pv_energy_today").shape,
             Shape::Reading(Some(StateClass::TotalIncreasing))
         );
         assert_eq!(reading("ac_power").shape, Shape::Reading(Some(StateClass::Measurement)));
@@ -368,11 +424,41 @@ mod tests {
     #[test]
     fn device_classes_follow_the_unit_except_where_it_cannot() {
         assert_eq!(reading("ac_power").device_class, Some("power"));
-        assert_eq!(reading("energy_today").device_class, Some("energy"));
+        assert_eq!(reading("pv_energy_today").device_class, Some("energy"));
         assert_eq!(reading("battery1_temp").device_class, Some("temperature"));
         // A percentage that is a charge level, against one that is not.
         assert_eq!(reading("battery_soc_total").device_class, Some("battery"));
         assert_eq!(setting("anti_backflow_power_percent").device_class, None);
+    }
+
+    #[test]
+    fn per_pack_entities_name_the_pack_they_describe() {
+        // What lets an absent pack be left unpublished: its registers read zero, which the temperature
+        // scaling turns into absolute zero.
+        assert_eq!(reading("battery1_soc").battery_pack(), Some(1));
+        assert_eq!(reading("battery2_temp").battery_pack(), Some(2));
+        assert_eq!(reading("battery4_soc").battery_pack(), Some(4));
+
+        // Battery-wide readings belong to no single pack and are always published.
+        for key in ["battery_soc_total", "battery_charge_power", "battery_cycles"] {
+            assert_eq!(reading(key).battery_pack(), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn an_absent_pack_would_report_absolute_zero() {
+        // The reason the pack count is consulted at all, pinned so nobody removes the check as redundant.
+        let entry = INPUT_REGISTERS
+            .iter()
+            .find(|entry| entry.name == "battery2_temp")
+            .expect("battery2_temp");
+        let absent = entry.decode(crate::model::Raw(0));
+        match absent {
+            crate::model::Value::Float(celsius) => {
+                assert!(celsius < -273.0, "an unattached pack decodes to {celsius} °C");
+            }
+            other => panic!("expected a temperature, got {other:?}"),
+        }
     }
 
     #[test]
@@ -394,7 +480,7 @@ mod tests {
             let Shape::Reading(state_class) = entity.shape else {
                 panic!("{} is not a reading", entity.key);
             };
-            let numeric = matches!(register.kind, Kind::Int | Kind::Float);
+            let numeric = matches!(register.kind, Kind::Int | Kind::Float | Kind::Float32);
             assert_eq!(
                 state_class.is_some(),
                 numeric,
@@ -422,8 +508,14 @@ mod tests {
 
     #[test]
     fn names_read_as_prose() {
-        assert_eq!(setting("charge_limit_upper").name, "Charge limit upper");
-        assert_eq!(reading("battery_soc_total").name, "Battery soc total");
+        // Derived from the field name where that reads well ...
+        assert_eq!(setting("slot1_output_power").name, "Slot1 output power");
+        // ... with acronyms kept as acronyms, including where a digit is stuck to one ...
+        assert_eq!(reading("pv1_voltage").name, "PV1 voltage");
+        assert_eq!(reading("ac_power").name, "AC power");
+        // ... and spelled out where the field name would read badly.
+        assert_eq!(reading("battery_soc_total").name, "Battery state of charge");
+        assert_eq!(setting("charge_limit_upper").name, "Charge limit, upper");
     }
 
     #[test]

@@ -37,6 +37,15 @@ pub enum Kind {
     Int,
     /// A scaled physical quantity.
     Float,
+    /// A scaled physical quantity whose raw value is a 32-bit integer across two registers.
+    ///
+    /// Not an IEEE float: the raw value is an integer like any other, and [`Scaling`] turns it into the
+    /// quantity. The entry's register is the **high** half and the low half follows it, which is the
+    /// order the vendor's own documentation uses for its 32-bit fields.
+    ///
+    /// Cumulative counters use this. Reading the low half alone is indistinguishable while the high half
+    /// is zero, and silently wrong afterwards.
+    Float32,
     /// An index into a set of labels.
     Enum(&'static [&'static str]),
     /// ASCII text spanning `registers` consecutive registers.
@@ -82,6 +91,24 @@ impl InputRegister {
             register: Register(register),
             name,
             kind: Kind::Float,
+            unit,
+            scaling,
+            confidence,
+        }
+    }
+
+    /// A scaled physical quantity carried by this register and the one after it, high half first.
+    pub const fn float32(
+        register: u16,
+        name: &'static str,
+        unit: Unit,
+        scaling: Scaling,
+        confidence: Confidence,
+    ) -> Self {
+        Self {
+            register: Register(register),
+            name,
+            kind: Kind::Float32,
             unit,
             scaling,
             confidence,
@@ -166,10 +193,10 @@ impl InputRegister {
                 raw: raw.get(),
                 label: labels.get(usize::from(raw.get())).copied(),
             },
-            // Text spans several registers, so a single raw value cannot produce it. Sharing the
-            // `Int` body is deliberate rather than an oversight: the decoder reads text octets
-            // directly, and this arm exists only to keep the match exhaustive.
-            Kind::Int | Kind::Text { .. } => Value::Int(raw.get()),
+            // Text and Float32 each span two or more registers, so a single raw value cannot produce
+            // either. Sharing the `Int` body is deliberate rather than an oversight: the decoder reads
+            // both directly from the frame, and these arms exist to keep the match exhaustive.
+            Kind::Int | Kind::Text { .. } | Kind::Float32 => Value::Int(raw.get()),
         }
     }
 }
@@ -207,13 +234,44 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::float(29, "battery1_soc", Percent, Scaling::UNIT, Verified),
         Entry::float(30, "battery1_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
         Entry::float(41, "battery2_soc", Percent, Scaling::UNIT, Observed),
+        // The per-pack block repeats every 12 registers, so the temperature of pack n sits one past its
+        // state of charge. Inferred from that symmetry alone: the reference device has one pack, which
+        // leaves 42, 54 and 66 reading zero exactly as the unused state-of-charge registers do.
+        Entry::float(42, "battery2_temp", Celsius, Scaling::KELVIN_TENTHS, Inferred),
         Entry::float(53, "battery3_soc", Percent, Scaling::UNIT, Observed),
+        Entry::float(54, "battery3_temp", Celsius, Scaling::KELVIN_TENTHS, Inferred),
         Entry::float(65, "battery4_soc", Percent, Scaling::UNIT, Observed),
-        Entry::float(71, "unknown_71", NoUnit, Scaling::UNIT, Inferred),
-        Entry::float(72, "energy_today", KilowattHour, Scaling::TENTHS, Verified),
-        Entry::float(74, "energy_month", KilowattHour, Scaling::TENTHS, Observed),
-        Entry::float(76, "energy_year", KilowattHour, Scaling::TENTHS, Observed),
-        Entry::float(78, "energy_total", KilowattHour, Scaling::TENTHS, Verified),
+        Entry::float(66, "battery4_temp", Celsius, Scaling::KELVIN_TENTHS, Inferred),
+        // Four 32-bit counters, each high half first. The high halves read zero throughout the capture,
+        // so a 16-bit read of the low half alone gives the same answer today and a wrong one past
+        // 6553.5 kWh. Named for what they count: another implementation calls these PV energy, and the
+        // day's figures agree — production exceeds AC output by what went into the battery.
+        Entry::float32(71, "pv_energy_today", KilowattHour, Scaling::TENTHS, Verified),
+        Entry::float32(73, "pv_energy_month", KilowattHour, Scaling::TENTHS, Observed),
+        Entry::float32(75, "pv_energy_year", KilowattHour, Scaling::TENTHS, Observed),
+        Entry::float32(77, "pv_energy_total", KilowattHour, Scaling::TENTHS, Verified),
+        // Daily counters, reset at midnight. 79 and 80 separate cleanly by the sign of register 11:
+        // across 12 426 frames, 80 rose only while charging and 79 only while discharging, without
+        // exception. The scaling is confirmed by capacity — 80 rising 17 over a 5..100 % climb implies
+        // 1.79 kWh usable against a 2.048 kWh pack.
+        Entry::float(
+            79,
+            "battery_discharge_energy_today",
+            KilowattHour,
+            Scaling::TENTHS,
+            Verified,
+        ),
+        Entry::float(
+            80,
+            "battery_charge_energy_today",
+            KilowattHour,
+            Scaling::TENTHS,
+            Verified,
+        ),
+        // 81 and 82 hold the same value in every frame, as 16 and 17 do. Named for what is certain: the
+        // reference installation never imported, so nothing separates AC output from energy exported.
+        Entry::float(81, "ac_output_energy_today", KilowattHour, Scaling::TENTHS, Observed),
+        Entry::float(82, "ac_output_energy_today_2", KilowattHour, Scaling::TENTHS, Observed),
         Entry::float(90, "charge_limit_upper", Percent, Scaling::UNIT, Verified),
         Entry::float(91, "charge_limit_lower", Percent, Scaling::UNIT, Verified),
         Entry::float(92, "pv1_voltage", Volt, Scaling::HUNDREDTHS, Observed),
