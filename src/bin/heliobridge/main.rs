@@ -247,6 +247,9 @@ impl<'a> Bridge<'a> {
 
     /// Serve the device until interrupted.
     fn serve(self) -> Result<(), String> {
+        // Read before binding, so a mistyped allowlist fails at startup rather than after the device has
+        // already been refused for an hour.
+        let peers = self.config.peers()?;
         let options = server::SessionOptions {
             time_push: self.config.should_push_time(),
             cloud: self.cloud,
@@ -254,7 +257,15 @@ impl<'a> Bridge<'a> {
             recorder: self.recorder,
             slots: self.config.slots,
             registry: self.registry,
+            devices: self.config.devices(),
         };
+        if !peers.is_open() || !options.devices.is_open() {
+            tracing::info!(
+                accept_from = %peers,
+                serve_devices = %options.devices,
+                "connections are filtered; anything else is refused"
+            );
+        }
         if options.time_push {
             // The device is sent *local* time, so an operator whose host runs UTC — a container default —
             // would set the device's clock wrong by the zone offset, and nothing in the protocol would say
@@ -278,7 +289,7 @@ impl<'a> Bridge<'a> {
                 }
             };
 
-            server::serve(listen, server_tls, options, shutdown)
+            server::serve(listen, server_tls, options, peers, shutdown)
                 .await
                 .map_err(|error| format!("listener failed: {}", chain(&error)))
         })?;

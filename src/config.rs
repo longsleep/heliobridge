@@ -15,6 +15,7 @@ use crate::homeassistant::command::Permitted;
 use crate::homeassistant::publisher::{self, PublisherOptions};
 use crate::homeassistant::topics::{self, Topics};
 use crate::record::{self, RecorderConfig};
+use crate::server::access::{Devices, Peers};
 
 /// Default device-facing listener address.
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:7006";
@@ -44,6 +45,29 @@ pub struct Config {
     /// Where to keep the generated certificate and cached state.
     #[arg(long, env = "HELIOBRIDGE_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
     pub state_dir: PathBuf,
+
+    /// Addresses and networks the device may connect from. Empty accepts any.
+    ///
+    /// Comma-separated, IPv4 and IPv6, addresses or networks:
+    /// `192.168.2.238,192.168.2.0/24,2001:db8::/32`. A connection from anywhere else is dropped before the
+    /// TLS handshake. An entry that cannot be read is a startup failure rather than one that matches
+    /// nothing, since the failure mode of a mistyped list is a device that silently stops connecting.
+    ///
+    /// Listing one address family does not deny the other — a list says what is allowed, and a family
+    /// nobody mentioned is simply absent from it. Loopback is not implicit either: list `127.0.0.1` and
+    /// `::1` if something local has to reach the device listener. The control socket is unaffected, being a
+    /// Unix socket rather than a network listener.
+    #[arg(long, env = "HELIOBRIDGE_ALLOW_FROM", default_value = "")]
+    pub allow_from: String,
+
+    /// Device serials to serve. Empty serves any.
+    ///
+    /// Comma-separated. Checked at CONNECT, before the session registers, so a device that is not listed
+    /// never reaches the control API, never gets a Home Assistant entity and never has a frame recorded. It
+    /// is answered with a CONNACK refusal rather than a dropped socket, so the reason is visible in a
+    /// capture.
+    #[arg(long, env = "HELIOBRIDGE_ALLOW_DEVICES", default_value = "")]
+    pub allow_devices: String,
 
     /// Record every frame here for later analysis. Off unless set.
     ///
@@ -295,6 +319,21 @@ impl Config {
             (Some(_), None) => Err("--mqtt-client-cert needs --mqtt-client-key".to_owned()),
             (None, Some(_)) => Err("--mqtt-client-key needs --mqtt-client-cert".to_owned()),
         }
+    }
+
+    /// Which addresses the device may connect from.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the entry that could not be read. Startup fails rather than continuing with a list
+    /// that admits less than the operator wrote — locking the device out is worse than not filtering.
+    pub fn peers(&self) -> Result<Peers, String> {
+        Peers::parse(&self.allow_from).map_err(|error| format!("--allow-from: {error}"))
+    }
+
+    /// Which device serials to serve.
+    pub fn devices(&self) -> Devices {
+        Devices::parse(&self.allow_devices)
     }
 
     /// What everything is called on the broker.

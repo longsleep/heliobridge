@@ -62,6 +62,7 @@ rcgen = { version = "0.14.8", features = ["aws_lc_rs"] }
 rustls-native-certs = "0.8"
 url = "2"
 gethostname = "1.1.0"
+ipnet = "2.11"    # CIDR containment for the source allowlist
 
 [dev-dependencies]
 # `test-util` gives the paused clock, so a test can prove the 4.5-second time push fires without

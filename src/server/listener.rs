@@ -24,6 +24,7 @@ use crate::control::Registry;
 use crate::growatt::cloud::CloudRelay;
 use crate::growatt::policy::Policy;
 use crate::record::Recorder;
+use crate::server::access::{Devices, Peers};
 use crate::server::session::Session;
 
 /// Why the listener stopped.
@@ -67,6 +68,9 @@ pub struct SessionOptions {
 
     /// Where sessions announce themselves so the control API can address them by device.
     pub registry: Option<Registry>,
+
+    /// Which device serials may be served. Empty admits any.
+    pub devices: Devices,
 }
 
 impl Default for SessionOptions {
@@ -78,6 +82,7 @@ impl Default for SessionOptions {
             recorder: None,
             slots: 1,
             registry: None,
+            devices: Devices::default(),
         }
     }
 }
@@ -92,6 +97,7 @@ pub async fn serve(
     address: std::net::SocketAddr,
     tls: Arc<ServerConfig>,
     options: SessionOptions,
+    peers: Peers,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), ListenerError> {
     let listener = TcpListener::bind(address).await.context(BindSnafu { address })?;
@@ -104,6 +110,8 @@ pub async fn serve(
         recording = options.recorder.is_some(),
         mode = ?options.policy.mode,
         answers = ?options.policy.answers,
+        accept_from = %peers,
+        serve_devices = %options.devices,
         "listening for the device"
     );
 
@@ -126,6 +134,14 @@ pub async fn serve(
                         continue;
                     }
                 };
+                // Before the handshake, so an unwanted peer costs a socket and a log line rather than a
+                // certificate exchange — and so nothing it sends is ever parsed.
+                if !peers.admits(peer.ip()) {
+                    tracing::warn!(%peer, allowed = %peers, "refusing a connection from an address that is not allowed");
+                    drop(stream);
+                    continue;
+                }
+
                 let acceptor = acceptor.clone();
                 let options = options.clone();
                 tokio::spawn(async move {
@@ -166,7 +182,8 @@ async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcce
         .with_policy(options.policy)
         .with_recorder(options.recorder)
         .with_slots(options.slots)
-        .with_registry(options.registry);
+        .with_registry(options.registry)
+        .with_devices(options.devices);
 
     match session.run().await {
         Ok(stats) => tracing::info!(
@@ -203,7 +220,7 @@ fn flatten(error: &dyn std::error::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionOptions;
+    use super::{Devices, Peers, SessionOptions};
     use crate::growatt::cloud::{CloudConfig, CloudRelay};
     use crate::growatt::policy::Policy;
     use crate::mqtt::Trust;
@@ -231,9 +248,20 @@ mod tests {
             recorder: None,
             slots: 1,
             registry: None,
+            devices: Devices::default(),
         };
         assert!(options.cloud.is_some());
         assert!(!options.time_push);
+    }
+
+    #[test]
+    fn nothing_is_filtered_until_a_list_says_so() {
+        // Both allowlists are opt-in: the common case is one device on an isolated VLAN, which needs
+        // neither, and a default that filtered would lock that device out on upgrade.
+        let options = SessionOptions::default();
+        assert!(options.devices.is_open(), "any serial is served");
+        assert!(Peers::default().is_open(), "any address may connect");
+        assert!(Peers::default().admits("203.0.113.9".parse().expect("an address")));
     }
 
     #[test]

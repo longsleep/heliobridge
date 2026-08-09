@@ -66,6 +66,8 @@ environment variable; `--help` documents each one in full.
 | `HELIOBRIDGE_TLS_CERT` / `_KEY` | generated | Certificate presented to the device |
 | `HELIOBRIDGE_STATE_DIR` | `/var/lib/heliobridge` | Generated certificate and cached state |
 | `HELIOBRIDGE_CONTROL_SOCKET` | off | Unix socket for the control API, mode 0600 |
+| `HELIOBRIDGE_ALLOW_FROM` | any | Addresses and networks the device may connect from |
+| `HELIOBRIDGE_ALLOW_DEVICES` | any | Device serials to serve |
 | `HELIOBRIDGE_SLOTS` | `1` | How many of the nine schedule slots to expose |
 | `HELIOBRIDGE_MQTT_URL` | off | Broker to publish to: `mqtt://host[:port]` or `mqtts://host[:port]` |
 | `HELIOBRIDGE_MQTT_USER` / `_PASS` | *(unset)* | Broker credentials |
@@ -82,6 +84,28 @@ environment variable; `--help` documents each one in full.
 | `HELIOBRIDGE_RELAY_ANSWERS` | `cloud-only` | Which answers to earlier commands reach the cloud |
 | `HELIOBRIDGE_RECORD_DIR` | off | Record raw frames for analysis |
 | `HELIOBRIDGE_LOG` | `info` | Tracing filter, per subsystem |
+
+### Who may connect
+
+Both allowlists are empty by default, and empty admits everything — one device on an isolated VLAN needs
+neither. They are comma-separated:
+
+```sh
+HELIOBRIDGE_ALLOW_FROM=192.168.2.238,192.168.2.0/24,2001:db8::/32,fe80::/10
+HELIOBRIDGE_ALLOW_DEVICES=0EXAMPLE00000001
+```
+
+An address that is not allowed is dropped on `accept`, before the TLS handshake. A serial that is not
+allowed is answered with a CONNACK refusal at connect, before the session registers — so it never reaches
+the control API, never becomes a Home Assistant entity and never has a frame recorded.
+
+Both lists say what is *allowed*, and nothing else is implicit. Listing only IPv4 does not deny IPv6, and
+loopback is not admitted unless `127.0.0.1` or `::1` is listed. An entry that cannot be parsed is a startup
+failure, because the failure mode of a mistyped list is a device that silently stops connecting.
+
+Neither replaces network isolation. The protocol's credentials are the serial plus a fixed string, so they
+identify rather than authenticate, and the serial crosses a connection whose certificate the device does not
+verify — anyone positioned to capture one already has it.
 
 A relative `HELIOBRIDGE_MQTT_PASS_FILE` is resolved inside `$CREDENTIALS_DIRECTORY`, which systemd sets
 for a unit using `LoadCredential=`:

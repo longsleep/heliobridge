@@ -34,6 +34,7 @@ use crate::growatt::{Codec, peek_version};
 use crate::model::{Confidence, Hex, Raw, Register, Timestamp, Unit};
 use crate::mqtt::{Packet, PacketStream, Publish, QoS, StreamError};
 use crate::record::{Recorder, Stream as RecordStream};
+use crate::server::access::Devices;
 use crate::server::clock::{Clock, Skew};
 use crate::{TARGET_VALUES, TARGET_WIRE};
 
@@ -52,6 +53,12 @@ pub const MAX_PACKET_LEN: usize = 64 * 1024;
 
 /// QoS granted in every SUBACK. See the module documentation.
 pub const GRANTED_QOS: u8 = 0x01;
+
+/// CONNACK return code for a device that is not on the serial allowlist.
+///
+/// MQTT 3.1.1's "not authorized". The device retries regardless of what it is told, so the code is for
+/// whoever reads the capture rather than for the device.
+pub const CONNACK_NOT_AUTHORISED: u8 = 0x05;
 
 /// How long after connect to send the server time push.
 ///
@@ -172,6 +179,8 @@ pub struct Session<S> {
     read_deadline: Option<Instant>,
     settings: BTreeMap<Register, Raw>,
     registry: Option<Registry>,
+    /// Which device serials may be served. Empty admits any.
+    devices: Devices,
     /// Requests from the control API, once this session has registered itself.
     requests: Option<mpsc::Receiver<ControlRequest>>,
     /// Where to publish settings so the API can answer reads without device traffic.
@@ -273,6 +282,7 @@ where
             read_deadline: None,
             settings: BTreeMap::new(),
             registry: None,
+            devices: Devices::default(),
             requests: None,
             settings_out: None,
             identity_out: None,
@@ -287,6 +297,13 @@ where
     #[must_use]
     pub fn with_registry(mut self, registry: Option<Registry>) -> Self {
         self.registry = registry;
+        self
+    }
+
+    /// Serve only these device serials. Empty admits any.
+    #[must_use]
+    pub fn with_devices(mut self, devices: Devices) -> Self {
+        self.devices = devices;
         self
     }
 
@@ -449,6 +466,24 @@ where
                     // but a log that habitually prints credentials is a bad habit to establish.
                     "device connected"
                 );
+                // Checked here, before anything else happens with the serial: a refused device must not
+                // register, must not have a relay dialled as it, and must not have a frame recorded. The
+                // refusal is a CONNACK rather than a dropped socket, so the reason is visible in a capture —
+                // the device retries either way.
+                if !self.devices.admits(&connect.client_id) {
+                    tracing::warn!(
+                        client_id = %connect.client_id,
+                        allowed = %self.devices,
+                        "refusing a device that is not on the allowlist"
+                    );
+                    self.send(&Packet::ConnAck {
+                        session_present: false,
+                        code: CONNACK_NOT_AUTHORISED,
+                    })
+                    .await?;
+                    return Ok(Flow::Stop);
+                }
+
                 self.device_id = Some(connect.client_id);
                 self.send(&Packet::ConnAck {
                     session_present: false,
@@ -1534,7 +1569,10 @@ enum Woke {
 
 #[cfg(test)]
 mod tests {
-    use super::{Clock, Frame, GRANTED_QOS, MessageType, Raw, Session, TIME_PUSH_DELAY, Timestamp};
+    use super::{
+        CONNACK_NOT_AUTHORISED, Clock, Devices, Frame, GRANTED_QOS, MessageType, Raw, Session, TIME_PUSH_DELAY,
+        Timestamp,
+    };
     use crate::mqtt::{Connect, Packet, Publish, QoS, Subscribe};
 
     const SERIAL: &str = "0EXAMPLE00000001";
@@ -1617,6 +1655,61 @@ mod tests {
             buf = buf.get(used..).expect("advance");
         }
         out
+    }
+
+    /// Drive a session that serves only the given serials.
+    async fn drive_allowing(script: &[u8], devices: Devices) -> Vec<Packet> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut full = script.to_vec();
+        full.extend_from_slice(&[0xE0, 0x00]);
+        client.write_all(&full).await.expect("buffered");
+
+        let mut session = Session::new(server).with_devices(devices);
+        session.run().await.expect("session should end cleanly");
+        drop(session);
+
+        let mut replies = Vec::new();
+        client.read_to_end(&mut replies).await.expect("read replies");
+        packets(&replies)
+    }
+
+    #[tokio::test]
+    async fn a_device_not_on_the_allowlist_is_refused_at_connect() {
+        // Refused before anything is done with the serial: no registration, no relay dialled as it, and
+        // nothing recorded. A CONNACK rather than a dropped socket, so a capture says why.
+        let mut script = connect_packet();
+        script.extend_from_slice(&subscribe_packet());
+        let replies = drive_allowing(&script, Devices::parse("0EXAMPLE99999999")).await;
+
+        assert!(
+            matches!(
+                replies.first(),
+                Some(Packet::ConnAck {
+                    session_present: false,
+                    code: CONNACK_NOT_AUTHORISED
+                })
+            ),
+            "{replies:?}"
+        );
+        assert_eq!(replies.len(), 1, "the session ends there: {replies:?}");
+    }
+
+    #[tokio::test]
+    async fn a_device_on_the_allowlist_is_served_normally() {
+        let mut script = connect_packet();
+        script.extend_from_slice(&subscribe_packet());
+        let replies = drive_allowing(&script, Devices::parse(SERIAL)).await;
+
+        assert!(matches!(
+            replies.first(),
+            Some(Packet::ConnAck {
+                session_present: false,
+                code: 0
+            })
+        ));
+        assert!(replies.iter().any(|p| matches!(p, Packet::SubAck { .. })));
     }
 
     #[tokio::test]
