@@ -28,4 +28,4 @@ pub mod tls;
 pub use clock::Clock;
 pub use listener::{ListenerError, SessionOptions, serve};
 pub use session::{Session, SessionError, SessionStats};
-pub use tls::{CertificateOrigin, TlsError, server_config};
+pub use tls::{CertificateOrigin, TlsError, client_identity, server_config};

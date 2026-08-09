@@ -20,6 +20,8 @@ use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use snafu::{ResultExt, Snafu};
 
+use crate::mqtt::ClientIdentity;
+
 /// Subject common name of a generated certificate.
 pub const GENERATED_CN: &str = "*.growatt.com";
 
@@ -181,6 +183,22 @@ fn write_private(path: &Path, contents: &str) -> Result<(), TlsError> {
         })?;
     }
     Ok(())
+}
+
+/// Load a client certificate and its key, to present to a peer that authenticates clients by
+/// certificate.
+///
+/// Uses the same loaders as the device-facing certificate, so the accepted formats and the error
+/// messages are the ones an operator has already seen.
+///
+/// # Errors
+///
+/// [`TlsError`] if either file cannot be read, holds nothing of the expected kind, or is malformed.
+pub fn client_identity(certificate: &Path, key: &Path) -> Result<ClientIdentity, TlsError> {
+    Ok(ClientIdentity {
+        chain: load_certificates(certificate)?,
+        key: load_key(key)?,
+    })
 }
 
 /// Load a PEM certificate chain.

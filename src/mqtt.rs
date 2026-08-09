@@ -18,6 +18,7 @@
 use core::fmt;
 use std::sync::Arc;
 
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
@@ -85,6 +86,25 @@ pub enum TrustError {
         /// What the loader complained about, if anything.
         problems: Vec<String>,
     },
+
+    /// The client certificate and key do not form a usable pair.
+    #[error("the client certificate and key cannot be used together: {reason}")]
+    UnusableIdentity {
+        /// What rustls said.
+        reason: String,
+    },
+}
+
+/// A certificate chain and key to present when a peer authenticates clients by certificate.
+///
+/// Held rather than loaded here: reading files belongs to the layer that already reports file problems by
+/// path, and keeping it out means this module needs no I/O.
+#[derive(Debug)]
+pub struct ClientIdentity {
+    /// The certificate chain, leaf first.
+    pub chain: Vec<CertificateDer<'static>>,
+    /// The matching private key.
+    pub key: PrivateKeyDer<'static>,
 }
 
 /// Which certificate authorities outbound TLS trusts.
@@ -150,24 +170,42 @@ impl Trust {
         }
     }
 
-    /// Load these anchors into a shareable TLS configuration.
+    /// Load these anchors into a shareable TLS configuration that presents no certificate.
     ///
     /// # Errors
     ///
     /// [`TrustError`], as [`Self::roots`].
     pub fn client_tls(self) -> Result<ClientTls, TrustError> {
+        self.client_tls_with(None)
+    }
+
+    /// The same, optionally presenting a client certificate.
+    ///
+    /// A certificate is how a broker can authenticate this program without a shared secret. It is per
+    /// *peer*, not per process — the vendor cloud is never sent one — which is why this takes it as an
+    /// argument rather than reading it from the environment like the anchors.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError`], as [`Self::roots`], or [`TrustError::UnusableIdentity`] if the certificate and key
+    /// do not form a usable pair.
+    pub fn client_tls_with(self, identity: Option<ClientIdentity>) -> Result<ClientTls, TrustError> {
         let roots = self.roots()?;
-        tracing::info!(
-            trust = self.as_str(),
-            anchors = roots.len(),
-            "outbound TLS trust anchors loaded"
-        );
+        let anchors = roots.len();
+        let builder = ClientConfig::builder().with_root_certificates(roots);
+
+        let config = match identity {
+            None => builder.with_no_client_auth(),
+            Some(identity) => builder
+                .with_client_auth_cert(identity.chain, identity.key)
+                .map_err(|error| TrustError::UnusableIdentity {
+                    reason: error.to_string(),
+                })?,
+        };
+
+        tracing::info!(trust = self.as_str(), anchors, "outbound TLS trust anchors loaded");
         Ok(ClientTls {
-            config: Arc::new(
-                ClientConfig::builder()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
-            ),
+            config: Arc::new(config),
             trust: self,
         })
     }

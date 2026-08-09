@@ -70,6 +70,42 @@ pub struct Config {
     #[arg(long, env = "HELIOBRIDGE_SLOTS", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=9))]
     pub slots: u16,
 
+    /// Broker to publish Home Assistant entities to.
+    ///
+    /// `mqtt://host[:port]` for a plain connection, `mqtts://host[:port]` for TLS. Home Assistant
+    /// publishing is off entirely while this is unset.
+    #[arg(long, env = "HELIOBRIDGE_MQTT_URL")]
+    pub mqtt_url: Option<String>,
+
+    /// Username for the broker, if it wants one.
+    #[arg(long, env = "HELIOBRIDGE_MQTT_USER")]
+    pub mqtt_user: Option<String>,
+
+    /// Password for the broker.
+    ///
+    /// Prefer `--mqtt-pass-file`: an environment variable is readable through `/proc`, appears in a
+    /// systemd unit, and is inherited by anything this process spawns.
+    #[arg(long, env = "HELIOBRIDGE_MQTT_PASS")]
+    pub mqtt_pass: Option<String>,
+
+    /// File holding the broker password, read at startup.
+    ///
+    /// A relative path is resolved inside `$CREDENTIALS_DIRECTORY` when systemd provides one, so
+    /// `LoadCredential=mqtt-pass:/etc/heliobridge/mqtt.pass` pairs with `--mqtt-pass-file mqtt-pass`.
+    /// Trailing newlines are stripped. Takes precedence over `--mqtt-pass`.
+    #[arg(long, env = "HELIOBRIDGE_MQTT_PASS_FILE")]
+    pub mqtt_pass_file: Option<PathBuf>,
+
+    /// PEM certificate chain to present to the broker, for a broker that authenticates by certificate.
+    ///
+    /// Only meaningful with `mqtts://`. Requires `--mqtt-client-key`.
+    #[arg(long, env = "HELIOBRIDGE_MQTT_CLIENT_CERT")]
+    pub mqtt_client_cert: Option<PathBuf>,
+
+    /// PEM private key matching `--mqtt-client-cert`.
+    #[arg(long, env = "HELIOBRIDGE_MQTT_CLIENT_KEY")]
+    pub mqtt_client_key: Option<PathBuf>,
+
     /// Relay device traffic to the Growatt cloud, so the vendor app keeps working.
     ///
     /// How much authority the cloud then keeps is a separate decision — see `--relay-mode`, which also
@@ -171,6 +207,46 @@ impl Config {
             host: self.cloud_host.clone(),
             port: self.cloud_port,
         })
+    }
+
+    /// The broker password, from a file if one was named and from the environment otherwise.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the file if it cannot be read. Startup fails rather than continuing without a
+    /// password, which would present as an authentication failure against the broker and send the reader
+    /// looking at the broker's configuration instead of at a missing file.
+    pub fn mqtt_password(&self) -> Result<Option<String>, String> {
+        let Some(path) = self.mqtt_pass_file.as_ref() else {
+            return Ok(self.mqtt_pass.clone());
+        };
+
+        // systemd puts credentials in a directory it names, with the unit referring to them by bare name.
+        // An absolute path is used as given, so this only ever adds a way to spell it.
+        let path = match std::env::var_os("CREDENTIALS_DIRECTORY") {
+            Some(dir) if path.is_relative() => PathBuf::from(dir).join(path),
+            _ => path.clone(),
+        };
+
+        let secret = std::fs::read_to_string(&path)
+            .map_err(|error| format!("could not read the broker password from {}: {error}", path.display()))?;
+        // A file written with an editor ends in a newline, which is not part of the password.
+        Ok(Some(secret.trim_end_matches(['\r', '\n']).to_owned()))
+    }
+
+    /// The client certificate and key to present to the broker, if both were named.
+    ///
+    /// # Errors
+    ///
+    /// A message if only one of the pair was given: a certificate without its key cannot authenticate
+    /// anything, and silently ignoring half of it would look like the broker rejecting valid credentials.
+    pub fn mqtt_client_identity(&self) -> Result<Option<(PathBuf, PathBuf)>, String> {
+        match (self.mqtt_client_cert.as_ref(), self.mqtt_client_key.as_ref()) {
+            (Some(cert), Some(key)) => Ok(Some((cert.clone(), key.clone()))),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err("--mqtt-client-cert needs --mqtt-client-key".to_owned()),
+            (None, Some(_)) => Err("--mqtt-client-key needs --mqtt-client-cert".to_owned()),
+        }
     }
 
     /// Where to record frames, or `None` when recording is off.

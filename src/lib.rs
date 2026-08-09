@@ -31,6 +31,7 @@
 pub mod config;
 pub mod control;
 pub mod growatt;
+pub mod homeassistant;
 pub mod model;
 pub mod mqtt;
 pub mod record;
