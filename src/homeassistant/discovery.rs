@@ -15,6 +15,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::control::IdentityView;
+use crate::growatt::product::Product;
 use crate::homeassistant::broker::Publication;
 use crate::homeassistant::entity::{Bounds, Component, Entity, Shape};
 use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
@@ -64,7 +65,13 @@ impl DeviceBlock {
     fn json(&self) -> Value {
         let mut device = Map::new();
         device.insert("identifiers".to_owned(), json!([self.serial]));
-        device.insert("name".to_owned(), json!(format!("Nexa 2000 {}", self.serial)));
+        // The product comes from the serial prefix, not from the identity report: it is known at
+        // CONNECT, and a device page should not claim to be a product it is not.
+        let name = match Product::from_serial(&self.serial).name() {
+            Some(product) => format!("{product} {}", self.serial),
+            None => format!("Growatt {}", self.serial),
+        };
+        device.insert("name".to_owned(), json!(name));
         device.insert("manufacturer".to_owned(), json!("Growatt"));
         device.insert("serial_number".to_owned(), json!(self.serial));
         for (key, value) in [
@@ -304,6 +311,28 @@ mod tests {
     /// The device as it looks before its identity report has arrived.
     fn bare() -> DeviceBlock {
         DeviceBlock::new("0EXAMPLE00000001", None)
+    }
+
+    /// The `name` of a device block built from a serial.
+    fn device_name(serial: &str) -> String {
+        let json = DeviceBlock::new(serial, None).json();
+        json.get("name")
+            .and_then(Value::as_str)
+            .expect("a device block always names the device")
+            .to_owned()
+    }
+
+    #[test]
+    fn the_device_page_is_named_for_the_product_the_serial_identifies() {
+        assert_eq!(device_name("0HVR000000000001"), "NEXA 2000 0HVR000000000001");
+        assert_eq!(device_name("0PVP000000000001"), "NOAH 2000 0PVP000000000001");
+    }
+
+    #[test]
+    fn an_unrecognised_serial_is_named_for_the_vendor_rather_than_guessed() {
+        // Not refused and not labelled as either product: a serial this build has not been taught is
+        // still a device worth serving, and claiming a model would be worse than naming none.
+        assert_eq!(device_name("0EXAMPLE00000001"), "Growatt 0EXAMPLE00000001");
     }
 
     /// One entity's discovery payload, parsed back.

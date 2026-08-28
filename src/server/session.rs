@@ -457,8 +457,10 @@ where
                     });
                 }
                 tracing::Span::current().record("device_id", &connect.client_id);
+                let product = crate::growatt::product::Product::from_serial(&connect.client_id);
                 tracing::info!(
                     client_id = %connect.client_id,
+                    %product,
                     keepalive_s = connect.keepalive,
                     clean_session = connect.clean_session,
                     username = connect.username.as_deref().unwrap_or("<none>"),
@@ -482,6 +484,18 @@ where
                     })
                     .await?;
                     return Ok(Flow::Stop);
+                }
+
+                // Said once per session, not per frame. The settings registers agree across the product
+                // family and most telemetry registers carry the same quantity, so this is a caution about
+                // individual labels rather than a warning that nothing works.
+                if !product.telemetry_map_matches() {
+                    tracing::warn!(
+                        %product,
+                        "serving a device this build's telemetry map was not written for; \
+                         settings are shared across the family, but individual readings may be \
+                         mislabelled"
+                    );
                 }
 
                 self.device_id = Some(connect.client_id);

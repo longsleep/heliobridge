@@ -43,6 +43,7 @@
 pub mod cloud;
 pub mod header;
 pub mod policy;
+pub mod product;
 pub mod v7;
 
 use core::fmt;
