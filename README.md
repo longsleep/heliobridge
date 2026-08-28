@@ -252,6 +252,95 @@ GET  /devices/{device}/actions
 POST /devices/{device}/actions/{key}           restart the datalogger, clear its log
 ```
 
+## Running in a container
+
+`ghcr.io/longsleep/heliobridge`, for `linux/amd64` and `linux/arm64`. Each release is tagged three ways:
+the full version, `major.minor`, and `latest`, which points at the highest release. Pin a full version in
+anything you deploy.
+
+The device connects to port 7006, and the container needs one writable volume for the state directory.
+
+```sh
+podman run -d --name heliobridge \
+  -p 7006:7006 \
+  -v heliobridge-state:/state \
+  -e HELIOBRIDGE_STATE_DIR=/state \
+  -e HELIOBRIDGE_MQTT_URL=mqtt://broker.lan:1883 \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  ghcr.io/longsleep/heliobridge:latest
+```
+
+`docker run` takes the same arguments. Under rootless Podman add `--userns=keep-id` if the volume is a
+host path rather than a named volume, so the uid inside matches the owner outside.
+
+The volume must be writable by uid **65532**, which the image runs as. A named volume inherits that on
+first use; a host path needs `chown 65532:65532`.
+
+### Compose
+
+```yaml
+services:
+  heliobridge:
+    image: ghcr.io/longsleep/heliobridge:latest
+    restart: unless-stopped
+    ports:
+      - "7006:7006"
+    environment:
+      HELIOBRIDGE_STATE_DIR: /state
+      HELIOBRIDGE_MQTT_URL: mqtt://broker.lan:1883
+      HELIOBRIDGE_CONTROL_SOCKET: /run/heliobridge/control.sock
+      HELIOBRIDGE_RECORD_DIR: ""
+      HELIOBRIDGE_LOG: info
+    volumes:
+      - state:/state
+      - control:/run/heliobridge
+    tmpfs:
+      - /tmp
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  state:
+  control:
+```
+
+Works with `docker compose` and `podman-compose`. Drop the `control` volume and the
+`HELIOBRIDGE_CONTROL_SOCKET` line to run without the control API.
+
+### Reaching the control API
+
+The control API is a Unix socket, so it is not published as a port. Share the directory holding it — the
+`control` volume above — and talk to it from the host:
+
+```sh
+curl --unix-socket /var/lib/docker/volumes/heliobridge_control/_data/control.sock \
+     http://localhost/healthz
+```
+
+Or from inside another container that mounts the same volume. There is no shell to `exec` into.
+
+### Health
+
+`GET /healthz` on the device-facing port answers `ok` when the server is serving, and is accepted only
+from loopback:
+
+```sh
+curl http://127.0.0.1:7006/healthz
+```
+
+`heliobridge healthz` asks the same question and exits 0 or 1, which is what the image's `HEALTHCHECK`
+runs. It reports whether the server is serving — not whether a device is connected, which is expected to
+be absent for hours at a time.
+
+### Relaying to the vendor cloud
+
+Off by default in a container as everywhere else. `HELIOBRIDGE_CLOUD_RELAY=true` needs outbound TCP to
+`mqtt.growatt.com:7006`. The TLS roots are compiled into the binary, so this works with no CA bundle in
+the image; to trust a private authority for the *broker* instead, mount it and set `SSL_CERT_FILE`.
+
 ## Building for another machine
 
 `cargo build --release` links against the build host's glibc, so the result will not start on a distribution
