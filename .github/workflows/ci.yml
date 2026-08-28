@@ -1,0 +1,62 @@
+# Checks on every push and pull request.
+#
+# No toolchain setup step: rust-toolchain.toml pins 1.97.1 with rustfmt and clippy, and rustup — present on
+# the runner image — honours it on the first cargo invocation. An action naming a version would fight that
+# pin and let CI drift from a developer's machine.
+name: CI
+
+on:
+  # Pull requests are the gate: `pull_request` fires on every push to an open one, so a branch under
+  # review is checked on each revision, and a fork's branch is checked too.
+  pull_request:
+  # Plus the default branch, which catches a direct push and records that a merge result is green.
+  # Listing every branch here as well would run each same-repo pull request twice for nothing.
+  push:
+    branches: [main]
+    # Tags are release.yml's business, and it re-runs these same checks before publishing anything.
+    tags-ignore: ["**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A crate that fails to build should fail, not spend six minutes retrying a registry.
+  CARGO_NET_RETRY: 2
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # Both files, because a toolchain bump invalidates compiled artefacts just as a dependency
+          # change does.
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Format
+        run: cargo fmt --check
+
+      # --all-targets deliberately: the lint set denies unwrap, expect, indexing and unchecked
+      # arithmetic, and tests are where those creep in.
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
