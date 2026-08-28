@@ -283,9 +283,33 @@ impl<'a> Bridge<'a> {
         let server_tls = self.server_tls;
         self.runtime.block_on(async move {
             let shutdown = async {
-                match tokio::signal::ctrl_c().await {
-                    Ok(()) => tracing::info!("interrupt received"),
-                    Err(error) => tracing::error!(%error, "could not listen for an interrupt"),
+                // Both signals, because the two ways this program is stopped send different ones: a
+                // terminal sends SIGINT, and every service manager sends SIGTERM. Handling only the
+                // first means an orderly stop under systemd or Docker is the default action instead —
+                // killed mid-write, with buffered frames lost from the recording and the device left
+                // to time out rather than told the session ended.
+                use tokio::signal::unix::{SignalKind, signal};
+
+                let mut terminate = match signal(SignalKind::terminate()) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        // Not fatal: losing the orderly path is worse than losing one of two ways to
+                        // reach it, so fall back to interrupt alone rather than refusing to serve.
+                        tracing::error!(%error, "could not listen for SIGTERM; only SIGINT will stop this cleanly");
+                        match tokio::signal::ctrl_c().await {
+                            Ok(()) => tracing::info!(signal = "SIGINT", "shutdown signal received"),
+                            Err(error) => tracing::error!(%error, "could not listen for an interrupt"),
+                        }
+                        return;
+                    }
+                };
+
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => match result {
+                        Ok(()) => tracing::info!(signal = "SIGINT", "shutdown signal received"),
+                        Err(error) => tracing::error!(%error, "could not listen for an interrupt"),
+                    },
+                    _ = terminate.recv() => tracing::info!(signal = "SIGTERM", "shutdown signal received"),
                 }
             };
 
