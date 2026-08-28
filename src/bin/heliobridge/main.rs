@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use heliobridge::VERSION;
-use heliobridge::config::{Config, LogFormat};
+use heliobridge::config::{Command, Config, LogFormat};
 use heliobridge::control::{self, Registry};
 use heliobridge::growatt::cloud::CloudRelay;
 use heliobridge::homeassistant::broker::{BrokerConfig, BrokerUrl};
@@ -23,12 +23,41 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 fn main() -> ExitCode {
     let config = Config::from_env();
+
     init_tracing(&config);
+
+    // A question with an exit code rather than a program that serves. Answered through tracing like
+    // everything else, so a failure reaches wherever the deployment already collects output.
+    if config.command == Some(Command::Healthz) {
+        return healthz(&config);
+    }
 
     match run(&config) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             tracing::error!("{message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Ask a running server whether it is alive.
+///
+/// A single-threaded runtime: one connection, one request, one answer, and the process exits — a worker
+/// per core would cost more to start than the check costs to run.
+fn healthz(config: &Config) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(%error, "could not start the async runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match runtime.block_on(server::probe::Check::for_listener(config.listen).run()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!("{error}");
             ExitCode::FAILURE
         }
     }
