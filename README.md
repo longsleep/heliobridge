@@ -266,6 +266,10 @@ podman run -d --name heliobridge \
   -v heliobridge-state:/state \
   -e HELIOBRIDGE_STATE_DIR=/state \
   -e HELIOBRIDGE_MQTT_URL=mqtt://broker.lan:1883 \
+  -e HELIOBRIDGE_CONTROL_SOCKET=/state/control.sock \
+  -e HELIOBRIDGE_RECORD_DIR= \
+  -e HELIOBRIDGE_CLOUD_RELAY=false \
+  -e HELIOBRIDGE_RELAY_MODE=controls \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
   ghcr.io/longsleep/heliobridge:latest
 ```
@@ -286,16 +290,22 @@ services:
     ports:
       - "7006:7006"
     environment:
+      # Holds the generated certificate, and is the only path written to.
       HELIOBRIDGE_STATE_DIR: /state
       HELIOBRIDGE_MQTT_URL: mqtt://broker.lan:1883
-      HELIOBRIDGE_CONTROL_SOCKET: /run/heliobridge/control.sock
+      # Placed in the state volume, which is already mounted; replaced on each start. Omit the
+      # variable to run without the control API.
+      HELIOBRIDGE_CONTROL_SOCKET: /state/control.sock
+      # Empty turns raw frame recording off. It writes about 10 MB a day, so name a path under a
+      # volume only while diagnosing something.
       HELIOBRIDGE_RECORD_DIR: ""
+      # Whether to also connect to the vendor cloud.
+      HELIOBRIDGE_CLOUD_RELAY: "false"
+      # What the cloud may change while relaying: full, controls, or observer.
+      HELIOBRIDGE_RELAY_MODE: controls
       HELIOBRIDGE_LOG: info
     volumes:
       - state:/state
-      - control:/run/heliobridge
-    tmpfs:
-      - /tmp
     read_only: true
     cap_drop:
       - ALL
@@ -304,23 +314,21 @@ services:
 
 volumes:
   state:
-  control:
 ```
 
-Works with `docker compose` and `podman-compose`. Drop the `control` volume and the
-`HELIOBRIDGE_CONTROL_SOCKET` line to run without the control API.
+Works with `docker compose` and `podman-compose`.
 
 ### Reaching the control API
 
-The control API is a Unix socket, so it is not published as a port. Share the directory holding it — the
-`control` volume above — and talk to it from the host:
+The control API is a Unix socket, so it is not published as a port. In the examples above it sits in the
+state volume, and is reached from the host through that volume's path:
 
 ```sh
-curl --unix-socket /var/lib/docker/volumes/heliobridge_control/_data/control.sock \
-     http://localhost/healthz
+curl --unix-socket /var/lib/docker/volumes/heliobridge_state/_data/control.sock \
+     http://localhost/devices
 ```
 
-Or from inside another container that mounts the same volume. There is no shell to `exec` into.
+Or from another container that mounts the same volume. There is no shell to `exec` into.
 
 ### Health
 
@@ -338,8 +346,8 @@ be absent for hours at a time.
 ### Relaying to the vendor cloud
 
 Off by default in a container as everywhere else. `HELIOBRIDGE_CLOUD_RELAY=true` needs outbound TCP to
-`mqtt.growatt.com:7006`. The TLS roots are compiled into the binary, so this works with no CA bundle in
-the image; to trust a private authority for the *broker* instead, mount it and set `SSL_CERT_FILE`.
+`mqtt.growatt.com:7006` and no further setup. To trust a private authority for your own *broker*, mount
+it and set `SSL_CERT_FILE`.
 
 ## Building for another machine
 
