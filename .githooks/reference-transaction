@@ -1,0 +1,75 @@
+#!/bin/sh
+# Refuse a version tag whose Cargo.toml version does not already match, in the commit being tagged.
+#
+# There is no pre-tag hook. `reference-transaction` fires for every reference update — commits, fetches,
+# checkouts — and can still refuse one while the state is "prepared", which makes it the only local place
+# to catch this. Everything that is not a `v*` tag creation exits immediately, so the cost on ordinary
+# work is one string comparison.
+#
+# The version is read from the *commit*, with `git show <commit>:Cargo.toml`, not from the working tree. A
+# bump that has been edited but not committed would otherwise satisfy a check that read the file on disk,
+# and the tag would then point at a tree still carrying the old version — which is exactly the mistake
+# this exists to prevent.
+#
+# Enable it once per clone; hooks are not installed by cloning:
+#
+#     git config core.hooksPath .githooks
+#
+# The release workflow performs the same comparison, so this is a fast local failure rather than the only
+# guard. Deliberately no `--no-verify` equivalent: `git tag -d` makes a refused tag cheap to retry.
+set -eu
+
+[ "${1:-}" = "prepared" ] || exit 0
+
+# The version in [package], ignoring the version keys of every dependency.
+package_version() {
+	git show "$1:Cargo.toml" 2>/dev/null | awk '
+		/^\[package\]/ { in_package = 1; next }
+		/^\[/          { in_package = 0 }
+		in_package && /^[ \t]*version[ \t]*=/ {
+			if (match($0, /"[^"]*"/)) {
+				print substr($0, RSTART + 1, RLENGTH - 2)
+				exit
+			}
+		}
+	'
+}
+
+status=0
+
+while read -r _old new ref; do
+	case "$ref" in
+	refs/tags/v*) ;;
+	*) continue ;;
+	esac
+
+	# A deletion has an all-zero new value and is always allowed.
+	case "$new" in
+	*[!0]*) ;;
+	*) continue ;;
+	esac
+
+	tagged=${ref#refs/tags/v}
+
+	commit=$(git rev-parse --quiet --verify "$new^{commit}" || true)
+	if [ -z "$commit" ]; then
+		# Not something with a commit behind it. Not this hook's business.
+		continue
+	fi
+
+	version=$(package_version "$commit")
+	if [ -z "$version" ]; then
+		echo "reference-transaction: no [package] version in Cargo.toml at $ref; refusing" >&2
+		status=1
+		continue
+	fi
+
+	if [ "$version" != "$tagged" ]; then
+		echo "reference-transaction: refusing $ref" >&2
+		echo "  Cargo.toml in the tagged commit says $version, the tag says $tagged." >&2
+		echo "  Bump the version and commit it first, then tag that commit." >&2
+		status=1
+	fi
+done
+
+exit "$status"
