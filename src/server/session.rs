@@ -971,7 +971,7 @@ where
             name = read.entry.name,
             value = %read.entry.decode(response.raw),
             raw = response.raw.get(),
-            "setting"
+            "read back"
         );
 
         self.settings.insert(response.register, response.raw);
@@ -1105,12 +1105,13 @@ where
             let Some(entry) = HoldingRegister::lookup(*register) else {
                 continue;
             };
+            // Names the direction: a bare "setting" reads as the verb, and this writes nothing.
             tracing::info!(
                 register = %register,
                 name = entry.name,
                 value = %entry.decode(*raw),
                 unit = entry.unit.symbol(),
-                "setting"
+                "setting read"
             );
         }
     }
