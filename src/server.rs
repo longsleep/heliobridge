@@ -24,6 +24,7 @@
 pub mod access;
 pub mod clock;
 pub mod listener;
+pub mod probe;
 pub mod session;
 pub mod tls;
 

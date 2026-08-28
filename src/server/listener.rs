@@ -25,6 +25,7 @@ use crate::growatt::cloud::CloudRelay;
 use crate::growatt::policy::Policy;
 use crate::record::Recorder;
 use crate::server::access::{Devices, Peers};
+use crate::server::probe;
 use crate::server::session::Session;
 
 /// Why the listener stopped.
@@ -134,6 +135,16 @@ pub async fn serve(
                         continue;
                     }
                 };
+                // A liveness probe, before everything else. Loopback only, so nothing here is reachable
+                // from the network the device is on; and ahead of the allowlist, or a deployment that
+                // admits only the device's address would refuse its own healthcheck. A connection that
+                // is not a probe comes back with every octet unread.
+                let mut stream = stream;
+                if peer.ip().is_loopback() && probe::Probe::new(&mut stream).serve().await == probe::Outcome::Answered {
+                    tracing::debug!(%peer, "answered a liveness probe");
+                    continue;
+                }
+
                 // Before the handshake, so an unwanted peer costs a socket and a log line rather than a
                 // certificate exchange — and so nothing it sends is ever parsed.
                 if !peers.admits(peer.ip()) {

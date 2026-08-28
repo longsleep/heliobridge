@@ -43,10 +43,28 @@ pub const DEFAULT_DISCOVERY_PREFIX: &str = "homeassistant";
 /// Default tracing filter.
 pub const DEFAULT_LOG: &str = "info";
 
+/// What to do instead of serving.
+///
+/// Absent means serve, so the ordinary invocation is unchanged and every flag below still applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Subcommand)]
+pub enum Command {
+    /// Ask a running heliobridge whether it is alive, and exit 0 if it is.
+    ///
+    /// Probes the address in `--listen`, which is the same setting the server reads — so inside a
+    /// container this needs no arguments. Reports only that the server is serving: a device is expected
+    /// to be absent for hours at a time, and a health signal that said otherwise would call a working
+    /// deployment broken every night.
+    Healthz,
+}
+
 /// A local MQTT bridge for the Growatt Nexa 2000.
 #[derive(Debug, Clone, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Config {
+    /// What to do instead of serving.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Device-facing TLS listener.
     ///
     /// Port 7006 is where the device connects; changing it only makes sense alongside a destination
