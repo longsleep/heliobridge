@@ -25,6 +25,7 @@
 //! GET  /devices/{device}/settings/{key}
 //! PUT  /devices/{device}/settings/{key}       {"value": 100}
 //! POST /devices/{device}/settings/{key}/read
+//! POST /devices/{device}/config/read           ?registers=a,b,c or ?all — streamed as JSON Lines
 //! ```
 //!
 //! # Shapes are consistent, so a client can be written against one
@@ -70,13 +71,14 @@
 //! Every request becomes a [`Command`], which can only be built from the holding register map with a value
 //! inside the register's domain. There is no path from this socket to a register the encoder would refuse.
 
+use core::convert::Infallible;
 use core::time::Duration;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use axum::extract::{FromRequestParts, RawPathParams, State};
+use axum::extract::{FromRequestParts, Query, RawPathParams, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
@@ -85,9 +87,13 @@ use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt};
 
 use crate::growatt::v7::encode::{Command, WritableConfig};
-use crate::growatt::v7::registers::{ConfigRegister, HoldingRegister, SLOT_COUNT};
+use crate::growatt::v7::registers::{CONFIG_REGISTER_LAST, ConfigRegister, HoldingRegister, SLOT_COUNT};
 use crate::model::{Raw, Register};
 
 /// How many commands may queue per device before new ones are refused.
@@ -290,6 +296,187 @@ pub struct IdentityView {
     pub endpoint: Option<String>,
     /// Every entry reported, in the order sent.
     pub entries: Vec<ConfigView>,
+}
+
+/// Which config registers a read is for.
+#[derive(Debug, PartialEq, Eq)]
+enum Selection {
+    /// The whole space, `0..=CONFIG_REGISTER_LAST`.
+    All,
+    /// The keys named, each a field name or a register number.
+    Named(Vec<String>),
+}
+
+/// Query parameters for the config read route.
+#[derive(Debug, Deserialize)]
+pub struct ReadParams {
+    /// `?registers=` — comma-separated names or numbers.
+    registers: Option<String>,
+    /// `?all` — the whole space. Bare, or `all=true`; `all=false` reads as absent.
+    all: Option<String>,
+    /// `?batch=N` — how many registers per request frame. Defaults to 1, which is the only count the vendor
+    /// server has ever been seen to send; the device honours more.
+    batch: Option<usize>,
+}
+
+impl ReadParams {
+    /// What the query asked for, or why it did not ask for anything usable.
+    ///
+    /// The two forms are exclusive rather than one taking precedence: a request naming both has two readings
+    /// and guessing which was meant is how a caller ends up reading 146 registers by accident.
+    fn selection(&self) -> Result<Selection, &'static str> {
+        let all = self.all.as_deref().is_some_and(|value| {
+            // Bare `?all` arrives as an empty value, which is the common spelling and means yes.
+            !matches!(value.trim(), "false" | "0")
+        });
+        let named: Vec<String> = self.registers.as_deref().map_or_else(Vec::new, |list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_owned)
+                .collect()
+        });
+        match (all, named.is_empty()) {
+            (true, true) => Ok(Selection::All),
+            (false, false) => Ok(Selection::Named(named)),
+            (true, false) => Err("name either ?registers= or ?all, not both"),
+            (false, true) => Err("say what to read: ?registers= with names or numbers, or ?all"),
+        }
+    }
+}
+
+/// What a complete read of the configuration space found.
+///
+/// The space is bounded, so this is a terminating operation with a fixed cost rather than a probe: every
+/// register from 0 to [`CONFIG_REGISTER_LAST`] is asked for exactly once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReadAllView {
+    /// How many registers were asked for. Constant unless the session went away part-way through.
+    pub requested: u16,
+    /// How many the device has a value for afterwards, including those it volunteers unasked.
+    pub answered: u16,
+    /// Registers that answered nothing. Some are genuinely empty — reading the whole space on the reference
+    /// device left three unpopulated — so this is an observation, not a list of failures.
+    pub silent: Vec<u16>,
+}
+
+/// Reads the configuration space, yielding each register as the device answers for it.
+///
+/// **An async cursor, not a batch job.** `while let Some(entry) = reader.next().await` is the shape, which
+/// is what `tokio`'s own receivers and most database cursors offer on stable Rust — `AsyncIterator` is not
+/// stable, so this is the idiom rather than a `Stream` impl and a dependency to go with it.
+///
+/// Why it matters here: answers arrive tens of seconds behind the asking, so anything that collects
+/// everything before returning makes the caller wait for the slowest register to say anything at all. A
+/// cursor lets a summary be accumulated, a response be streamed, or a caller stop early, from one
+/// implementation.
+///
+/// **Batching is an implementation detail and deliberately so.** Whether the device honours a request for
+/// more than one register is unproven (see [`Command::read_config_many`]); if it ignores the count and
+/// answers only the first, the cursor still yields whatever arrives and the caller cannot tell the
+/// difference except in how long it takes. That is the point of putting the iterator boundary here.
+/// Reads the configuration space, yielding each register as the device answers for it.
+///
+/// A [`Stream`], because that is what this is: a sequence produced over time, whose consumer should be able
+/// to render, count or abandon it without waiting for the end. The asking runs as its own task, so a slow
+/// consumer cannot stall the requests and a burst of answers cannot starve them either — the two were
+/// interleaved in an earlier attempt and the interleaving lost 40 registers.
+///
+/// **Batching is an implementation detail and deliberately so.** Whether the device honours a request for
+/// more than one register is a device question (see [`Command::read_config_many`]); if it ignored the count
+/// and answered only the first, this stream would still yield whatever arrived, and the caller could not
+/// tell except in how long it took.
+struct ConfigReader;
+
+impl ConfigReader {
+    /// Gap between consecutive request frames.
+    ///
+    /// A device in production use answering requests it did not ask for. Four per second is the rate a
+    /// hand-run pass used without the device showing any sign of noticing.
+    const PACE: Duration = Duration::from_millis(250);
+
+    /// How long answers must stop arriving, **after every request has gone out**, before the stream ends.
+    ///
+    /// Answers lag the asking badly: measured on a real device, requests finished in 39 s and answers were
+    /// still landing 20 s later. The "after every request has gone out" part is load-bearing — applying this
+    /// while requests were still queued ended a run at 106 of 146.
+    const QUIET: Duration = Duration::from_secs(10);
+
+    /// Cap on the whole operation, in case answers never stop or never come.
+    const SETTLE_LIMIT: Duration = Duration::from_mins(5);
+
+    /// How often to re-check when the identity channel is quiet.
+    const POLL: Duration = Duration::from_millis(500);
+
+    /// The registers named, and only those.
+    ///
+    /// Reading all of them is this with the whole space passed in, so one implementation serves both and a
+    /// subset read cannot drift from the complete one in pacing, ending or output shape.
+    fn of(handle: SessionHandle, wanted: Vec<Register>, batch: usize) -> impl Stream<Item = ConfigView> {
+        let asking = Self::ask(handle.clone(), wanted.clone(), batch.max(1));
+        Self::answers(handle, wanted, asking)
+    }
+
+    /// Send a request for each wanted register, paced, as a background task.
+    ///
+    /// Returns the task handle so the answer stream can tell when the asking is done — which is when its
+    /// quiet timer becomes meaningful.
+    fn ask(handle: SessionHandle, wanted: Vec<Register>, batch: usize) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            for (index, chunk) in wanted.chunks(batch).enumerate() {
+                if index > 0 {
+                    tokio::time::sleep(Self::PACE).await;
+                }
+                // A refusal or timeout is not retried: the register simply goes unanswered, which the
+                // summary reports as silent.
+                drop(handle.carry_out(Action::Send(Command::read_config_many(chunk))).await);
+            }
+        })
+    }
+
+    /// Yield each wanted config entry the first time it appears, until the asking is done and answers stop.
+    ///
+    /// Filtered to what was asked for, which matters for a subset read: the accumulated identity already
+    /// holds the 32 registers the device volunteers, and streaming those back to a caller who asked for one
+    /// would answer a question nobody put.
+    fn answers(handle: SessionHandle, wanted: Vec<Register>, asking: JoinHandle<()>) -> impl Stream<Item = ConfigView> {
+        async_stream::stream! {
+            let wanted: Vec<u16> = wanted.iter().copied().map(Register::number).collect();
+            let mut identity = handle.identity.clone();
+            let mut seen: Vec<u16> = Vec::new();
+            let mut last_new = Instant::now();
+            let deadline = Instant::now().checked_add(Self::SETTLE_LIMIT);
+
+            loop {
+                // Cloned out of the watch borrow before any await: holding a `Ref` across one would block
+                // every writer.
+                let snapshot = identity.borrow_and_update().clone();
+                let mut fresh = Vec::new();
+                if let Some(report) = snapshot {
+                    for entry in report.entries {
+                        if wanted.contains(&entry.register) && !seen.contains(&entry.register) {
+                            seen.push(entry.register);
+                            fresh.push(entry);
+                        }
+                    }
+                }
+                if !fresh.is_empty() {
+                    last_new = Instant::now();
+                }
+                for entry in fresh {
+                    yield entry;
+                }
+
+                if asking.is_finished() && last_new.elapsed() >= Self::QUIET {
+                    break;
+                }
+                if deadline.is_none_or(|end| Instant::now() >= end) {
+                    break;
+                }
+                drop(tokio::time::timeout(Self::POLL, identity.changed()).await);
+            }
+        }
+    }
 }
 
 /// One telemetry register as last decoded.
@@ -614,6 +801,7 @@ pub fn listen(path: &Path, registry: Registry) -> Result<(), ControlError> {
         .route("/devices/{device}/settings/{key}/read", post(Api::refresh))
         .route("/devices/{device}/actions", get(Api::actions))
         .route("/devices/{device}/actions/{key}", post(Api::act))
+        .route("/devices/{device}/config/read", post(Api::read_config_set))
         .route("/devices/{device}/config/{key}", get(Api::config))
         .route("/devices/{device}/config/{key}/read", post(Api::read_config))
         .with_state(registry);
@@ -976,6 +1164,102 @@ impl Api {
                 &format!("the device has not reported config register {}", register.number()),
             ),
         }
+    }
+
+    /// Ask the device to report config registers, streamed as they answer.
+    ///
+    /// One route for a few registers or for the whole space, because they are one operation with different
+    /// lists — a subset that answered differently from the whole would be a second implementation to keep
+    /// honest.
+    ///
+    /// `?registers=` takes a comma-separated list of names or numbers, resolved the same way `{key}` is
+    /// elsewhere. `?all` takes the whole space: **every** register, including the 32 the device volunteers
+    /// on connect, since that report appears to be assembled once per session and asking again is the only
+    /// way to know a value is current rather than however old the session is.
+    ///
+    /// Filtered to what was asked for: the accumulated identity already holds the volunteered registers, and
+    /// none of those is an answer to a request for something else.
+    async fn read_config_set(Session { handle, .. }: Session, Query(params): Query<ReadParams>) -> Response {
+        let batch = params.batch.unwrap_or(1);
+        match params.selection() {
+            Ok(Selection::All) => {
+                let wanted = (0..=CONFIG_REGISTER_LAST).map(Register).collect();
+                Self::stream_config(handle, wanted, batch, "the whole config space")
+            }
+            Ok(Selection::Named(keys)) => {
+                let mut wanted = Vec::new();
+                for key in keys {
+                    match Self::config_register(&key) {
+                        Ok(register) if register.number() <= CONFIG_REGISTER_LAST => wanted.push(register),
+                        // Outside the space is worth naming rather than answering nothing: the bound is
+                        // known, so a number past it cannot be a typo the device will resolve.
+                        Ok(register) => {
+                            return problem(
+                                StatusCode::BAD_REQUEST,
+                                &format!(
+                                    "config register {} is outside the space, which ends at {CONFIG_REGISTER_LAST}",
+                                    register.number()
+                                ),
+                            );
+                        }
+                        Err(rejection) => return rejection.into_response(),
+                    }
+                }
+                Self::stream_config(handle, wanted, batch, "a set of config registers")
+            }
+            Err(detail) => problem(StatusCode::BAD_REQUEST, detail),
+        }
+    }
+
+    /// Stream a set of config registers as JSON Lines, one object per register, then a summary.
+    ///
+    /// Shared by both read routes. The body is produced as answers arrive rather than collected first,
+    /// because the device answers tens of seconds behind the asking and a caller should not have to wait for
+    /// the slowest register before seeing the first.
+    fn stream_config(handle: SessionHandle, wanted: Vec<Register>, batch: usize, what: &'static str) -> Response {
+        let (tx, rx) = mpsc::channel::<Result<String, Infallible>>(QUEUE_DEPTH);
+        let asked: Vec<u16> = wanted.iter().copied().map(Register::number).collect();
+
+        tokio::spawn(async move {
+            let entries = ConfigReader::of(handle, wanted, batch);
+            tokio::pin!(entries);
+            let mut answered: Vec<u16> = Vec::new();
+            while let Some(entry) = entries.next().await {
+                answered.push(entry.register);
+                let Ok(mut line) = serde_json::to_string(&entry) else {
+                    continue;
+                };
+                line.push('\n');
+                // A send error means the client hung up. Stop asking the device for answers nobody is
+                // waiting for — the point of streaming is that the caller can leave.
+                if tx.send(Ok(line)).await.is_err() {
+                    tracing::debug!(sent = answered.len(), "config read abandoned by the client");
+                    return;
+                }
+            }
+            let summary = ReadAllView {
+                requested: u16::try_from(asked.len()).unwrap_or(u16::MAX),
+                answered: u16::try_from(answered.len()).unwrap_or(u16::MAX),
+                silent: asked.into_iter().filter(|number| !answered.contains(number)).collect(),
+            };
+            tracing::info!(
+                batch,
+                requested = summary.requested,
+                answered = summary.answered,
+                silent = summary.silent.len(),
+                "read {what}"
+            );
+            if let Ok(mut line) = serde_json::to_string(&summary) {
+                line.push('\n');
+                drop(tx.send(Ok(line)).await);
+            }
+        });
+
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/jsonl")],
+            axum::body::Body::from_stream(ReceiverStream::new(rx)),
+        )
+            .into_response()
     }
 
     /// Ask the device to report one config register again.

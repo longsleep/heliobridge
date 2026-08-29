@@ -248,9 +248,35 @@ PUT  /devices/{device}/settings/{key}          write, then read back to confirm
 POST /devices/{device}/settings/{key}/read     refresh from the device
 GET  /devices/{device}/config/{key}            datalogger configuration
 POST /devices/{device}/config/{key}/read
+POST /devices/{device}/config/read             ?registers=a,b,c or ?all — streamed
 GET  /devices/{device}/actions
 POST /devices/{device}/actions/{key}           restart the datalogger, clear its log
 ```
+
+A `{key}` is a field name or a register number. The config space is 146 registers, 0 to 145; the device
+volunteers 32 of them on connect and answers the rest only when asked.
+
+### Reading configuration in bulk
+
+`config/read` answers `application/jsonl` — one JSON object per register as the device answers for it, then
+a final summary line. Name the registers with `?registers=`, or the whole space with `?all`; one or the
+other, not both. `?batch=N` sets how many registers go in each request frame.
+
+```console
+$ curl -N --unix-socket /run/heliobridge.sock -X POST \
+    "http://local/devices/$SERIAL/config/read?registers=update_url,sdk_version,76"
+{"register":76,"name":"wifi_signal","role":"dynamic","value":"-63"}
+{"register":80,"name":"update_url","role":"dynamic","value":"http://cdn.growatt.com/update/…"}
+{"register":61,"name":"sdk_version","role":"metadata","value":"IDFSDK:v4.4.3"}
+{"requested":3,"answered":3,"silent":[]}
+```
+
+Answers arrive out of order and tens of seconds behind the request, which is why the response streams.
+Reading the whole space takes about 37 s at `batch=1` and about 19 s at `batch=8`. Closing the connection
+stops the reading.
+
+`silent` lists registers that answered nothing; some are simply unpopulated. `role` is `identity` for
+fields that carry the serial, the Wi-Fi passphrase or the Bluetooth handshake key.
 
 ## Running in a container
 

@@ -27,6 +27,8 @@ clap = { version = "4.6", features = ["derive", "env"] }
 # Local wall-clock time for the server time push. The device is sent *local* time, matching its own
 # clock, so a timezone-aware conversion is needed rather than arithmetic on a Unix timestamp.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tokio-stream = "0.1"    # the Stream trait (re-exported) and ReceiverStream
+async-stream = "0.3"    # authoring a Stream from async code; the config cursor is a generator
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
@@ -49,7 +51,7 @@ rustls-pemfile = "2.2"
 # The control API: HTTP over a Unix socket, so it is reachable with curl and unreachable from the
 # network. Unlike the device-facing MQTT, nothing here is impersonating anything, so a well-maintained
 # library is simply the right answer.
-axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "query"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Trust anchors for the cloud relay. The device verifies nothing; this program is a proper client and
