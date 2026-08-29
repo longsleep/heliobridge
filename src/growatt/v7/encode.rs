@@ -286,10 +286,14 @@ pub enum Command {
         value: String,
     },
 
-    /// Ask for one config register's value with `0x19`.
+    /// Ask for one or more config registers' values with `0x19`.
     ReadConfig {
-        /// The register to ask for.
-        register: Register,
+        /// The registers to ask for, in the order they go on the wire.
+        ///
+        /// The body's leading field is a **count**, so more than one is expressible. Whether the device
+        /// honours a count above 1 is a separate question from whether the frame can carry it — see
+        /// [`Command::read_config_many`].
+        registers: Vec<Register>,
     },
 }
 
@@ -592,8 +596,30 @@ impl Command {
     ///
     /// Any config register may be asked for, not only the writable ones — reading has no side effect, which
     /// is the same reasoning that leaves [`Self::read`] unrestricted.
-    pub const fn read_config(register: Register) -> Self {
-        Self::ReadConfig { register }
+    pub fn read_config(register: Register) -> Self {
+        Self::ReadConfig {
+            registers: vec![register],
+        }
+    }
+
+    /// Ask for several config registers in one frame.
+    ///
+    /// **The count is expressible; whether it is honoured is a device question.** The body's leading field
+    /// is a count and the report that answers demonstrably carries up to 32 entries, so the format is
+    /// symmetric — but every request ever captured from the vendor server asks for exactly one, so a count
+    /// above 1 is *inferred* rather than observed. A device that ignores the count would answer with the
+    /// first register only, which is what a caller must be ready for.
+    ///
+    /// Reading remains free of side effects however many are asked for, so trying costs nothing but the
+    /// device's attention.
+    ///
+    /// Named `_many` rather than `_range` — the sibling [`Self::write_range`] means *consecutive*, which it
+    /// enforces, and these registers need not be. A slice rather than a `Vec` for the same reason
+    /// `write_range` takes one: the caller usually has the numbers already.
+    pub fn read_config_many(registers: &[Register]) -> Self {
+        Self::ReadConfig {
+            registers: registers.to_vec(),
+        }
     }
 
     /// The config register this command writes, or `None` if it is not a config write.
@@ -605,10 +631,10 @@ impl Command {
     }
 
     /// The config register this command addresses, whether it writes or reads it.
-    pub const fn config_target(&self) -> Option<Register> {
+    pub fn config_target(&self) -> Option<Register> {
         match self {
             Self::WriteConfig { register, .. } => Some(register.register()),
-            Self::ReadConfig { register } => Some(*register),
+            Self::ReadConfig { registers } => registers.first().copied(),
             _ => None,
         }
     }
@@ -739,10 +765,13 @@ impl Command {
             // frames, four of them written by the vendor's own interface with body lengths this code had
             // never produced.
             // Count, then the register. No length: there is no value to size.
-            Self::ReadConfig { register } => {
-                let mut body = Vec::with_capacity(4);
-                body.extend_from_slice(&1u16.to_be_bytes());
-                body.extend_from_slice(&register.number().to_be_bytes());
+            Self::ReadConfig { registers } => {
+                let count = u16::try_from(registers.len()).unwrap_or(u16::MAX);
+                let mut body = Vec::with_capacity(2usize.saturating_add(registers.len().saturating_mul(2)));
+                body.extend_from_slice(&count.to_be_bytes());
+                for register in registers {
+                    body.extend_from_slice(&register.number().to_be_bytes());
+                }
                 body
             }
 
@@ -1241,5 +1270,42 @@ mod tests {
             assert_eq!(parsed, frame, "{command:?} did not survive a round trip");
             assert_eq!(parsed.message_type(), command.message_type());
         }
+    }
+
+    #[test]
+    fn a_config_read_asks_for_one_register() {
+        // Count, then the register, with no length — there is no value to size. This is the shape the
+        // vendor server sends, byte for byte.
+        let frame = Command::read_config(Register(21)).to_frame(SERIAL).expect("build");
+        assert_eq!(frame.body(), &[0x00, 0x01, 0x00, 0x15]);
+        assert_eq!(frame.message_type(), MessageType::ConfigRead);
+    }
+
+    #[test]
+    fn a_config_read_can_ask_for_several() {
+        // The leading field is a count, so the body grows by two octets per register and the count tracks
+        // it. The device honours this; the vendor server has never been seen to use it.
+        let registers: Vec<Register> = (0..8).map(Register).collect();
+        let frame = Command::read_config_many(&registers).to_frame(SERIAL).expect("build");
+        assert_eq!(
+            frame.body(),
+            &[
+                0x00, 0x08, // count 8
+                0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, // registers 0..3
+                0x00, 0x04, 0x00, 0x05, 0x00, 0x06, 0x00, 0x07, // registers 4..7
+            ]
+        );
+        assert_eq!(frame.message_type(), MessageType::ConfigRead);
+    }
+
+    #[test]
+    fn a_config_read_of_one_is_a_read_of_many_with_one() {
+        // The single-register constructor is the plural one with a one-element list, so the two cannot
+        // disagree about the body they produce.
+        let single = Command::read_config(Register(80)).to_frame(SERIAL).expect("build");
+        let many = Command::read_config_many(&[Register(80)])
+            .to_frame(SERIAL)
+            .expect("build");
+        assert_eq!(single.body(), many.body());
     }
 }
