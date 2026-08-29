@@ -1,12 +1,19 @@
 //! Register maps for generation 7.
 //!
 //! Three distinct address spaces exist; a register number is meaningful only with its space. This
-//! module covers two of them:
+//! module covers all three:
 //!
 //! - **input** — telemetry, read-only, carried in `0x04` frames and located by frame offset.
 //! - **holding** — settings, read/write, written by register number via `0x06` and `0x10`.
+//! - **config** — datalogger fields, reported as TLV tags in `0x19` and written with `0x18`.
 //!
-//! The config space, reported as TLV tags in the `0x19` identity frame, is not modelled yet.
+//! # The config space is bounded, and the table is not
+//!
+//! The space is **146 parameters, 0 through 145** — a compile-time loop bound in the firmware, confirmed
+//! independently by sweeping a device, which answered on 0–145 and on nothing above. The table below names
+//! the subset whose meaning is established. A register absent from it resolves to `None` and is reported
+//! without a name, which is deliberate: a number with no meaning attached is more useful than a guessed
+//! one, and the gap is what marks the space as incompletely understood rather than complete.
 //!
 //! # Locating an input register
 //!
@@ -29,6 +36,18 @@ use crate::model::{Confidence, Raw, Register, Scaling, Unit, Value};
 
 /// Base offset of the input register block within a telemetry frame.
 pub const INPUT_BASE_OFFSET: usize = 0x4F;
+
+/// The highest config register that exists, making the space `0..=CONFIG_REGISTER_LAST`.
+///
+/// 146 parameters. The figure comes from a compile-time loop bound in a May 2026 firmware image and was
+/// confirmed on a device running an older release, which answered on 0–145 and on nothing above — two
+/// unrelated methods and two releases agreeing, so this is a property of the protocol rather than of one
+/// build.
+///
+/// What it buys is that reading the whole space is a **terminating operation** rather than an open-ended
+/// probe: a sweep knows when it is finished, and a register outside the range is a mistake rather than
+/// something to try.
+pub const CONFIG_REGISTER_LAST: u16 = 145;
 
 /// What kind of quantity a register carries.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -684,6 +703,8 @@ pub struct ConfigRegister {
     pub name: &'static str,
     /// What the value means, and how it should be treated.
     pub role: Role,
+    /// Whether the device offers this register unasked, or only answers a read for it.
+    pub availability: Availability,
     /// How well the meaning is established.
     pub confidence: Confidence,
 }
@@ -707,6 +728,32 @@ pub enum Role {
     Endpoint,
     /// Reported but not describing the live system, or not understood at all.
     Inert,
+}
+
+/// Whether the device volunteers a config register, or answers it only when asked.
+///
+/// The identity report carries **32** of the 146 registers that exist. The rest are not missing and not
+/// write-only — they answer an ordinary read and are simply never offered. F82 concluded the opposite from
+/// exactly this absence, and was wrong: register 80 is absent from every report and reads back fine.
+///
+/// Recording it here rather than in a list beside the tests keeps it next to the definition it describes,
+/// where a new entry has to state which kind it is.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum Availability {
+    /// Carried in the unsolicited identity report on every connect.
+    Reported,
+    /// Absent from the report; answers an explicit read.
+    OnRequest,
+}
+
+impl Availability {
+    /// A short label for a log line or an API field.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reported => "reported",
+            Self::OnRequest => "on_request",
+        }
+    }
 }
 
 impl Role {
@@ -733,11 +780,24 @@ impl ConfigRegister {
         CONFIG_REGISTERS.iter().find(|entry| entry.name == name)
     }
 
+    /// A register the device volunteers in its identity report.
     const fn new(register: u16, name: &'static str, role: Role, confidence: Confidence) -> Self {
         Self {
             register: Register(register),
             name,
             role,
+            availability: Availability::Reported,
+            confidence,
+        }
+    }
+
+    /// A register that answers an explicit read but is absent from the identity report.
+    const fn on_request(register: u16, name: &'static str, role: Role, confidence: Confidence) -> Self {
+        Self {
+            register: Register(register),
+            name,
+            role,
+            availability: Availability::OnRequest,
             confidence,
         }
     }
@@ -748,7 +808,7 @@ impl ConfigRegister {
 /// Not exhaustive by construction — one device reported these, and a parser must carry an unrecognised key
 /// rather than reject the frame. Absent here does not mean absent from the protocol.
 pub const CONFIG_REGISTERS: &[ConfigRegister] = {
-    use Confidence::{Observed, Verified};
+    use Confidence::{Inferred, Observed, Verified};
     use ConfigRegister as Entry;
     use Role::{Dynamic, Endpoint, Identity, Inert, Metadata};
 
@@ -773,15 +833,68 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         Entry::new(26, "default_gateway", Inert, Observed),
         Entry::new(30, "timezone", Metadata, Verified),
         Entry::new(31, "datetime", Dynamic, Verified),
+        // Commands rather than settings: each takes "1" and does something. Absent from the device's own
+        // identity report yet writable and effective, which is why presence in a report must never gate an
+        // action.
+        Entry::on_request(32, "restart", Dynamic, Observed),
+        Entry::on_request(35, "clear_log", Dynamic, Observed),
+        // The Bluetooth handshake key, per device — not the constant published in the vendor application.
+        // Identity because it is a credential: readable here because this socket belongs to the device's
+        // owner, and redacted out of anything committed.
+        Entry::on_request(54, "ble_handshake_key", Identity, Verified),
+        // The joined network and its passphrase, both in clear. The passphrase is why an identity report is
+        // not something to forward or store carelessly.
+        Entry::on_request(56, "wifi_ssid", Identity, Observed),
+        Entry::on_request(57, "wifi_passphrase", Identity, Observed),
+        // The running build's ESP-IDF version. A release fingerprint obtainable without a firmware image:
+        // it moves when the datalogger firmware does.
+        Entry::on_request(61, "sdk_version", Metadata, Observed),
         // Verified against the vendor's own web interface, which showed "Good(-72)" while this register read
         // -72: the unit is dBm and the sign is as sent.
         Entry::new(76, "wifi_signal", Dynamic, Verified),
+        // The last update URL the device was actually told to install — one slot, durable across months.
+        // Dynamic because a firmware campaign changes it, and that change is the thing worth catching.
+        Entry::on_request(80, "update_url", Dynamic, Observed),
+        // A second copy of the network identity. Whether these track the live interface is not established —
+        // 14/25/26 demonstrably do not — so the names say what the field holds, not that it is current.
+        Entry::on_request(105, "network_mac", Identity, Inferred),
+        Entry::on_request(106, "network_ip", Inert, Inferred),
+        Entry::on_request(107, "network_mask", Inert, Inferred),
+        Entry::on_request(108, "network_gateway", Inert, Inferred),
+        Entry::on_request(109, "network_dns", Inert, Inferred),
+        // A live link diagnostic: Wi-Fi error count, reconnect count, and the server's view of signal.
+        Entry::on_request(121, "link_diagnostics", Dynamic, Observed),
+        // Fifteen slots of connection-event records, one per entry, most recent eviction policy unestablished.
+        Entry::on_request(124, "connection_event_00", Dynamic, Observed),
+        Entry::on_request(125, "connection_event_01", Dynamic, Observed),
+        Entry::on_request(126, "connection_event_02", Dynamic, Observed),
+        Entry::on_request(127, "connection_event_03", Dynamic, Observed),
+        Entry::on_request(128, "connection_event_04", Dynamic, Observed),
+        Entry::on_request(129, "connection_event_05", Dynamic, Observed),
+        Entry::on_request(130, "connection_event_06", Dynamic, Observed),
+        Entry::on_request(131, "connection_event_07", Dynamic, Observed),
+        Entry::on_request(132, "connection_event_08", Dynamic, Observed),
+        Entry::on_request(133, "connection_event_09", Dynamic, Observed),
+        Entry::on_request(134, "connection_event_10", Dynamic, Observed),
+        Entry::on_request(135, "connection_event_11", Dynamic, Observed),
+        Entry::on_request(136, "connection_event_12", Dynamic, Observed),
+        Entry::on_request(137, "connection_event_13", Dynamic, Observed),
+        Entry::on_request(138, "connection_event_14", Dynamic, Observed),
+        // DHCP lease history, on the network the device is actually joined to.
+        Entry::on_request(139, "dhcp_lease_0", Identity, Observed),
+        Entry::on_request(140, "dhcp_lease_1", Identity, Observed),
+        // A concatenation of several other registers, including the handshake key of 54. Purpose unknown;
+        // named and marked Identity anyway, because whatever it is for it carries a credential.
+        Entry::on_request(144, "assembled_values", Identity, Inferred),
     ]
 };
 
 #[cfg(test)]
 mod tests {
-    use super::{BATTERY_STATUS_LABELS, INPUT_BASE_OFFSET, INPUT_REGISTERS, InputRegister, Kind, WORK_MODE_LABELS};
+    use super::{
+        BATTERY_STATUS_LABELS, CONFIG_REGISTER_LAST, CONFIG_REGISTERS, ConfigRegister, INPUT_BASE_OFFSET,
+        INPUT_REGISTERS, InputRegister, Kind, Role, WORK_MODE_LABELS,
+    };
     use crate::model::{Confidence, Raw, Register, Unit, Value};
 
     #[test]
@@ -938,5 +1051,67 @@ mod tests {
             })
             .sum();
         assert_eq!(total * 2, 16);
+    }
+
+    #[test]
+    fn config_registers_are_sorted_and_unique() {
+        // Lookup is a linear scan, so a duplicate would not fail — it would silently shadow, and the
+        // shadowed entry would be the one someone later edits. Sortedness is what makes that visible.
+        let numbers: Vec<u16> = CONFIG_REGISTERS.iter().map(|entry| entry.register.number()).collect();
+        let mut expected = numbers.clone();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(
+            numbers, expected,
+            "config table must be sorted by register, without duplicates"
+        );
+    }
+
+    #[test]
+    fn config_register_names_are_unique() {
+        // `lookup_name` resolves the API's `/config/{name}` route, so two entries sharing a name would make
+        // one of them unreachable by name.
+        let mut names: Vec<&str> = CONFIG_REGISTERS.iter().map(|entry| entry.name).collect();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), before, "config register names must be unique");
+    }
+
+    #[test]
+    fn config_registers_lie_within_the_bounded_space() {
+        // A firmware loop bound, confirmed by a device sweep that answered on 0–145 and nothing above. An
+        // entry outside that is a transcription error.
+        for entry in CONFIG_REGISTERS {
+            assert!(
+                entry.register.number() <= CONFIG_REGISTER_LAST,
+                "config register {} is outside 0–145",
+                entry.register.number()
+            );
+        }
+    }
+
+    #[test]
+    fn credential_bearing_config_registers_are_marked_identity() {
+        // The Identity role is what a fixture generator redacts on. These four carry secrets — the Bluetooth
+        // handshake key, the Wi-Fi passphrase, and the assembled value that embeds the key — so a change that
+        // reclassified one would quietly widen what a committed capture may contain.
+        for (number, name) in [
+            (54, "ble_handshake_key"),
+            (57, "wifi_passphrase"),
+            (144, "assembled_values"),
+        ] {
+            let entry = ConfigRegister::lookup(Register(number)).expect(name);
+            assert_eq!(entry.name, name);
+            assert_eq!(entry.role, Role::Identity, "config {number} carries a credential");
+        }
+    }
+
+    #[test]
+    fn the_firmware_update_register_is_named() {
+        // The register the write filter refuses on. Naming it is what turns "write-config(80)" in a log line
+        // into something readable without a lookup.
+        let entry = ConfigRegister::lookup(Register(80)).expect("register 80");
+        assert_eq!(entry.name, "update_url");
     }
 }

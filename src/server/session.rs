@@ -29,7 +29,7 @@ use crate::growatt::v7::decode::{FromFrame, ReadResponse, Telemetry, WriteAck};
 use crate::growatt::v7::encode::{Command, EncodeError};
 use crate::growatt::v7::frame::{Frame, MessageType};
 use crate::growatt::v7::identity::Identity;
-use crate::growatt::v7::registers::{HoldingRegister, Role as ConfigRole};
+use crate::growatt::v7::registers::{ConfigRegister, HoldingRegister, Role as ConfigRole};
 use crate::growatt::{Codec, peek_version};
 use crate::model::{Confidence, Hex, Raw, Register, Timestamp, Unit};
 use crate::mqtt::{Packet, PacketStream, Publish, QoS, StreamError};
@@ -1304,6 +1304,21 @@ where
     /// Everything it reported, in the order sent: this is the owner's own device on the owner's own socket,
     /// so the serial and password fields are served like any other. What must not carry them is a committed
     /// fixture, which is the fixture generator's business rather than this one's.
+    /// The documented field name a config-bearing intent refers to, for a log line.
+    ///
+    /// `write-config(80)` says nothing without the map open beside it; `field=update_url` says which
+    /// setting the cloud tried to change. Only config intents resolve — a holding register shares the
+    /// number space with a different meaning, so naming one from this table would be worse than silence.
+    ///
+    /// Lives here rather than in [`Intent`]'s `Display`: the policy layer is deliberately
+    /// generation-neutral, and the register map is generation 7's.
+    fn intent_field(intent: &Intent) -> Option<&'static str> {
+        match intent {
+            Intent::WriteConfig { register } => ConfigRegister::lookup(*register).map(|entry| entry.name),
+            _ => None,
+        }
+    }
+
     fn publish_identity(&self) {
         let (Some(out), Some(identity)) = (self.identity_out.as_ref(), self.identity.as_ref()) else {
             return;
@@ -1487,6 +1502,7 @@ where
             self.record(RecordStream::Blocked, &message.payload);
             tracing::warn!(
                 %intent,
+                field = Self::intent_field(&intent),
                 %refusal,
                 topic = %message.topic,
                 count = self.stats.refused_to_device,

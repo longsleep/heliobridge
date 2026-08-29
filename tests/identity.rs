@@ -15,7 +15,7 @@
 use heliobridge::growatt::v7::decode::FromFrame;
 use heliobridge::growatt::v7::frame::{Frame, MessageType};
 use heliobridge::growatt::v7::identity::{Entry, Identity};
-use heliobridge::growatt::v7::registers::{CONFIG_REGISTERS, ConfigRegister, Role};
+use heliobridge::growatt::v7::registers::{Availability, CONFIG_REGISTER_LAST, CONFIG_REGISTERS, ConfigRegister, Role};
 use heliobridge::model::Register;
 
 /// A full report as the device sends it, 401 octets.
@@ -177,17 +177,45 @@ fn the_report_does_not_enumerate_every_writable_register() {
 }
 
 #[test]
-fn every_documented_config_register_is_either_reported_or_deliberately_absent() {
+fn availability_matches_what_the_device_actually_reports() {
     let frame = Frame::parse(FULL_REPORT).expect("the fixture parses");
     let report = Identity::from_frame(&frame).expect("the identity report decodes");
-    let missing: Vec<&str> = CONFIG_REGISTERS
+
+    // Each entry's own declaration, checked against real device bytes in both directions. This lives on the
+    // definition rather than in a list beside the tests: the map is where a register gets added, and a
+    // separate list is a second place to forget.
+    for entry in CONFIG_REGISTERS {
+        let reported = report.reports(entry.register);
+        let (number, name) = (entry.register.number(), entry.name);
+        match entry.availability {
+            Availability::Reported => assert!(
+                reported,
+                "config {number} ({name}) is declared Reported but this device does not volunteer it"
+            ),
+            Availability::OnRequest => assert!(
+                !reported,
+                "config {number} ({name}) is declared OnRequest but appears in the report"
+            ),
+        }
+    }
+}
+
+#[test]
+fn the_report_is_a_minority_of_the_space() {
+    let frame = Frame::parse(FULL_REPORT).expect("the fixture parses");
+    let report = Identity::from_frame(&frame).expect("the identity report decodes");
+
+    // 32 volunteered out of the 146 that exist. That gap is the whole reason reading the space is an
+    // operation rather than a matter of waiting for a report.
+    assert_eq!(report.entries.len(), 32);
+    assert_eq!(CONFIG_REGISTER_LAST, 145);
+    let on_request = CONFIG_REGISTERS
         .iter()
-        .filter(|entry| !report.reports(entry.register))
-        .map(|entry| entry.name)
-        .collect();
+        .filter(|entry| entry.availability == Availability::OnRequest)
+        .count();
     assert!(
-        missing.is_empty(),
-        "the map documents registers this device does not report: {missing:?}"
+        on_request > 0,
+        "the map names registers the device never volunteers; losing that would hide them"
     );
 }
 
