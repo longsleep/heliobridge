@@ -833,38 +833,30 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         Entry::new(26, "default_gateway", Inert, Observed),
         Entry::new(30, "timezone", Metadata, Verified),
         Entry::new(31, "datetime", Dynamic, Verified),
-        // Commands rather than settings: each takes "1" and does something. Absent from the device's own
-        // identity report yet writable and effective, which is why presence in a report must never gate an
-        // action.
+        // Commands rather than settings: each takes "1". Absent from the identity report, yet writable.
         Entry::on_request(32, "restart", Dynamic, Observed),
         Entry::on_request(35, "clear_log", Dynamic, Observed),
-        // The Bluetooth handshake key, per device — not the constant published in the vendor application.
-        // Identity because it is a credential: readable here because this socket belongs to the device's
-        // owner, and redacted out of anything committed.
+        // The Bluetooth handshake key, per device. A credential: Identity, so a fixture redacts it.
         Entry::on_request(54, "ble_handshake_key", Identity, Verified),
-        // The joined network and its passphrase, both in clear. The passphrase is why an identity report is
-        // not something to forward or store carelessly.
+        // The joined network and its passphrase, both in clear.
         Entry::on_request(56, "wifi_ssid", Identity, Observed),
         Entry::on_request(57, "wifi_passphrase", Identity, Observed),
-        // The running build's ESP-IDF version. A release fingerprint obtainable without a firmware image:
-        // it moves when the datalogger firmware does.
+        // The running build's ESP-IDF version.
         Entry::on_request(61, "sdk_version", Metadata, Observed),
         // Verified against the vendor's own web interface, which showed "Good(-72)" while this register read
         // -72: the unit is dBm and the sign is as sent.
         Entry::new(76, "wifi_signal", Dynamic, Verified),
-        // The last update URL the device was actually told to install — one slot, durable across months.
-        // Dynamic because a firmware campaign changes it, and that change is the thing worth catching.
+        // The last update URL the device was told to install. One slot.
         Entry::on_request(80, "update_url", Dynamic, Observed),
-        // A second copy of the network identity. Whether these track the live interface is not established —
-        // 14/25/26 demonstrably do not — so the names say what the field holds, not that it is current.
+        // A second MAC, address, mask, gateway and DNS.
         Entry::on_request(105, "network_mac", Identity, Inferred),
         Entry::on_request(106, "network_ip", Inert, Inferred),
         Entry::on_request(107, "network_mask", Inert, Inferred),
         Entry::on_request(108, "network_gateway", Inert, Inferred),
         Entry::on_request(109, "network_dns", Inert, Inferred),
-        // A live link diagnostic: Wi-Fi error count, reconnect count, and the server's view of signal.
-        Entry::on_request(121, "link_diagnostics", Dynamic, Observed),
-        // Fifteen slots of connection-event records, one per entry, most recent eviction policy unestablished.
+        // A string of labelled fields: `state`, `err_wifi`, `reconnect`, `server`.
+        Entry::on_request(121, "link_diagnostics", Inert, Inferred),
+        // Fifteen slots, each a timestamped connection-event record.
         Entry::on_request(124, "connection_event_00", Dynamic, Observed),
         Entry::on_request(125, "connection_event_01", Dynamic, Observed),
         Entry::on_request(126, "connection_event_02", Dynamic, Observed),
@@ -880,11 +872,10 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         Entry::on_request(136, "connection_event_12", Dynamic, Observed),
         Entry::on_request(137, "connection_event_13", Dynamic, Observed),
         Entry::on_request(138, "connection_event_14", Dynamic, Observed),
-        // DHCP lease history, on the network the device is actually joined to.
+        // DHCP lease history.
         Entry::on_request(139, "dhcp_lease_0", Identity, Observed),
         Entry::on_request(140, "dhcp_lease_1", Identity, Observed),
-        // A concatenation of several other registers, including the handshake key of 54. Purpose unknown;
-        // named and marked Identity anyway, because whatever it is for it carries a credential.
+        // A concatenation of several other registers, including the handshake key of 54.
         Entry::on_request(144, "assembled_values", Identity, Inferred),
     ]
 };
