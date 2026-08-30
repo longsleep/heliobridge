@@ -133,12 +133,21 @@ impl Topics {
         format!("{}/{device}/status", self.base)
     }
 
+    /// Where the datalogger's own configuration goes: signal, reporting interval, link diagnostics.
+    ///
+    /// Its own topic rather than fields in `state`, because it is a different address space arriving on a
+    /// different schedule — once per connect, where telemetry arrives every five seconds.
+    pub fn config(&self, device: &str) -> String {
+        format!("{}/{device}/config", self.base)
+    }
+
     /// Which topic carries a given kind of state.
     pub fn topic_for(&self, source: Source, device: &str) -> String {
         match source {
             Source::Telemetry => self.state(device),
             Source::Settings => self.settings(device),
             Source::Status => self.status(device),
+            Source::Config => self.config(device),
         }
     }
 
@@ -286,7 +295,8 @@ mod tests {
         // telemetry with an object missing every reading.
         let topics = Topics::default();
         let device = "0EXAMPLE00000001";
-        let all = [Source::Telemetry, Source::Settings, Source::Status].map(|source| topics.topic_for(source, device));
+        let all = [Source::Telemetry, Source::Settings, Source::Status, Source::Config]
+            .map(|source| topics.topic_for(source, device));
         assert_eq!(all[0], topics.state(device));
         assert_eq!(all[1], topics.settings(device));
         assert_eq!(all[2], topics.status(device));

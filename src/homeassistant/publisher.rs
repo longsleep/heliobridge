@@ -375,6 +375,7 @@ impl Link {
                     }
                     // A device that has just said what model it is deserves a device page that says so.
                     self.announce();
+                    self.publish_config();
                 }
 
                 () = async move {
@@ -526,26 +527,55 @@ impl Link {
     /// still be holding whatever a previous run left there. A second battery announced before the device
     /// said it has one is exactly that case.
     fn withdraw(&mut self, keeping: &[Entity]) -> usize {
+        // Whether this is the first announcement of the session, which is the one that has to assume the
+        // broker holds whatever some other run left there.
+        let first = self.announced.is_none();
         let previous = match self.announced.take() {
             Some(announced) => announced.entities,
             None => Catalogue::everything(),
         };
 
-        let gone: Vec<(Component, &'static str)> = previous
-            .iter()
-            .filter(|entity| {
-                !keeping
-                    .iter()
-                    .any(|kept| kept.key == entity.key && kept.component == entity.component)
-            })
-            .map(|entity| (entity.component, entity.key))
-            .collect();
+        let retired = if first { Catalogue::RETIRED } else { &[] };
+        let gone = Self::retractions(&previous, keeping, retired);
 
         for (component, key) in &gone {
             let topic = self.topics.discovery(*component, &self.device, key);
             self.publish(Publication::retained(topic, Vec::new()));
         }
         gone.len()
+    }
+
+    /// Which discovery topics need an empty retained payload.
+    ///
+    /// Pure, and separated from the publishing for one reason: [`Catalogue::RETIRED`] is empty in every
+    /// build that has shipped, so the branch that sweeps it would otherwise never execute and could rot
+    /// unnoticed until the day it mattered. A test passes a synthetic entry through here instead.
+    fn retractions(
+        previous: &[Entity],
+        keeping: &[Entity],
+        retired: &[(Component, &'static str)],
+    ) -> Vec<(Component, &'static str)> {
+        let kept = |component: Component, key: &str| {
+            keeping
+                .iter()
+                .any(|entity| entity.key == key && entity.component == component)
+        };
+
+        let mut gone: Vec<(Component, &'static str)> = previous
+            .iter()
+            .filter(|entity| !kept(entity.component, entity.key))
+            .map(|entity| (entity.component, entity.key))
+            .collect();
+
+        // Entities this program used to publish. They cannot appear in `previous` — the catalogue is built
+        // from the code and their constructors are gone — so without this the retained discovery message
+        // outlives every trace of the entity that produced it.
+        for entry in retired {
+            if !kept(entry.0, entry.1) && !gone.contains(entry) {
+                gone.push(*entry);
+            }
+        }
+        gone
     }
 
     /// How many battery packs to publish entities for.
@@ -571,6 +601,19 @@ impl Link {
         let status =
             StatePayload::status(self.present, self.last_update.as_deref()).retained(self.topics.status(&self.device));
         self.publish(status);
+    }
+
+    /// Publish the datalogger configuration worth showing.
+    fn publish_config(&mut self) {
+        let entries = self.session.identity.borrow().as_ref().map(|view| view.entries.clone());
+        let Some(entries) = entries else { return };
+        let payload = StatePayload::config(&entries, &self.fields);
+        if payload.is_empty() {
+            return;
+        }
+        // Retained, unlike telemetry: it arrives once per connect, so a subscriber joining mid-session
+        // would otherwise see nothing until the device reconnected.
+        self.publish(payload.retained(self.topics.config(&self.device)));
     }
 
     /// Publish one telemetry frame.
@@ -674,7 +717,9 @@ fn reading(view: &TelemetryView, name: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FAREWELL_DEPTH, Fields, Generation, Link, OFFLINE_AFTER, PublisherOptions, reading};
+    use super::{
+        Catalogue, Component, FAREWELL_DEPTH, Fields, Generation, Link, OFFLINE_AFTER, PublisherOptions, reading,
+    };
     use crate::control::{IdentityView, ReadingView, SessionHandle, SettingView, StatusView, TelemetryView};
     use crate::homeassistant::broker::{Publication, Publications};
     use crate::homeassistant::topics::Topics;
@@ -1128,5 +1173,51 @@ mod tests {
         };
         assert_eq!(reading(&view, "battery_pack_count"), Some(2));
         assert_eq!(reading(&view, "ac_power"), None);
+    }
+
+    #[test]
+    fn a_retired_entity_is_withdrawn_even_though_the_catalogue_forgot_it() {
+        // The case the retired list exists for: an entity deleted from the code, so it appears in neither
+        // what is being kept nor what the catalogue can describe. Without the list nothing would ever
+        // retract its retained discovery message.
+        let keeping = Catalogue::everything();
+        let retired = [(Component::Sensor, "a_deleted_sensor")];
+
+        let gone = Link::retractions(&[], &keeping, &retired);
+        assert!(
+            gone.contains(&(Component::Sensor, "a_deleted_sensor")),
+            "a retired entity must be retracted: {gone:?}"
+        );
+    }
+
+    #[test]
+    fn a_retired_key_that_came_back_is_not_withdrawn() {
+        // Reusing a key would otherwise retract the live entity moments after announcing it.
+        let revived = Catalogue::everything()
+            .into_iter()
+            .find(|entity| entity.component == Component::Sensor)
+            .expect("a sensor exists");
+        let retired = [(revived.component, revived.key)];
+
+        let gone = Link::retractions(&[], core::slice::from_ref(&revived), &retired);
+        assert!(
+            !gone.contains(&(revived.component, revived.key)),
+            "a key in use must not be retracted: {gone:?}"
+        );
+    }
+
+    #[test]
+    fn the_shipped_retired_list_names_nothing_still_published() {
+        // A guard for the future rather than for today, since the list is empty: an entry left in place
+        // after its key was reintroduced would silently retract a live entity on every reconnect.
+        let live = Catalogue::everything();
+        for (component, key) in Catalogue::RETIRED {
+            assert!(
+                !live
+                    .iter()
+                    .any(|entity| entity.key == *key && entity.component == *component),
+                "{component}/{key} is both retired and published"
+            );
+        }
     }
 }

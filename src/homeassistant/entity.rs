@@ -109,6 +109,12 @@ pub enum Source {
     Settings,
     /// What this bridge knows about the device rather than from it.
     Status,
+    /// Datalogger configuration, from the identity report the device sends on connect.
+    ///
+    /// A fourth address space rather than a fourth flavour of the same one, and mostly not entity
+    /// material: most of it is static, inert, or identifying. The handful published here are the ones
+    /// that change and mean something.
+    Config,
 }
 
 /// What an entity's availability depends on.
@@ -330,6 +336,64 @@ impl Entity {
         }
     }
 
+    /// How strong the datalogger's Wi-Fi is, in dBm.
+    ///
+    /// Config register 76, which the device volunteers on every connect, so this costs no traffic. Verified
+    /// against the vendor's own web interface, which showed "Good(-72)" while the register read -72 — the
+    /// unit is dBm and the sign is as sent.
+    pub fn wifi_signal() -> Self {
+        Self {
+            key: "wifi_signal",
+            name: "Wi-Fi signal".to_owned(),
+            component: Component::Sensor,
+            device_class: Some("signal_strength"),
+            unit: Some("dBm"),
+            category: Some(Category::Diagnostic),
+            precision: Some(0),
+            shape: Shape::Reading(Some(StateClass::Measurement)),
+            source: Source::Config,
+            presence: Presence::Device,
+        }
+    }
+
+    /// How often the device says it reports, in seconds.
+    ///
+    /// Config register 4. It qualifies [`Self::last_update`]: how stale a reading is only means something
+    /// against how often one is expected. Every frame ever captured says 5.
+    pub fn data_interval() -> Self {
+        Self {
+            key: "data_interval",
+            name: "Telemetry interval".to_owned(),
+            component: Component::Sensor,
+            device_class: None,
+            unit: Some("s"),
+            category: Some(Category::Diagnostic),
+            precision: Some(0),
+            shape: Shape::Reading(None),
+            source: Source::Config,
+            presence: Presence::Device,
+        }
+    }
+
+    /// The serial the device identifies itself by.
+    ///
+    /// Already the device page's `serial_number`, and repeated as an entity because that field cannot be
+    /// templated against while an entity can. Config register 8, which is also the MQTT client identifier.
+    pub fn serial_number() -> Self {
+        Self {
+            key: "serial_number",
+            name: "Serial number".to_owned(),
+            component: Component::Sensor,
+            device_class: None,
+            unit: None,
+            category: Some(Category::Diagnostic),
+            precision: None,
+            shape: Shape::Reading(None),
+            source: Source::Config,
+            presence: Presence::Device,
+        }
+    }
+
     /// The same entity with nothing writable about it.
     ///
     /// What `HELIOBRIDGE_ALLOW_WRITES=false` produces: a setting still worth seeing, published as a plain
@@ -446,8 +510,29 @@ impl Catalogue {
         readings
             .chain(settings)
             .chain([Entity::connected(), Entity::last_update(), Entity::bridge_version()])
+            .chain([Entity::wifi_signal(), Entity::data_interval(), Entity::serial_number()])
             .collect()
     }
+
+    /// Entities this program once published and no longer does.
+    ///
+    /// [`Self::everything`] is built from the register maps, so by construction it cannot describe an
+    /// entity whose constructor has been **deleted**. That makes a removal invisible to the very
+    /// reconciliation meant to clean up after one: the retained discovery message stays on the broker,
+    /// Home Assistant keeps the entity forever, and it survives restarts because the retained message
+    /// re-creates it. Nothing in the code would ever mention it again, so nothing would ever notice.
+    ///
+    /// This is the memory the catalogue otherwise lacks. An entry is a `(component, key)` pair, because the
+    /// component picks the discovery topic — the same reason `everything` includes both forms of a setting.
+    ///
+    /// **Add to this list in the same change that deletes an entity**, and leave the entry in place. It
+    /// costs one empty retained publish per session on a topic that is already empty; the alternative is a
+    /// stale entity on someone's dashboard that only a hand-run `mosquitto_pub` can remove.
+    ///
+    /// Empty, and correctly so: no released version of this program has ever announced an entity that a
+    /// later one withdrew. An entity that existed only between two commits needs no entry — nobody's broker
+    /// ever held it. The list is for entities that reached a release.
+    pub const RETIRED: &'static [(Component, &'static str)] = &[];
 
     /// Every entity any configuration of this device could produce.
     ///

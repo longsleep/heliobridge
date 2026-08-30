@@ -15,7 +15,7 @@ use std::collections::HashSet;
 
 use serde_json::{Map, Number, Value, json};
 
-use crate::control::{SettingView, TelemetryView};
+use crate::control::{ConfigView, SettingView, TelemetryView};
 use crate::homeassistant::broker::Publication;
 use crate::homeassistant::entity::Entity;
 use crate::homeassistant::topics::{OFFLINE, ONLINE};
@@ -89,6 +89,33 @@ impl StatePayload {
         object.insert("bridge_version".to_owned(), json!(crate::VERSION));
         if let Some(stamp) = last_update {
             object.insert("last_update".to_owned(), json!(stamp));
+        }
+        Self(object)
+    }
+
+    /// The datalogger's configuration, from the identity report.
+    ///
+    /// Only the named registers an entity was declared for. The report carries 32 and most are static,
+    /// inert or identifying; publishing the rest would put a device page's worth of constants on a
+    /// dashboard.
+    pub fn config(entries: &[ConfigView], fields: &Fields) -> Self {
+        let mut object = Map::new();
+        for entry in entries {
+            let Some(name) = entry.name else { continue };
+            if !fields.contains(name) {
+                continue;
+            }
+            // Every config value is ASCII on the wire whatever the field means, so a numeric entity needs
+            // it parsed. A value that will not parse is left out rather than sent as text: Home Assistant
+            // would take "abc" for a dBm reading and show it as unknown anyway, but noisily.
+            let value = match name {
+                "wifi_signal" | "data_interval" => match entry.value.trim().parse::<i64>() {
+                    Ok(number) => json!(number),
+                    Err(_) => continue,
+                },
+                _ => json!(entry.value),
+            };
+            object.insert(name.to_owned(), value);
         }
         Self(object)
     }
