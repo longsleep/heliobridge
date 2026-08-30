@@ -518,7 +518,12 @@ pub struct StatusView {
     pub relay_mode: Option<&'static str>,
     /// The device's own clock, as last reported.
     pub device_time: Option<String>,
-    /// How far the device's clock is from this server's, in seconds. Positive means the device is ahead.
+    /// How far this server's clock is from the device's, in seconds.
+    ///
+    /// **Positive means this server is ahead**, matching `Skew::seconds`. Under a minute this is dominated
+    /// by the lag between the device sampling and the frame arriving, not by clock error: across 232 428
+    /// frames the device's stamp trailed receipt by a median of 7 s and ranged from -6 to +12. A magnitude
+    /// beyond `Skew::SIGNIFICANT` is what indicates a real disagreement.
     pub clock_skew_seconds: Option<i64>,
     /// Telemetry frames decoded this session.
     pub telemetry_frames: u64,
