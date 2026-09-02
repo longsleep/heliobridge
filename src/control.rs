@@ -846,19 +846,19 @@ fn restrict(path: &Path) {
 enum DeviceAction {
     /// Restart the datalogger. Recoverable: it reboots and reconnects by itself.
     Restart,
-    /// Clear the datalogger's log.
-    ClearLog,
+    /// Reset the datalogger to factory defaults. **Destructive**: see [`Self::effect`].
+    FactoryReset,
 }
 
 impl DeviceAction {
     /// Every action offered.
-    const ALL: [Self; 2] = [Self::Restart, Self::ClearLog];
+    const ALL: [Self; 2] = [Self::Restart, Self::FactoryReset];
 
     /// The name in the route.
     const fn name(self) -> &'static str {
         match self {
             Self::Restart => "restart",
-            Self::ClearLog => "clear-log",
+            Self::FactoryReset => "factory-reset",
         }
     }
 
@@ -869,7 +869,12 @@ impl DeviceAction {
                 "reboots the datalogger; the session drops and returns within seconds, and telemetry pauses \
                  meanwhile. The inverter keeps running"
             }
-            Self::ClearLog => "clears the datalogger's own log; no effect on telemetry or settings",
+            Self::FactoryReset => {
+                "resets the datalogger to factory defaults. The serial, the clock and the server endpoint \
+                 survive; the Wi-Fi credentials do not, so the device leaves the network and must be \
+                 re-provisioned over Bluetooth, in person. The Bluetooth key returns to the published \
+                 constant"
+            }
         }
     }
 
@@ -877,7 +882,7 @@ impl DeviceAction {
     const fn config(self) -> WritableConfig {
         match self {
             Self::Restart => WritableConfig::Restart,
-            Self::ClearLog => WritableConfig::ClearLog,
+            Self::FactoryReset => WritableConfig::FactoryReset,
         }
     }
 
@@ -885,7 +890,7 @@ impl DeviceAction {
     fn command(self) -> Command {
         match self {
             Self::Restart => Command::restart_datalogger(),
-            Self::ClearLog => Command::clear_datalogger_log(),
+            Self::FactoryReset => Command::factory_reset(),
         }
     }
 

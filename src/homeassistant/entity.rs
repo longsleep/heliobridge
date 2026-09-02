@@ -379,6 +379,32 @@ impl Entity {
         }
     }
 
+    /// Restart the datalogger.
+    ///
+    /// Config register 32, the one action worth offering: the device reboots, reconnects by itself within
+    /// seconds, and the inverter keeps running throughout — so the cost of an accidental press is a gap in
+    /// telemetry. Its sibling, the factory reset of register 35, is deliberately **not** published: it
+    /// clears the Wi-Fi credentials, and recovering from that means standing next to the device with a
+    /// Bluetooth client.
+    ///
+    /// A button carries no state, so unlike the other config entities this names a register the device
+    /// never reports — there is nothing to report. Home Assistant is told not to enable it by default;
+    /// rebooting hardware should be a deliberate act.
+    pub fn restart() -> Self {
+        Self {
+            key: "restart",
+            name: "Restart datalogger".to_owned(),
+            component: Component::Button,
+            device_class: Some("restart"),
+            unit: None,
+            category: Some(Category::Config),
+            precision: None,
+            shape: Shape::Action,
+            source: Source::Config,
+            presence: Presence::Device,
+        }
+    }
+
     /// The serial the device identifies itself by.
     ///
     /// Already the device page's `serial_number`, and repeated as an entity because that field cannot be
@@ -515,6 +541,9 @@ impl Catalogue {
             .chain(settings)
             .chain([Entity::connected(), Entity::last_update(), Entity::bridge_version()])
             .chain([Entity::wifi_signal(), Entity::data_interval(), Entity::serial_number()])
+            // An action has nothing to publish but a control, so refusing writes withdraws it entirely
+            // rather than downgrading it to a reading the way a setting does.
+            .chain(self.permitted.writes.then(Entity::restart))
             .collect()
     }
 
@@ -789,9 +818,11 @@ mod tests {
     /// structurally rather than remembering.
     #[test]
     fn every_config_entity_reads_a_register_the_device_reports() {
+        // Actions are excluded because they carry no state at all: a button has no state topic, so there
+        // is nothing for the device to report and no register to require in the identity report.
         let published: Vec<_> = Catalogue::everything()
             .into_iter()
-            .filter(|entity| entity.source == Source::Config)
+            .filter(|entity| entity.source == Source::Config && entity.shape != Shape::Action)
             .collect();
         assert!(
             !published.is_empty(),

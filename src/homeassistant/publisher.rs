@@ -26,7 +26,7 @@ use tokio::time::Instant;
 
 use crate::control::{Action as ControlAction, Connected, Registry, SessionHandle, TelemetryView};
 use crate::homeassistant::broker::{Broker, BrokerConfig, BrokerError, Event, Publication, Publications};
-use crate::homeassistant::command::{Change, Permitted};
+use crate::homeassistant::command::{Change, Delivery, Permitted};
 use crate::homeassistant::discovery::{DeviceBlock, Discovery};
 use crate::homeassistant::entity::{Catalogue, Component, Entity};
 use crate::homeassistant::state::{Fields, StatePayload};
@@ -661,6 +661,16 @@ impl Link {
 async fn apply(session: &SessionHandle, device: &str, change: Change) {
     let also_read = change.also_read();
     tracing::info!(%device, setting = %change.key, "applying a command from Home Assistant");
+
+    // An action is transmitted and answered as sent. Putting it through `Apply` would wait for a read-back
+    // that the config space never produces, and report a working restart as a failure to confirm.
+    if change.delivery == Delivery::FireAndForget {
+        match session.carry_out(ControlAction::Send(change.command)).await {
+            Ok(_outcome) => tracing::info!(%device, action = %change.key, "sent"),
+            Err(error) => tracing::warn!(%device, action = %change.key, %error, "could not be sent"),
+        }
+        return;
+    }
 
     match session.carry_out(ControlAction::Apply(change.command)).await {
         Ok(outcome) if outcome.confirmed => {

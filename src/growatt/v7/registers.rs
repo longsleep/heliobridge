@@ -835,7 +835,7 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         Entry::new(31, "datetime", Dynamic, Verified),
         // Commands rather than settings: each takes "1". Absent from the identity report, yet writable.
         Entry::on_request(32, "restart", Dynamic, Observed),
-        Entry::on_request(35, "clear_log", Dynamic, Observed),
+        Entry::on_request(35, "factory_reset", Dynamic, Vendor),
         // The Bluetooth handshake key, per device. A credential: Identity, so a fixture redacts it.
         Entry::on_request(54, "ble_handshake_key", Identity, Verified),
         // The joined network and its passphrase, both in clear.

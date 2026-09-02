@@ -20,7 +20,7 @@
 use serde_json::Value;
 use snafu::Snafu;
 
-use crate::growatt::v7::encode::{Command, EncodeError};
+use crate::growatt::v7::encode::{Command, EncodeError, WritableConfig};
 use crate::growatt::v7::registers::{Domain, HoldingRegister, SLOT_COUNT};
 use crate::model::Register;
 
@@ -106,7 +106,17 @@ pub enum CommandError {
     },
 }
 
-/// One setting change, ready to send.
+/// How a change is delivered, and what counts as success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// A setting: written, then read back, and the stored value is what gets published.
+    Confirmed,
+    /// An action: transmitted, with nothing to read back. The config space draws no acknowledgement and
+    /// these registers hold no readable value, so "sent" is the strongest answer available.
+    FireAndForget,
+}
+
+/// One setting change or action, ready to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
     /// The field name, for logging and for the read-back that follows.
@@ -115,6 +125,8 @@ pub struct Change {
     pub register: Register,
     /// The command that carries it out.
     pub command: Command,
+    /// How to deliver it.
+    pub delivery: Delivery,
 }
 
 impl Change {
@@ -141,6 +153,10 @@ impl Change {
 
     /// One field of a command payload.
     fn one(key: &str, value: &Value, permitted: Permitted) -> Result<Self, CommandError> {
+        if let Some(action) = Self::action(key, permitted) {
+            return action;
+        }
+
         let register = HoldingRegister::resync_set(SLOT_COUNT)
             .into_iter()
             .find(|entry| entry.name == key)
@@ -168,7 +184,38 @@ impl Change {
             key: key.to_owned(),
             register: register.register,
             command,
+            delivery: Delivery::Confirmed,
         })
+    }
+
+    /// The config-space action a key names, if it names one.
+    ///
+    /// Resolved from the encoder's own list rather than a second table here, so a name can only mean what
+    /// the encoder already says it means. A destructive action is refused rather than left unmatched: it is
+    /// not published as an entity, and a command naming it — retained on the broker, or hand-published —
+    /// must not get through a control that was never offered.
+    fn action(key: &str, permitted: Permitted) -> Option<Result<Self, CommandError>> {
+        let action = WritableConfig::ALL
+            .into_iter()
+            .find(|config| config.is_action() && config.name() == key)?;
+
+        // Both refusals produce the same answer, because both mean the same thing to a caller: this
+        // name is not a control that may be operated. Destructive actions are never offered, and refusing
+        // writes withdraws the rest.
+        if action.is_destructive() || !permitted.allows(key) {
+            return Some(Err(CommandError::Refused { key: key.to_owned() }));
+        }
+        let value = action.trigger_value()?.to_owned();
+
+        Some(Ok(Self {
+            key: key.to_owned(),
+            register: action.register(),
+            command: Command::WriteConfig {
+                register: action,
+                value,
+            },
+            delivery: Delivery::FireAndForget,
+        }))
     }
 
     /// Whether this change may have moved another register with it.
@@ -237,7 +284,7 @@ fn rendered(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Change, CommandError, POWER_PLUS, Permitted};
+    use super::{Change, CommandError, POWER_PLUS, Permitted, WritableConfig};
     use crate::model::Register;
 
     fn parse(payload: &str) -> Result<Vec<Change>, CommandError> {
@@ -377,6 +424,43 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_is_accepted_and_sent_without_a_read_back() {
+        let changes = Change::from_payload(br#"{"restart": 1}"#, Permitted::default()).expect("accepted");
+        let change = changes.first().expect("one change");
+        assert_eq!(change.key, "restart");
+        assert_eq!(change.register.number(), 32);
+        // Fire-and-forget: the config space acknowledges nothing, so waiting for a read-back would report a
+        // working restart as a failure to confirm.
+        assert_eq!(change.delivery, super::Delivery::FireAndForget);
+    }
+
+    #[test]
+    fn a_factory_reset_is_refused_however_it_arrives() {
+        // It is not published as an entity, so nothing in Home Assistant offers it — but a retained command
+        // on the broker, a hand-published one, or a later catalogue change must not get through. What it
+        // costs is a device off the network until somebody re-provisions it over Bluetooth, in person.
+        let refused = Change::from_payload(br#"{"factory_reset": 1}"#, Permitted::default());
+        assert_eq!(
+            refused,
+            Err(CommandError::Refused {
+                key: "factory_reset".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn refusing_writes_refuses_a_restart_too() {
+        let refused = Change::from_payload(
+            br#"{"restart": 1}"#,
+            Permitted {
+                writes: false,
+                ..Permitted::default()
+            },
+        );
+        assert!(refused.is_err(), "a restart got through with writes refused");
+    }
+
+    #[test]
     fn every_writable_entity_can_be_commanded_by_the_name_it_publishes() {
         // The two halves must agree: an entity Home Assistant can change has to be a name this accepts,
         // or the command silently goes nowhere.
@@ -385,10 +469,15 @@ mod tests {
             ..crate::homeassistant::entity::Catalogue::default()
         };
         for entity in catalogue.entities().iter().filter(|entity| entity.is_writable()) {
-            let register = crate::growatt::v7::registers::HoldingRegister::resync_set(9)
+            // Either kind: a holding-register setting, or a config-space action. Both are commandable and
+            // they resolve by different routes, so checking only the first would fail a published button.
+            let setting = crate::growatt::v7::registers::HoldingRegister::resync_set(9)
                 .into_iter()
-                .find(|entry| entry.name == entity.key);
-            assert!(register.is_some(), "{} is writable but not commandable", entity.key);
+                .any(|entry| entry.name == entity.key);
+            let action = WritableConfig::ALL
+                .into_iter()
+                .any(|config| config.is_action() && !config.is_destructive() && config.name() == entity.key);
+            assert!(setting || action, "{} is writable but not commandable", entity.key);
         }
     }
 }

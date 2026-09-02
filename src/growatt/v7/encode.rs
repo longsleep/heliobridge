@@ -308,8 +308,9 @@ pub enum WritableConfig {
     Clock,
     /// Register 32. Restarts the datalogger; observed from the vendor's own interface **[O]**.
     Restart,
-    /// Register 35. Clears the datalogger's log **[O]**.
-    ClearLog,
+    /// Register 35. **Resets the datalogger to factory defaults** — not a log wipe, whatever the
+    /// vendor's own web interface labels it **[F]**. See [`Self::is_destructive`].
+    FactoryReset,
     /// Register 19, the broker host name. **Retargets the device** — see [`Self::is_retarget`].
     RemoteUrl,
     /// Register 18, the broker port. **Retargets the device.**
@@ -324,7 +325,7 @@ impl WritableConfig {
     pub const ALL: [Self; 6] = [
         Self::Clock,
         Self::Restart,
-        Self::ClearLog,
+        Self::FactoryReset,
         Self::RemoteUrl,
         Self::RemotePort,
         Self::RemoteIp,
@@ -335,7 +336,7 @@ impl WritableConfig {
         Register(match self {
             Self::Clock => 31,
             Self::Restart => 32,
-            Self::ClearLog => 35,
+            Self::FactoryReset => 35,
             Self::RemoteUrl => 19,
             Self::RemotePort => 18,
             Self::RemoteIp => 17,
@@ -347,7 +348,7 @@ impl WritableConfig {
         match self {
             Self::Clock => "datetime",
             Self::Restart => "restart",
-            Self::ClearLog => "clear_log",
+            Self::FactoryReset => "factory_reset",
             Self::RemoteUrl => "remote_url",
             Self::RemotePort => "remote_port",
             Self::RemoteIp => "remote_ip",
@@ -372,7 +373,17 @@ impl WritableConfig {
     ///
     /// Registers 32 and 35 take `"1"` and *do* something; nothing suggests they hold a readable value.
     pub const fn is_action(self) -> bool {
-        matches!(self, Self::Restart | Self::ClearLog)
+        matches!(self, Self::Restart | Self::FactoryReset)
+    }
+
+    /// Whether carrying this out costs the operator something they must undo in person.
+    ///
+    /// Only the factory reset. It keeps the serial, the clock and the server endpoint, so a device does
+    /// come back to the same server — but the Wi-Fi credentials do not survive, which takes the device off
+    /// the network until somebody stands next to it with a Bluetooth client. That is the difference
+    /// between this and a restart, and the reason the Home Assistant surface will not carry it.
+    pub const fn is_destructive(self) -> bool {
+        matches!(self, Self::FactoryReset)
     }
 
     /// The value that triggers an action, or `None` for a register that holds a value.
@@ -581,9 +592,9 @@ impl Command {
     }
 
     /// Clear the datalogger's log: register 35, value `"1"`.
-    pub fn clear_datalogger_log() -> Self {
+    pub fn factory_reset() -> Self {
         Self::WriteConfig {
-            register: WritableConfig::ClearLog,
+            register: WritableConfig::FactoryReset,
             value: "1".to_owned(),
         }
     }
@@ -1193,11 +1204,12 @@ mod tests {
 
     #[test]
     fn the_action_commands_match_the_captured_frames() {
-        // Bytes the vendor's web interface sent, register and value both: 32 = "1" restarts, 35 = "1" clears
-        // the log. Building them from the general config write must reproduce those exactly.
+        // Bytes the vendor's web interface sent, register and value both. Its own label for 35 is "clear
+        // datalogger log", which the firmware contradicts — it resets to factory defaults — but the frame is
+        // the frame, and building each from the general config write must reproduce those bytes exactly.
         for (command, register, value) in [
             (Command::restart_datalogger(), 32u16, "1"),
-            (Command::clear_datalogger_log(), 35, "1"),
+            (Command::factory_reset(), 35, "1"),
         ] {
             let frame = command.to_frame(SERIAL).expect("build");
             assert_eq!(frame.message_type(), MessageType::ConfigWrite);
@@ -1228,7 +1240,11 @@ mod tests {
         ] {
             assert!(register.is_retarget(), "{}", register.name());
         }
-        for register in [WritableConfig::Clock, WritableConfig::Restart, WritableConfig::ClearLog] {
+        for register in [
+            WritableConfig::Clock,
+            WritableConfig::Restart,
+            WritableConfig::FactoryReset,
+        ] {
             assert!(!register.is_retarget(), "{}", register.name());
         }
         assert_eq!(WritableConfig::Restart.trigger_value(), Some("1"));
