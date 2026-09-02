@@ -156,6 +156,12 @@ impl fmt::Display for Timestamp {
 pub enum Confidence {
     /// Seen on the wire; the interpretation is a guess.
     Inferred,
+    /// Read out of decompiled vendor software, and not seen on the wire.
+    ///
+    /// Stronger than a guess and weaker than an observation: the device has not been seen to behave this
+    /// way, but the software that drives it says so. Such a meaning is only as good as the decompilation,
+    /// and may not hold on another firmware release.
+    Vendor,
     /// Seen on the wire and self-consistent, but not checked against an independent source.
     Observed,
     /// Confirmed against an independent reference, or by changing it and watching the result.
@@ -165,11 +171,13 @@ pub enum Confidence {
 impl Confidence {
     /// The marker used in the specification, and in anything this publishes.
     ///
-    /// Deliberately the same three words the documentation uses, so a consumer reading `inferred` from the
-    /// API and `[I]` in the specification is reading one claim rather than two vocabularies.
+    /// Deliberately the same words the documentation uses, so a consumer reading `inferred` from the
+    /// API and `[I]` in the specification is reading one claim rather than two vocabularies. `vendor-app`
+    /// is the word the Bluetooth client already publishes for the same thing.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Inferred => "inferred",
+            Self::Vendor => "vendor-app",
             Self::Observed => "observed",
             Self::Verified => "verified",
         }

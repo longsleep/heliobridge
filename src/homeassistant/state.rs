@@ -105,9 +105,10 @@ impl StatePayload {
             if !fields.contains(name) {
                 continue;
             }
-            // Every config value is ASCII on the wire whatever the field means, so a numeric entity needs
-            // it parsed. A value that will not parse is left out rather than sent as text: Home Assistant
-            // would take "abc" for a dBm reading and show it as unknown anyway, but noisily.
+            // A config value arrives as octets whatever the field means — usually text, though some
+            // registers carry NUL padding or raw bytes — so a numeric entity needs it parsed. A value that
+            // will not parse is left out rather than sent as text: Home Assistant would take "abc" for a
+            // dBm reading and show it as unknown anyway, but noisily.
             let value = match name {
                 "wifi_signal" | "data_interval" => match entry.value.trim().parse::<i64>() {
                     Ok(number) => json!(number),

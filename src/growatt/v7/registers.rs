@@ -808,7 +808,7 @@ impl ConfigRegister {
 /// Not exhaustive by construction — one device reported these, and a parser must carry an unrecognised key
 /// rather than reject the frame. Absent here does not mean absent from the protocol.
 pub const CONFIG_REGISTERS: &[ConfigRegister] = {
-    use Confidence::{Inferred, Observed, Verified};
+    use Confidence::{Inferred, Observed, Vendor, Verified};
     use ConfigRegister as Entry;
     use Role::{Dynamic, Endpoint, Identity, Inert, Metadata};
 
@@ -819,9 +819,9 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         Entry::new(9, "protocol_version", Metadata, Observed),
         Entry::new(12, "dns_ip", Endpoint, Observed),
         Entry::new(13, "device_type", Metadata, Observed),
-        // Reported 192.168.5.1 while the device was actually addressed elsewhere, and unchanged across a
-        // power cycle. Inert defaults, and a client must not use them to reach the device.
-        Entry::new(14, "local_ip", Inert, Observed),
+        // The static address configuration, which 71 selects between. Inert on a device using DHCP: these
+        // hold factory values and describe no live network, so a client must not use them to reach it.
+        Entry::new(14, "static_network_ip", Inert, Vendor),
         Entry::new(16, "mac_address", Identity, Observed),
         Entry::new(17, "remote_ip", Endpoint, Verified),
         Entry::new(18, "remote_port", Endpoint, Verified),
@@ -829,8 +829,8 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         Entry::new(20, "model_id", Metadata, Observed),
         Entry::new(21, "sw_version", Metadata, Verified),
         Entry::new(22, "hw_version", Metadata, Observed),
-        Entry::new(25, "subnet_mask", Inert, Observed),
-        Entry::new(26, "default_gateway", Inert, Observed),
+        Entry::new(25, "static_network_mask", Inert, Vendor),
+        Entry::new(26, "static_network_gateway", Inert, Vendor),
         Entry::new(30, "timezone", Metadata, Verified),
         Entry::new(31, "datetime", Dynamic, Verified),
         // Commands rather than settings: each takes "1". Absent from the identity report, yet writable.
@@ -843,17 +843,23 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         Entry::on_request(57, "wifi_passphrase", Identity, Observed),
         // The running build's ESP-IDF version.
         Entry::on_request(61, "sdk_version", Metadata, Observed),
+        // Selects between DHCP and the static configuration of 14/25/26. "1" disables DHCP and takes the
+        // address from those three; "0" leaves DHCP in charge and they go unread.
+        Entry::on_request(71, "dhcp_disabled", Metadata, Vendor),
         // Verified against the vendor's own web interface, which showed "Good(-72)" while this register read
         // -72: the unit is dBm and the sign is as sent.
         Entry::new(76, "wifi_signal", Dynamic, Verified),
         // The last update URL the device was told to install. One slot.
         Entry::on_request(80, "update_url", Dynamic, Observed),
-        // A second MAC, address, mask, gateway and DNS.
-        Entry::on_request(105, "network_mac", Identity, Inferred),
-        Entry::on_request(106, "network_ip", Inert, Inferred),
-        Entry::on_request(107, "network_mask", Inert, Inferred),
-        Entry::on_request(108, "network_gateway", Inert, Inferred),
-        Entry::on_request(109, "network_dns", Inert, Inferred),
+        // Five more registers shaped like a MAC, address, mask, gateway and DNS, each reading the factory
+        // default of 16, 14, 25, 26 and 12. Named by number only: nothing establishes what they are for,
+        // the vendor application never reads them, and a name like `network_ip` invites a reader to take
+        // one for the address the device is using.
+        Entry::on_request(105, "unknown_105", Identity, Inferred),
+        Entry::on_request(106, "unknown_106", Inert, Inferred),
+        Entry::on_request(107, "unknown_107", Inert, Inferred),
+        Entry::on_request(108, "unknown_108", Inert, Inferred),
+        Entry::on_request(109, "unknown_109", Inert, Inferred),
         // A string of labelled fields: `state`, `err_wifi`, `reconnect`, `server`.
         Entry::on_request(121, "link_diagnostics", Inert, Inferred),
         // Fifteen slots, each a timestamped connection-event record.

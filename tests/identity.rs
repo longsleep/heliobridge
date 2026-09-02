@@ -103,14 +103,15 @@ fn the_clock_and_timezone_disagree_as_documented() {
 }
 
 #[test]
-fn the_inert_network_fields_do_not_describe_the_live_network() {
+fn the_static_network_fields_do_not_describe_the_live_network() {
     let frame = Frame::parse(FULL_REPORT).expect("the fixture parses");
     let report = Identity::from_frame(&frame).expect("the identity report decodes");
-    // 192.168.5.1 while the device was addressed elsewhere entirely. Marked inert so nothing tries to
+    // The static configuration, which `dhcp_disabled` selects between and this device does not use: it
+    // reads 192.168.5.1 while the device is addressed elsewhere entirely. Inert, so nothing tries to
     // reach the device with it.
-    assert_eq!(report.get("local_ip"), Some("192.168.5.1"));
-    assert_eq!(report.get("default_gateway"), Some("192.168.5.1"));
-    for name in ["local_ip", "default_gateway", "subnet_mask"] {
+    assert_eq!(report.get("static_network_ip"), Some("192.168.5.1"));
+    assert_eq!(report.get("static_network_gateway"), Some("192.168.5.1"));
+    for name in ["static_network_ip", "static_network_gateway", "static_network_mask"] {
         assert_eq!(ConfigRegister::lookup_name(name).expect(name).role, Role::Inert);
     }
 }

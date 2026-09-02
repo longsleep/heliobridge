@@ -114,6 +114,10 @@ pub enum Source {
     /// A fourth address space rather than a fourth flavour of the same one, and mostly not entity
     /// material: most of it is static, inert, or identifying. The handful published here are the ones
     /// that change and mean something.
+    ///
+    /// **Only a register the device volunteers may become an entity.** Most of the config space answers
+    /// an explicit read and nothing else, so an entity built on one would sit unknown until somebody
+    /// asked — announcing something Home Assistant can never fill in on its own. A test below holds this.
     Config,
 }
 
@@ -772,8 +776,39 @@ const NAMED: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::{Catalogue, Category, Component, Entity, Shape, Source, StateClass};
-    use crate::growatt::v7::registers::{HOLDING_REGISTERS, HoldingRegister, INPUT_REGISTERS, InputRegister, Kind};
+    use crate::growatt::v7::registers::{
+        Availability, ConfigRegister, HOLDING_REGISTERS, HoldingRegister, INPUT_REGISTERS, InputRegister, Kind,
+    };
     use crate::model::Register;
+
+    /// Nothing is announced that the device does not volunteer.
+    ///
+    /// A config register that only answers an explicit read would give Home Assistant an entity it can
+    /// never fill in by itself: it would sit unknown from the moment it appeared until somebody happened
+    /// to ask for that register. Most of the config space is like that, so the rule needs holding
+    /// structurally rather than remembering.
+    #[test]
+    fn every_config_entity_reads_a_register_the_device_reports() {
+        let published: Vec<_> = Catalogue::everything()
+            .into_iter()
+            .filter(|entity| entity.source == Source::Config)
+            .collect();
+        assert!(
+            !published.is_empty(),
+            "the config entities went missing rather than passing trivially"
+        );
+
+        for entity in published {
+            let register = ConfigRegister::lookup_name(entity.key)
+                .unwrap_or_else(|| panic!("{} is published but names no config register", entity.key));
+            assert_eq!(
+                register.availability,
+                Availability::Reported,
+                "{} is published but the device only answers it on request",
+                entity.key
+            );
+        }
+    }
 
     /// A setting by name, from the listed registers or from the generated slot ones.
     fn setting(name: &str) -> Entity {

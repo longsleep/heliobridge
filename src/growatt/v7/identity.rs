@@ -363,7 +363,7 @@ mod tests {
             Role::Metadata
         );
         assert_eq!(
-            ConfigRegister::lookup_name("local_ip").expect("known").role,
+            ConfigRegister::lookup_name("static_network_ip").expect("known").role,
             Role::Inert
         );
     }
