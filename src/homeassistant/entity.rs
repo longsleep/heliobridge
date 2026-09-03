@@ -155,6 +155,9 @@ pub enum Gate {
     },
 }
 
+/// When the last telemetry frame arrived, which does not exist until one has.
+pub const LAST_UPDATE: &str = "last_update";
+
 /// The reading that says whether the device currently has a meter reporting.
 pub const METER_CONNECTED: &str = "meter_connected";
 
@@ -360,7 +363,7 @@ impl Entity {
     /// ordinary sensor rather than a diagnostic: it is read alongside the readings it qualifies.
     pub fn last_update() -> Self {
         Self {
-            key: "last_update",
+            key: LAST_UPDATE,
             name: "Last update".to_owned(),
             component: Component::Sensor,
             device_class: Some("timestamp"),
@@ -582,6 +585,23 @@ impl Entity {
         let rest = self.key.strip_prefix("battery")?;
         let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
         digits.parse().ok()
+    }
+
+    /// Whether this entity is published on a topic of its own rather than reading a shared object.
+    ///
+    /// **Home Assistant does not silently ignore a state that templates to nothing.** A `text` entity
+    /// fails the length and pattern it was announced with, and a `sensor` logs `Invalid state message ''`
+    /// — both observed. So a field that is sometimes *absent* from its object must not share that object
+    /// with fields that are always present: on a topic of its own, nothing is published until there is
+    /// something to publish, and the entity simply stays unknown.
+    ///
+    /// Two fields are absent for a while:
+    ///
+    /// - a slot boundary, because the settings cache fills in one register at a time over the half-minute
+    ///   a resync takes;
+    /// - [`LAST_UPDATE`], which does not exist until a frame has arrived.
+    pub fn published_alone(&self) -> bool {
+        matches!(self.shape, Shape::TimeOfDay) || self.key == LAST_UPDATE
     }
 
     /// Whether this entity accepts commands.

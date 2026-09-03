@@ -28,7 +28,7 @@ use crate::control::{Action as ControlAction, Connected, Registry, SessionHandle
 use crate::homeassistant::broker::{Broker, BrokerConfig, BrokerError, Event, Publication, Publications};
 use crate::homeassistant::command::{Change, Delivery, Permitted};
 use crate::homeassistant::discovery::{DeviceBlock, Discovery};
-use crate::homeassistant::entity::{Catalogue, Component, Entity, Gate};
+use crate::homeassistant::entity::{Catalogue, Component, Entity, Gate, LAST_UPDATE, Source};
 use crate::homeassistant::state::{Fields, StatePayload};
 use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
 
@@ -242,7 +242,7 @@ impl Publisher {
         tracing::info!(%device, "device session ended");
         self.linked.remove(device);
         self.publish(Publication::retained(self.topics.device_availability(device), OFFLINE));
-        self.publish(StatePayload::status(false, None).retained(self.topics.status(device)));
+        self.publish(StatePayload::status(false).retained(self.topics.status(device)));
         self.link_devices();
     }
 
@@ -322,6 +322,47 @@ struct Announcement {
     catalogue: Catalogue,
     /// Kept so an entity that leaves the catalogue can be withdrawn by name and component.
     entities: Vec<Entity>,
+    /// The catalogue turned inside out, so publishing needs no lookups.
+    indexed: Indexed,
+}
+
+/// The catalogue indexed by the field that decides each thing, rather than by entity.
+///
+/// Built once per announcement. Publishing then walks the values that arrived and asks what each one
+/// decides, which is one pass with constant-time lookups — where asking each entity to find its own value
+/// would be a scan of every value per entity, on a path that runs again on every telemetry frame.
+#[derive(Debug, Default)]
+struct Indexed {
+    /// Settings published on a topic of their own. The entity key and the setting name are the same string.
+    unshared: HashSet<&'static str>,
+    /// Entities gated on a setting: the deciding name, then each entity and the value that makes it inert.
+    gated_by_setting: HashMap<&'static str, Vec<(&'static str, u16)>>,
+    /// Entities gated on a reading: the deciding name, then each entity.
+    gated_by_reading: HashMap<&'static str, Vec<&'static str>>,
+}
+
+impl Indexed {
+    /// Index a catalogue.
+    fn of(entities: &[Entity]) -> Self {
+        let mut indexed = Self::default();
+        for entity in entities {
+            if entity.source == Some(Source::Settings) && entity.published_alone() {
+                indexed.unshared.insert(entity.key);
+            }
+            match entity.gate {
+                Some(Gate::SettingIsNot { setting, value }) => indexed
+                    .gated_by_setting
+                    .entry(setting)
+                    .or_default()
+                    .push((entity.key, value)),
+                Some(Gate::ReadingIsSet { reading }) => {
+                    indexed.gated_by_reading.entry(reading).or_default().push(entity.key);
+                }
+                None => {}
+            }
+        }
+        indexed
+    }
 }
 
 impl Announcement {
@@ -369,7 +410,7 @@ impl Link {
                     if changed.is_err() {
                         break;
                     }
-                    self.publish_settings();
+                    self.settings_changed();
                 }
 
                 changed = self.session.identity.changed() => {
@@ -412,12 +453,22 @@ impl Link {
 
         self.announce();
         self.publish_presence();
-        self.publish_settings();
+        self.settings_changed();
         // Only if it is still current. A frame from before the outage is not state.
         let current = self.fresh().then(|| self.session.telemetry.borrow().clone()).flatten();
         if let Some(view) = current {
             self.publish_telemetry(&view);
         }
+    }
+
+    /// The settings cache changed.
+    ///
+    /// Three publishes rather than one: the shared object, the settings that cannot share it, and which
+    /// controls a setting has just made inert.
+    fn settings_changed(&mut self) {
+        self.publish_settings();
+        self.publish_unshared_settings();
+        self.publish_gates();
     }
 
     /// A telemetry frame arrived.
@@ -446,6 +497,7 @@ impl Link {
         // that looks wrong answerable, and it moves each time.
         self.publish_presence();
         self.publish_telemetry(&view);
+        self.publish_gates();
     }
 
     /// The device has been quiet too long.
@@ -513,10 +565,12 @@ impl Link {
         }
 
         self.fields = Fields::of(&entities);
+        let indexed = Indexed::of(&entities);
         self.announced = Some(Announcement {
             device,
             catalogue,
             entities,
+            indexed,
         });
     }
 
@@ -601,9 +655,14 @@ impl Link {
         let topic = self.topics.device_availability(&self.device);
         self.publish(Publication::retained(topic, availability));
 
-        let status =
-            StatePayload::status(self.present, self.last_update.as_deref()).retained(self.topics.status(&self.device));
+        let status = StatePayload::status(self.present).retained(self.topics.status(&self.device));
         self.publish(status);
+
+        // Its own sub-topic, so nothing is published for it before the first frame has arrived.
+        if let Some(stamp) = self.last_update.clone() {
+            let topic = self.topics.field(Source::Status, &self.device, LAST_UPDATE);
+            self.publish(StatePayload::last_update(&stamp).retained(topic));
+        }
     }
 
     /// Publish the datalogger configuration worth showing.
@@ -627,7 +686,6 @@ impl Link {
         }
         let publication = payload.publication(self.topics.state(&self.device));
         self.publish(publication);
-        self.publish_gates();
     }
 
     /// Publish the settings a session has read back.
@@ -641,55 +699,104 @@ impl Link {
         }
         let publication = payload.retained(self.topics.settings(&self.device));
         self.publish(publication);
-        self.publish_gates();
+    }
+
+    /// Publish each setting that cannot share the settings object, on a topic of its own.
+    ///
+    /// The shared object omits a field until the device has answered for it, and the settings cache fills
+    /// in over the half-minute a resync takes. An entity that validates its state — a `text` standing in
+    /// for the missing `time` component — would see an empty value on every publish before its own field
+    /// arrived, and Home Assistant logs an error rather than ignoring it. On its own topic nothing is
+    /// published until there is something to publish.
+    ///
+    /// The payload is still an object carrying the one field, so the entity's template is the same one
+    /// every other entity uses.
+    ///
+    /// The queue is written directly rather than through [`Self::publish`], because the settings borrow is
+    /// held across the loop; the guard that method applies is hoisted to the top instead.
+    fn publish_unshared_settings(&mut self) {
+        if self.published_for.is_none() {
+            return;
+        }
+        let Some(announced) = self.announced.as_ref() else {
+            return;
+        };
+        for setting in self.session.settings.borrow().iter() {
+            if !announced.indexed.unshared.contains(setting.name) {
+                continue;
+            }
+            let payload = StatePayload::settings(core::slice::from_ref(setting), &self.fields);
+            if payload.is_empty() {
+                continue;
+            }
+            let topic = self.topics.field(Source::Settings, &self.device, setting.name);
+            self.publications.try_publish(payload.retained(topic));
+        }
     }
 
     /// Publish, per gated entity, whether it currently has an honest value.
     ///
-    /// Driven from the entity catalogue rather than from a table here: an entity carries its own
-    /// [`Gate`], so the condition is declared beside the thing it applies to.
+    /// Driven from the index rather than from a table here: an entity declares its own [`Gate`], and
+    /// [`Indexed`] turns those round so this walks the values that arrived and asks what each decides.
     ///
     /// **Only on change.** These are retained messages, and a gate is re-evaluated on every telemetry
     /// frame — republishing an unchanged answer every five seconds would be a message per gate per cycle
     /// for the life of the session.
     ///
-    /// A gate whose deciding value has not arrived yet publishes *nothing*. Reporting a control available
-    /// before knowing the work mode, or a reading valid before knowing whether a meter is attached, would
-    /// be a claim rather than an observation — and the wrong one about half the time.
+    /// A gate whose deciding value has not arrived yet publishes *nothing*: it never appears in either
+    /// pass. Reporting a control available before knowing the work mode, or a reading valid before knowing
+    /// whether a meter is attached, would be a claim rather than an observation.
+    ///
+    /// Written directly to the queue for the same reason as [`Self::publish_unshared_settings`], with the
+    /// added one that the record of what was last said is updated as the pass goes.
     fn publish_gates(&mut self) {
+        if self.published_for.is_none() {
+            return;
+        }
         let Some(announced) = self.announced.as_ref() else {
             return;
         };
+        let indexed = &announced.indexed;
 
-        let mut decided: Vec<(&'static str, &'static [u8])> = Vec::new();
-        {
-            let settings = self.session.settings.borrow();
-            let telemetry = self.session.telemetry.borrow();
-            for entity in &announced.entities {
-                let Some(gate) = entity.gate else { continue };
-                let open = match gate {
-                    Gate::SettingIsNot { setting, value } => settings
-                        .iter()
-                        .find(|held| held.name == setting)
-                        .map(|held| held.raw != value),
-                    Gate::ReadingIsSet { reading: name } => telemetry
-                        .as_ref()
-                        .and_then(|view| reading(view, name))
-                        .map(|value| value != 0),
-                };
-                if let Some(open) = open {
-                    decided.push((entity.key, if open { ONLINE } else { OFFLINE }));
-                }
+        // Disjoint fields of `self`, which is what lets a borrow of the caches be held while `gates` and
+        // the queue are written. Each pass scopes its own borrow so neither is held across the other.
+        let gates = &mut self.gates;
+        let publications = &mut self.publications;
+        let topics = &self.topics;
+        let device = &self.device;
+
+        let mut say = |key: &'static str, open: bool| {
+            let payload = if open { ONLINE } else { OFFLINE };
+            if gates.get(key) == Some(&payload) {
+                return;
+            }
+            gates.insert(key, payload);
+            publications.try_publish(Publication::retained(topics.entity_availability(device, key), payload));
+        };
+
+        // Iterating straight off each borrow rather than binding it, so neither guard outlives its loop.
+        // One pass over the values that arrived, asking the index what each decides — where asking every
+        // gate to find its own value would scan all of them per gate, on a path that runs each frame.
+        for setting in self.session.settings.borrow().iter() {
+            let Some(dependents) = indexed.gated_by_setting.get(setting.name) else {
+                continue;
+            };
+            for (key, inert) in dependents {
+                say(key, setting.raw != *inert);
             }
         }
 
-        for (key, payload) in decided {
-            if self.gates.get(key) == Some(&payload) {
-                continue;
+        if let Some(view) = self.session.telemetry.borrow().as_ref() {
+            for reading in &view.readings {
+                let Some(dependents) = indexed.gated_by_reading.get(reading.name) else {
+                    continue;
+                };
+                for key in dependents {
+                    // The raw value rather than the rendered one: a flag is a flag, and parsing a scaled
+                    // string back into a number would fail on any reading that is not an integer.
+                    say(key, reading.raw != 0);
+                }
             }
-            self.gates.insert(key, payload);
-            let topic = self.topics.entity_availability(&self.device, key);
-            self.publish(Publication::retained(topic, payload));
         }
     }
 
@@ -802,6 +909,7 @@ mod tests {
 
     use crate::growatt::v7::registers::{SMART_SELF_USE, WORK_MODE_LABELS};
     use crate::homeassistant::broker::{Publication, Publications};
+    use crate::homeassistant::entity::LAST_UPDATE;
     use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
     use core::time::Duration;
     use std::sync::Arc;
@@ -1116,14 +1224,49 @@ mod tests {
         tokio::time::advance(OFFLINE_AFTER.saturating_add(Duration::from_secs(1))).await;
         settle().await;
 
-        let status = wire.on("heliobridge/0EXAMPLE00000001/status");
-        let last = status.last().expect("a status message");
-        assert!(last.retain, "nothing will republish it while the device is away");
-        let object: serde_json::Value = serde_json::from_slice(&last.payload).expect("valid JSON");
+        // Drained once, because draining consumes the queue.
+        let published = wire.drain();
+        let latest = |topic: &str| {
+            published
+                .iter()
+                .rfind(|publication| publication.topic == topic)
+                .cloned()
+        };
+
+        let status = latest("heliobridge/0EXAMPLE00000001/status").expect("a status message");
+        assert!(status.retain, "nothing will republish it while the device is away");
+        let object: serde_json::Value = serde_json::from_slice(&status.payload).expect("valid JSON");
         assert_eq!(object["connected"], "offline");
+
+        // The stamp is retained on a sub-topic of its own, so it outlives the device the same way.
+        let stamped = latest("heliobridge/0EXAMPLE00000001/status/last_update").expect("a stamp");
+        assert!(stamped.retain, "nothing will republish it while the device is away");
+        let object: serde_json::Value = serde_json::from_slice(&stamped.payload).expect("valid JSON");
         assert!(
-            object["last_update"].is_string(),
+            object[LAST_UPDATE].is_string(),
             "the timestamp of the last frame outlives the device"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_published_for_the_stamp_before_a_frame_arrives() {
+        // An absent field templates to an empty state, which Home Assistant logs as invalid rather than
+        // ignoring — so the stamp says nothing at all until there is something to say.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+
+        // One drain, then both questions asked of it: draining twice would empty the queue and make the
+        // second assertion pass for the wrong reason.
+        let published = wire.drain();
+        let sent_to = |topic: &str| published.iter().any(|publication| publication.topic == topic);
+
+        assert!(
+            sent_to("heliobridge/0EXAMPLE00000001/status"),
+            "the shared status object is published from the start"
+        );
+        assert!(
+            !sent_to("heliobridge/0EXAMPLE00000001/status/last_update"),
+            "no frame has arrived, so there is no stamp"
         );
     }
 
@@ -1219,6 +1362,59 @@ mod tests {
                 unit: "W",
             },
         ]
+    }
+
+    #[tokio::test]
+    async fn a_validated_setting_is_not_published_before_the_device_has_answered_for_it() {
+        // The settings cache fills in one register at a time over a resync, so the shared object is
+        // partial for the first half-minute. A `text` entity checks its value against the length and
+        // pattern it was announced with and an empty string fails both, so Home Assistant logs an error
+        // for a value it was never sent. Its own topic stays silent until there is something to say.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(vec![SettingView {
+            register: 250,
+            name: "charge_limit_upper",
+            raw: 100,
+            value: "100".to_owned(),
+            unit: "%",
+        }]);
+        settle().await;
+
+        assert!(
+            !wire.on("heliobridge/0EXAMPLE00000001/settings").is_empty(),
+            "the shared object still carries what has arrived"
+        );
+        assert!(
+            wire.on("heliobridge/0EXAMPLE00000001/settings/slot1_start_time")
+                .is_empty(),
+            "nothing should be published for a setting the device has not answered for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_validated_setting_gets_a_topic_of_its_own_once_it_arrives() {
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(vec![SettingView {
+            register: 254,
+            name: "slot1_start_time",
+            raw: 0,
+            value: "00:00".to_owned(),
+            unit: "",
+        }]);
+        settle().await;
+
+        let published = wire.on("heliobridge/0EXAMPLE00000001/settings/slot1_start_time");
+        let last = published.last().expect("a message on its own topic");
+        assert!(last.retain, "a setting is retained wherever it is published");
+        let object: serde_json::Value = serde_json::from_slice(&last.payload).expect("valid JSON");
+        // An object carrying the one field, so the entity's template is the same as every other entity's.
+        assert_eq!(object["slot1_start_time"], serde_json::json!("00:00"));
     }
 
     #[tokio::test]

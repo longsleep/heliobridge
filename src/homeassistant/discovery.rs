@@ -9,8 +9,14 @@
 //!
 //! The alternative — a topic per field — is thirty publishes per telemetry cycle instead of one. So a
 //! device publishes a JSON object and each entity carries a `value_template` picking its own field out of
-//! it. A field that is missing renders empty, which Home Assistant treats as "no update" rather than as a
-//! value, so a short frame leaves the previous reading in place instead of blanking it.
+//! it. A field that is missing renders empty, and Home Assistant leaves the previous reading in place
+//! rather than blanking it — so a short frame loses nothing.
+//!
+//! **It does not do that silently.** A `text` entity fails the length and pattern it was announced with,
+//! and a `sensor` logs `Invalid state message ''` — both observed, and both merely logged, so the state is
+//! kept either way. A field that is only *sometimes* absent therefore gets a topic of its own, where
+//! nothing is published until there is something to publish; see [`Entity::published_alone`]. A field that
+//! is absent only in a malformed frame keeps sharing, since the alternative is a topic per register.
 
 use serde_json::{Map, Value, json};
 
@@ -132,8 +138,8 @@ impl Discovery<'_> {
         config.insert("object_id".to_owned(), json!(self.topics.unique_id(device, entity.key)));
         // A control with no source is optimistic: nothing reports its value back, so Home Assistant shows
         // what it last set. Announcing a state topic nothing publishes to would leave it unknown forever.
-        if let Some(source) = entity.source {
-            config.insert("state_topic".to_owned(), json!(self.topics.topic_for(source, device)));
+        if let Some(topic) = self.topics.topic_for(entity, device) {
+            config.insert("state_topic".to_owned(), json!(topic));
             config.insert("value_template".to_owned(), json!(self.value_template()));
         } else {
             config.insert("optimistic".to_owned(), json!(true));
@@ -185,8 +191,9 @@ impl Discovery<'_> {
 
     /// How Home Assistant picks this entity's field out of the shared object.
     ///
-    /// `default('')` covers the field being absent, which Home Assistant reads as "no update" — so a frame
-    /// that decoded short leaves the last reading in place rather than replacing it with `unknown`.
+    /// `default('')` covers the field being absent, which leaves the last reading in place rather than
+    /// replacing it with `unknown` — though Home Assistant logs it rather than ignoring it, which is why a
+    /// field that is regularly absent is published alone instead. See the module note.
     ///
     /// A flags word is rendered here rather than on the topic: the state topic keeps the raw number, which
     /// is what another subscriber wants, and the hexadecimal is presentation.
@@ -405,7 +412,13 @@ mod tests {
                 serde_json::json!([{ "topic": "heliobridge/bridge/attic/availability" }]),
                 "{key}"
             );
-            assert_eq!(config["state_topic"], "heliobridge/0EXAMPLE00000001/status", "{key}");
+            // The stamp is on a sub-topic of its own, because it does not exist until a frame arrives.
+            let expected = if key == "last_update" {
+                "heliobridge/0EXAMPLE00000001/status/last_update"
+            } else {
+                "heliobridge/0EXAMPLE00000001/status"
+            };
+            assert_eq!(config["state_topic"], expected, "{key}");
         }
 
         // Presence and category are separate judgements. These two qualify every reading on the page — how
@@ -554,6 +567,33 @@ mod tests {
         assert!(config["device"].get("model").is_none(), "nothing to say yet");
         assert_eq!(bare.model, None);
         assert_eq!(config["origin"]["name"], "heliobridge");
+    }
+
+    #[test]
+    fn a_validated_entity_is_announced_on_a_topic_of_its_own() {
+        // Everything else reads a field out of the shared settings object and tolerates one that has not
+        // arrived. A `text` entity validates its value instead of ignoring an empty one, so it must not be
+        // pointed at an object that is partial while a resync runs.
+        let catalogue = Catalogue::default().entities();
+        let slot_time = catalogue
+            .iter()
+            .find(|entity| entity.key == "slot1_start_time")
+            .expect("slot 1 is exposed");
+        let slot_power = catalogue
+            .iter()
+            .find(|entity| entity.key == "slot1_output_power")
+            .expect("slot 1 is exposed");
+
+        assert!(slot_time.published_alone());
+        assert!(!slot_power.published_alone());
+        assert_eq!(
+            payload(slot_time)["state_topic"],
+            "heliobridge/0EXAMPLE00000001/settings/slot1_start_time"
+        );
+        assert_eq!(
+            payload(slot_power)["state_topic"],
+            "heliobridge/0EXAMPLE00000001/settings"
+        );
     }
 
     #[test]

@@ -156,14 +156,34 @@ impl Topics {
         format!("{}/{device}/config", self.base)
     }
 
-    /// Which topic carries a given kind of state.
-    pub fn topic_for(&self, source: Source, device: &str) -> String {
+    /// The topic carrying every field of one source.
+    pub fn shared(&self, source: Source, device: &str) -> String {
         match source {
             Source::Telemetry => self.state(device),
             Source::Settings => self.settings(device),
             Source::Status => self.status(device),
             Source::Config => self.config(device),
         }
+    }
+
+    /// The sub-topic carrying one field of a source on its own.
+    pub fn field(&self, source: Source, device: &str, key: &str) -> String {
+        format!("{}/{key}", self.shared(source, device))
+    }
+
+    /// Which topic carries an entity's state.
+    ///
+    /// Almost every entity reads a field out of the object for its whole source. The exception is a field
+    /// that can be *absent* from that object — see [`Entity::published_alone`] — which gets a sub-topic to
+    /// itself, so nothing is published for it until there is something to publish. MQTT allows that: a
+    /// topic and its children are independent.
+    pub fn topic_for(&self, entity: &Entity, device: &str) -> Option<String> {
+        let shared = self.shared(entity.source?, device);
+        Some(if entity.published_alone() {
+            format!("{shared}/{}", entity.key)
+        } else {
+            shared
+        })
     }
 
     /// Where commands for any device arrive.
@@ -304,6 +324,13 @@ mod tests {
         assert_eq!(topics.command_filter(), "heliobridge/+/set");
     }
 
+    /// An entity reading a given source, for the topic tests.
+    fn sourced(source: Source) -> Entity {
+        let mut entity = Entity::connected();
+        entity.source = Some(source);
+        entity
+    }
+
     #[test]
     fn each_kind_of_state_has_its_own_topic() {
         // Settings and telemetry are published on different schedules from different sources, and status
@@ -312,7 +339,7 @@ mod tests {
         let topics = Topics::default();
         let device = "0EXAMPLE00000001";
         let all = [Source::Telemetry, Source::Settings, Source::Status, Source::Config]
-            .map(|source| topics.topic_for(source, device));
+            .map(|source| topics.topic_for(&sourced(source), device).expect("a topic"));
         assert_eq!(all[0], topics.state(device));
         assert_eq!(all[1], topics.settings(device));
         assert_eq!(all[2], topics.status(device));

@@ -18,6 +18,7 @@ use serde_json::{Map, Number, Value, json};
 use crate::control::{ConfigView, SettingView, TelemetryView};
 use crate::homeassistant::broker::Publication;
 use crate::homeassistant::entity::Entity;
+use crate::homeassistant::entity::LAST_UPDATE;
 use crate::homeassistant::topics::{OFFLINE, ONLINE};
 
 /// Which fields a device publishes.
@@ -78,7 +79,7 @@ impl StatePayload {
     /// `last_update` is left out entirely until a frame has arrived, rather than being sent as null or as a
     /// zero time: an absent field renders empty, which Home Assistant treats as no update, so the sensor
     /// stays unknown instead of claiming the device last reported at the epoch.
-    pub fn status(connected: bool, last_update: Option<&str>) -> Self {
+    pub fn status(connected: bool) -> Self {
         let mut object = Map::new();
         object.insert(
             "connected".to_owned(),
@@ -87,9 +88,16 @@ impl StatePayload {
         // A constant for the life of the process, so it rides along with the topic that is published
         // whenever this bridge's view of the device changes rather than needing one of its own.
         object.insert("bridge_version".to_owned(), json!(crate::VERSION));
-        if let Some(stamp) = last_update {
-            object.insert("last_update".to_owned(), json!(stamp));
-        }
+        Self(object)
+    }
+
+    /// When the last telemetry frame arrived, for the sub-topic that carries it alone.
+    ///
+    /// Its own topic because it does not exist until a frame has arrived, and an absent field templates to
+    /// an empty state — which Home Assistant logs rather than ignores.
+    pub fn last_update(stamp: &str) -> Self {
+        let mut object = Map::new();
+        object.insert(LAST_UPDATE.to_owned(), json!(stamp));
         Self(object)
     }
 
@@ -183,6 +191,7 @@ mod tests {
     use super::{Fields, StatePayload, quantity};
     use crate::control::{ReadingView, SettingView, TelemetryView};
     use crate::homeassistant::entity::Catalogue;
+    use crate::homeassistant::entity::LAST_UPDATE;
     use serde_json::json;
 
     fn reading(name: &'static str, value: &str) -> ReadingView {
@@ -299,13 +308,23 @@ mod tests {
 
     #[test]
     fn status_says_nothing_about_a_frame_that_never_arrived() {
-        let fresh = StatePayload::status(false, None);
-        assert_eq!(fresh.get("connected"), Some(&json!("offline")));
-        assert_eq!(fresh.get("last_update"), None, "the epoch is not an answer");
+        // Not even as an absent field. The stamp goes on a sub-topic of its own, so before the first frame
+        // nothing is published for it at all — where an absent field templates to an empty state, which
+        // Home Assistant logs as invalid rather than ignoring.
+        for connected in [true, false] {
+            assert_eq!(StatePayload::status(connected).get(LAST_UPDATE), None);
+        }
+        assert_eq!(StatePayload::status(false).get("connected"), Some(&json!("offline")));
+        assert_eq!(StatePayload::status(true).get("connected"), Some(&json!("online")));
+    }
 
-        let reporting = StatePayload::status(true, Some("2026-08-09T12:00:00+02:00"));
-        assert_eq!(reporting.get("connected"), Some(&json!("online")));
-        assert_eq!(reporting.get("last_update"), Some(&json!("2026-08-09T12:00:00+02:00")));
+    #[test]
+    fn the_last_update_stamp_is_its_own_object() {
+        let payload = StatePayload::last_update("2026-08-09T12:00:00+02:00");
+        assert_eq!(payload.get(LAST_UPDATE), Some(&json!("2026-08-09T12:00:00+02:00")));
+        // Nothing else, so it cannot overwrite the shared status object's fields on its own topic.
+        assert_eq!(payload.get("connected"), None);
+        assert_eq!(payload.get("bridge_version"), None);
     }
 
     #[test]
@@ -314,7 +333,7 @@ mod tests {
         // the interpreting belongs there — and it has to be true whether or not the device is present.
         for connected in [true, false] {
             assert_eq!(
-                StatePayload::status(connected, None).get("bridge_version"),
+                StatePayload::status(connected).get("bridge_version"),
                 Some(&json!(crate::VERSION))
             );
         }
@@ -324,7 +343,7 @@ mod tests {
     fn status_is_retained_and_telemetry_is_not() {
         // Status is published on change and must outlive a late subscriber; telemetry is replaced within
         // seconds, and a retained copy would be read as current long after the device went away.
-        assert!(StatePayload::status(true, None).retained("heliobridge/x/status").retain);
+        assert!(StatePayload::status(true).retained("heliobridge/x/status").retain);
         assert!(!StatePayload::default().publication("heliobridge/x/state").retain);
     }
 
