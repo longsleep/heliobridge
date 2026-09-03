@@ -796,6 +796,7 @@ pub fn listen(path: &Path, registry: Registry) -> Result<(), ControlError> {
 
     let router = Router::new()
         .route("/healthz", get(Api::health))
+        .route("/meter", get(Api::meter_state).post(Api::meter_set))
         .route("/devices", get(Api::devices))
         .route("/devices/{device}", get(Api::device))
         .route("/devices/{device}/identity", get(Api::identity))
@@ -807,7 +808,10 @@ pub fn listen(path: &Path, registry: Registry) -> Result<(), ControlError> {
         .route("/devices/{device}/actions", get(Api::actions))
         .route("/devices/{device}/actions/{key}", post(Api::act))
         .route("/devices/{device}/config/read", post(Api::read_config_set))
-        .route("/devices/{device}/config/{key}", get(Api::config))
+        .route(
+            "/devices/{device}/config/{key}",
+            get(Api::config).put(Api::write_config),
+        )
         .route("/devices/{device}/config/{key}/read", post(Api::read_config))
         .with_state(registry);
 
@@ -1341,6 +1345,120 @@ impl Api {
             );
         };
         dispatch(&handle, Action::Send(action.command())).await
+    }
+
+    /// What the simulated meter is reporting.
+    ///
+    /// Not device-scoped: there is one simulated meter and the device fetches from it, so it is a property
+    /// of this program rather than of a session. `served` is the answer to the experiment — a nonzero count
+    /// means the device really does poll a meter it has been given.
+    async fn meter_state() -> Response {
+        let meter = &crate::server::meter::METER;
+        axum::Json(serde_json::json!({
+            "enabled": meter.enabled(),
+            "watts": meter.watts(),
+            "served": meter.served(),
+        }))
+        .into_response()
+    }
+
+    /// Turn the simulated meter on or off, or change what it reports.
+    ///
+    /// `POST` rather than `PUT`: enabling it changes what this program answers on its listening port, which
+    /// is not the idempotent setting of a resource so much as an instruction.
+    async fn meter_set(axum::Json(body): axum::Json<serde_json::Value>) -> Response {
+        let meter = &crate::server::meter::METER;
+        let watts = body.get("watts").and_then(serde_json::Value::as_i64);
+        match body.get("enabled").and_then(serde_json::Value::as_bool) {
+            Some(false) => {
+                meter.disable();
+                tracing::info!("the simulated meter is off");
+            }
+            Some(true) => {
+                meter.enable(watts.unwrap_or_else(|| meter.watts()));
+                tracing::info!(watts = meter.watts(), "the simulated meter is on");
+            }
+            // Only a figure: change it without touching whether it answers, so a load can be swept without
+            // re-stating the obvious.
+            None => match watts {
+                Some(watts) => {
+                    meter.set_watts(watts);
+                    tracing::info!(watts, "the simulated meter reports a new figure");
+                }
+                None => {
+                    return problem(
+                        StatusCode::BAD_REQUEST,
+                        "send {\"enabled\": true|false} and/or {\"watts\": <number>}",
+                    );
+                }
+            },
+        }
+        Self::meter_state().await
+    }
+
+    /// Write one config register.
+    ///
+    /// Deliberately narrow. Two whole classes are refused rather than exposed:
+    ///
+    /// - **Anything that retargets the device** (17, 18, 19). A wrong value there leaves a device that
+    ///   listens on no port, reachable only by standing next to it with a Bluetooth client, and `0x18`
+    ///   carries no acknowledgement so the write that strands it looks exactly like one that worked.
+    /// - **Actions** (restart, factory reset). Those have their own endpoint, where the effect of each is
+    ///   spelled out, and the factory reset is not something to reach by supplying a value.
+    ///
+    /// What is left is the clock and the accessory list, neither of which can lose the device.
+    ///
+    /// No read-back: the config space acknowledges nothing and answers no read for these, so the honest
+    /// answer is that it was sent. Confirm with a read of the register afterwards.
+    async fn write_config(
+        Session { handle, .. }: Session,
+        Key(key): Key,
+        body: Result<axum::Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+    ) -> Response {
+        let Ok(axum::Json(body)) = body else {
+            return problem(StatusCode::BAD_REQUEST, r#"expected a body like {"value":"ADD:1-1-…"}"#);
+        };
+        let Some(value) = body.get("value").and_then(|value| value.as_str()) else {
+            return problem(StatusCode::BAD_REQUEST, r#"expected a body like {"value":"ADD:1-1-…"}"#);
+        };
+        let Some(register) = WritableConfig::lookup(&key) else {
+            let writable: Vec<&str> = WritableConfig::ALL
+                .iter()
+                .filter(|entry| !entry.is_retarget() && !entry.is_action())
+                .map(|entry| entry.name())
+                .collect();
+            return problem(
+                StatusCode::NOT_FOUND,
+                &format!(
+                    "{key:?} is not a writable config register; this accepts {}",
+                    writable.join(", ")
+                ),
+            );
+        };
+        if register.is_retarget() {
+            return problem(
+                StatusCode::FORBIDDEN,
+                &format!(
+                    "{key:?} moves the device to a different server, which has no remote recovery; \
+                     this endpoint refuses it"
+                ),
+            );
+        }
+        if register.is_action() {
+            return problem(
+                StatusCode::FORBIDDEN,
+                &format!("{key:?} is an action; POST it to the actions endpoint instead"),
+            );
+        }
+
+        dispatch(
+            &handle,
+            Action::Send(Command::WriteConfig {
+                register,
+                value: value.to_owned(),
+            }),
+        )
+        .await
     }
 
     /// Serve a cached value, or explain that it has not arrived yet.

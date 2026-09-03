@@ -14,6 +14,8 @@
 //!
 //! - [`session`] — the per-connection state machine.
 //! - [`listener`] — accept loop, one session per connection.
+//! - [`meter`] — a simulated energy meter, answered on the same port because the device may reach no
+//!   other one.
 //! - [`access`] — who may connect: a source-address allowlist and a device-serial allowlist.
 //! - [`tls`] — server TLS, including first-run certificate generation.
 //! - [`clock`] — wall-clock time for the server time push, and the skew check that goes with it.
@@ -24,6 +26,7 @@
 pub mod access;
 pub mod clock;
 pub mod listener;
+pub mod meter;
 pub mod probe;
 pub mod session;
 pub mod tls;
@@ -31,5 +34,6 @@ pub mod tls;
 pub use access::{AccessError, Devices, Peers};
 pub use clock::Clock;
 pub use listener::{ListenerError, SessionOptions, serve};
+pub use meter::METER;
 pub use session::{Session, SessionError, SessionStats};
 pub use tls::{CertificateOrigin, TlsError, client_identity, server_config};

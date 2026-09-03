@@ -311,6 +311,12 @@ pub enum WritableConfig {
     /// Register 35. **Resets the datalogger to factory defaults** — not a log wipe, whatever the
     /// vendor's own web interface labels it **[F]**. See [`Self::is_destructive`].
     FactoryReset,
+    /// Register 122, the list of network accessories the device polls **[F]**.
+    ///
+    /// Takes a command rather than a value: `ADD:<type>-<mode>-<payload>`, `DEL:…` or `CRL:…`, with mode 1
+    /// giving an address and a serial and mode 7 naming something to find by mDNS. See the specification's
+    /// Appendix C. Writable because a meter cannot otherwise be registered without the vendor's cloud.
+    AccessoryList,
     /// Register 19, the broker host name. **Retargets the device** — see [`Self::is_retarget`].
     RemoteUrl,
     /// Register 18, the broker port. **Retargets the device.**
@@ -322,10 +328,11 @@ pub enum WritableConfig {
 
 impl WritableConfig {
     /// Every member, for listing what this build can write.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Clock,
         Self::Restart,
         Self::FactoryReset,
+        Self::AccessoryList,
         Self::RemoteUrl,
         Self::RemotePort,
         Self::RemoteIp,
@@ -337,6 +344,7 @@ impl WritableConfig {
             Self::Clock => 31,
             Self::Restart => 32,
             Self::FactoryReset => 35,
+            Self::AccessoryList => 122,
             Self::RemoteUrl => 19,
             Self::RemotePort => 18,
             Self::RemoteIp => 17,
@@ -349,6 +357,7 @@ impl WritableConfig {
             Self::Clock => "datetime",
             Self::Restart => "restart",
             Self::FactoryReset => "factory_reset",
+            Self::AccessoryList => "accessory_list",
             Self::RemoteUrl => "remote_url",
             Self::RemotePort => "remote_port",
             Self::RemoteIp => "remote_ip",

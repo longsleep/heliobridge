@@ -172,6 +172,24 @@ async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcce
         tracing::warn!(%error, "could not disable Nagle");
     }
 
+    // A TLS record begins 0x16; an HTTP request begins with its method. The device may reach only this
+    // port, so the simulated meter of `meter` is answered here rather than on a port of its own. Peeking
+    // leaves the octet in the socket, so the handshake below still sees a complete stream.
+    if crate::server::meter::METER.enabled() {
+        let mut first = [0_u8; 1];
+        match stream.peek(&mut first).await {
+            Ok(1) if first.first() != Some(&0x16) => {
+                crate::server::meter::METER.serve(stream, peer).await;
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "could not peek at a new connection");
+                return;
+            }
+        }
+    }
+
     let stream = match acceptor.accept(stream).await {
         Ok(stream) => stream,
         Err(error) => {
