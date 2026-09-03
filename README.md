@@ -251,6 +251,23 @@ $ curl --unix-socket /run/heliobridge.sock -X PUT \
 Positive is importing, negative is exporting. `DELETE` on the same path withdraws it. From Home Assistant the
 same two operations are the **Supplied meter reading** number and the **Withdraw meter reading** button.
 
+**Every write is a fresh submission, not a stored setting** — which the number does not look like, and one
+consequence is worth knowing. Setting it from an automation or from *Developer tools → Actions* submits the
+figure every time, whether or not it differs from the last. Typing into the box does not: the frontend keeps
+the value it last sent and will not re-submit an unchanged one, so the same reading cannot be supplied twice
+by hand that way. To send a figure again, call the action rather than retyping it:
+
+```yaml
+action: number.set_value
+target:
+  entity_id: number.nexa_2000_0example00000001_supplied_meter_reading
+data:
+  value: -250
+```
+
+or publish to the command topic directly with `mqtt.publish`, which is also what an automation should do if
+it is already computing the figure.
+
 **The reading is an error signal, not a target.** For each new reading the device adjusts its *own* output by
 approximately that amount:
 
