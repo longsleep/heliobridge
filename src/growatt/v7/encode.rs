@@ -323,7 +323,7 @@ pub enum WritableConfig {
     RemotePort,
     /// Register 17, the broker address. **Retargets the device**, and is the one member never observed
     /// being written **[I]**.
-    RemoteIp,
+    ServerAddress,
 }
 
 impl WritableConfig {
@@ -335,7 +335,7 @@ impl WritableConfig {
         Self::AccessoryList,
         Self::RemoteUrl,
         Self::RemotePort,
-        Self::RemoteIp,
+        Self::ServerAddress,
     ];
 
     /// The config register number.
@@ -347,7 +347,7 @@ impl WritableConfig {
             Self::AccessoryList => 122,
             Self::RemoteUrl => 19,
             Self::RemotePort => 18,
-            Self::RemoteIp => 17,
+            Self::ServerAddress => 17,
         })
     }
 
@@ -360,7 +360,7 @@ impl WritableConfig {
             Self::AccessoryList => "accessory_list",
             Self::RemoteUrl => "remote_url",
             Self::RemotePort => "remote_port",
-            Self::RemoteIp => "remote_ip",
+            Self::ServerAddress => "server_address",
         }
     }
 
@@ -375,7 +375,7 @@ impl WritableConfig {
     /// without enumerating its members, because the failure mode is a device that never comes back and is
     /// recoverable only by re-provisioning it over Bluetooth.
     pub const fn is_retarget(self) -> bool {
-        matches!(self, Self::RemoteUrl | Self::RemotePort | Self::RemoteIp)
+        matches!(self, Self::RemoteUrl | Self::RemotePort | Self::ServerAddress)
     }
 
     /// Whether this is an action rather than a setting.
@@ -1243,7 +1243,7 @@ mod tests {
         // A caller must be able to refuse all of them without listing them: a wrong value here leaves a
         // device that never comes back.
         for register in [
-            WritableConfig::RemoteIp,
+            WritableConfig::ServerAddress,
             WritableConfig::RemotePort,
             WritableConfig::RemoteUrl,
         ] {

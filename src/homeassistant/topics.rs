@@ -14,7 +14,7 @@
 //! makes them available exactly when both are true; the two that exist to *report* an outage list only the
 //! bridge's, or they would vanish at the moment they became interesting.
 
-use crate::homeassistant::entity::{Component, Presence, Source};
+use crate::homeassistant::entity::{Component, Entity, Presence, Source};
 use crate::mqtt::{QoS, Will};
 
 /// Payload for an availability topic when the thing is present.
@@ -106,12 +106,27 @@ impl Topics {
         format!("{}/{device}/availability", self.base)
     }
 
+    /// Where one entity's own presence is reported, for a setting another one can override.
+    ///
+    /// Per entity rather than per device: two slots can be in different work modes, so one slot's power
+    /// setting may be effective while another's is not.
+    pub fn entity_availability(&self, device: &str, key: &str) -> String {
+        format!("{}/{device}/availability/{key}", self.base)
+    }
+
     /// Which availability topics an entity depends on, in the order they go into its discovery message.
-    pub fn availability(&self, presence: Presence, device: &str) -> Vec<String> {
-        match presence {
+    ///
+    /// Combined with `availability_mode: all`, so every topic listed must say online. A gated entity adds
+    /// a third topic of its own, which this program drives from whatever its gate names.
+    pub fn availability(&self, entity: &Entity, device: &str) -> Vec<String> {
+        let mut topics = match entity.presence {
             Presence::Bridge => vec![self.bridge_availability()],
             Presence::Device => vec![self.bridge_availability(), self.device_availability(device)],
+        };
+        if entity.gate.is_some() {
+            topics.push(self.entity_availability(device, entity.key));
         }
+        topics
     }
 
     /// Where a device's telemetry goes.
@@ -187,7 +202,8 @@ impl Topics {
 #[cfg(test)]
 mod tests {
     use super::Topics;
-    use crate::homeassistant::entity::{Component, Presence, Source};
+    use crate::growatt::v7::registers::{HoldingRegister, INPUT_REGISTERS, InputRegister};
+    use crate::homeassistant::entity::{Component, Entity, Source};
 
     /// Two bridges on one broker, distinguished only by their instance name.
     fn two_instances() -> (Topics, Topics) {
@@ -305,6 +321,14 @@ mod tests {
         }
     }
 
+    /// An ordinary telemetry register, for the availability tests.
+    fn ac_power() -> InputRegister {
+        *INPUT_REGISTERS
+            .iter()
+            .find(|entry| entry.name == "ac_power")
+            .expect("ac_power is mapped")
+    }
+
     #[test]
     fn the_entities_that_report_an_outage_do_not_depend_on_the_device() {
         // The point of the distinction: an entity listing the device's availability goes unavailable
@@ -312,12 +336,34 @@ mod tests {
         let topics = Topics::default();
         let device = "0EXAMPLE00000001";
         assert_eq!(
-            topics.availability(Presence::Device, device),
+            topics.availability(&Entity::for_reading(&ac_power()).expect("an entity"), device),
             vec![topics.bridge_availability(), topics.device_availability(device)]
         );
         assert_eq!(
-            topics.availability(Presence::Bridge, device),
+            topics.availability(&Entity::connected(), device),
             vec![topics.bridge_availability()]
+        );
+    }
+
+    #[test]
+    fn an_overridable_setting_adds_a_topic_of_its_own() {
+        // Per entity, so one slot going into smart self-use does not take another slot's power setting
+        // away with it.
+        let topics = Topics::default();
+        let device = "0EXAMPLE00000001";
+        let power = Entity::for_setting(&HoldingRegister::slot(1).expect("slot 1")[3]);
+        assert!(power.gate.is_some(), "the slot power setting is gated by its work mode");
+        assert_eq!(
+            topics.availability(&power, device),
+            vec![
+                topics.bridge_availability(),
+                topics.device_availability(device),
+                topics.entity_availability(device, "slot1_output_power"),
+            ]
+        );
+        assert_ne!(
+            topics.entity_availability(device, "slot1_output_power"),
+            topics.entity_availability(device, "slot2_output_power")
         );
     }
 

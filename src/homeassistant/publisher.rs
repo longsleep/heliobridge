@@ -18,7 +18,7 @@
 //! Assistant records a gap, which is what actually happened.
 
 use core::time::Duration;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, watch};
@@ -28,7 +28,7 @@ use crate::control::{Action as ControlAction, Connected, Registry, SessionHandle
 use crate::homeassistant::broker::{Broker, BrokerConfig, BrokerError, Event, Publication, Publications};
 use crate::homeassistant::command::{Change, Delivery, Permitted};
 use crate::homeassistant::discovery::{DeviceBlock, Discovery};
-use crate::homeassistant::entity::{Catalogue, Component, Entity};
+use crate::homeassistant::entity::{Catalogue, Component, Entity, Gate};
 use crate::homeassistant::state::{Fields, StatePayload};
 use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
 
@@ -227,6 +227,7 @@ impl Publisher {
                     last_update: None,
                     present: false,
                     fields: Fields::default(),
+                    gates: HashMap::new(),
                 }
                 .run(),
             );
@@ -310,6 +311,8 @@ struct Link {
     present: bool,
     /// Which fields the announced entities read.
     fields: Fields,
+    /// What was last published to each gated entity's availability topic.
+    gates: HashMap<&'static str, &'static [u8]>,
 }
 
 /// What the discovery messages on the broker describe.
@@ -624,6 +627,7 @@ impl Link {
         }
         let publication = payload.publication(self.topics.state(&self.device));
         self.publish(publication);
+        self.publish_gates();
     }
 
     /// Publish the settings a session has read back.
@@ -637,6 +641,56 @@ impl Link {
         }
         let publication = payload.retained(self.topics.settings(&self.device));
         self.publish(publication);
+        self.publish_gates();
+    }
+
+    /// Publish, per gated entity, whether it currently has an honest value.
+    ///
+    /// Driven from the entity catalogue rather than from a table here: an entity carries its own
+    /// [`Gate`], so the condition is declared beside the thing it applies to.
+    ///
+    /// **Only on change.** These are retained messages, and a gate is re-evaluated on every telemetry
+    /// frame — republishing an unchanged answer every five seconds would be a message per gate per cycle
+    /// for the life of the session.
+    ///
+    /// A gate whose deciding value has not arrived yet publishes *nothing*. Reporting a control available
+    /// before knowing the work mode, or a reading valid before knowing whether a meter is attached, would
+    /// be a claim rather than an observation — and the wrong one about half the time.
+    fn publish_gates(&mut self) {
+        let Some(announced) = self.announced.as_ref() else {
+            return;
+        };
+
+        let mut decided: Vec<(&'static str, &'static [u8])> = Vec::new();
+        {
+            let settings = self.session.settings.borrow();
+            let telemetry = self.session.telemetry.borrow();
+            for entity in &announced.entities {
+                let Some(gate) = entity.gate else { continue };
+                let open = match gate {
+                    Gate::SettingIsNot { setting, value } => settings
+                        .iter()
+                        .find(|held| held.name == setting)
+                        .map(|held| held.raw != value),
+                    Gate::ReadingIsSet { reading: name } => telemetry
+                        .as_ref()
+                        .and_then(|view| reading(view, name))
+                        .map(|value| value != 0),
+                };
+                if let Some(open) = open {
+                    decided.push((entity.key, if open { ONLINE } else { OFFLINE }));
+                }
+            }
+        }
+
+        for (key, payload) in decided {
+            if self.gates.get(key) == Some(&payload) {
+                continue;
+            }
+            self.gates.insert(key, payload);
+            let topic = self.topics.entity_availability(&self.device, key);
+            self.publish(Publication::retained(topic, payload));
+        }
     }
 
     /// Queue a publication, unless there is nothing to publish over.
@@ -665,9 +719,22 @@ async fn apply(session: &SessionHandle, device: &str, change: Change) {
     // An action is transmitted and answered as sent. Putting it through `Apply` would wait for a read-back
     // that the config space never produces, and report a working restart as a failure to confirm.
     if change.delivery == Delivery::FireAndForget {
-        match session.carry_out(ControlAction::Send(change.command)).await {
-            Ok(_outcome) => tracing::info!(%device, action = %change.key, "sent"),
-            Err(error) => tracing::warn!(%device, action = %change.key, %error, "could not be sent"),
+        let requested = change.requested.clone();
+        let outcome = session.carry_out(ControlAction::Send(change.command)).await;
+        // Two arms per result rather than one with an `Option` field: an action carries no value, and
+        // `requested=None` beside a restart is noise. The value is logged here or nowhere — nothing reads
+        // these registers back, so this line is the only record of what the device was told.
+        match (outcome, requested) {
+            (Ok(_), Some(requested)) => {
+                tracing::info!(%device, action = %change.key, %requested, "sent");
+            }
+            (Ok(_), None) => tracing::info!(%device, action = %change.key, "sent"),
+            (Err(error), Some(requested)) => {
+                tracing::warn!(%device, action = %change.key, %requested, %error, "could not be sent");
+            }
+            (Err(error), None) => {
+                tracing::warn!(%device, action = %change.key, %error, "could not be sent");
+            }
         }
         return;
     }
@@ -731,8 +798,11 @@ mod tests {
         Catalogue, Component, FAREWELL_DEPTH, Fields, Generation, Link, OFFLINE_AFTER, PublisherOptions, reading,
     };
     use crate::control::{IdentityView, ReadingView, SessionHandle, SettingView, StatusView, TelemetryView};
+    use std::collections::HashMap;
+
+    use crate::growatt::v7::registers::{SMART_SELF_USE, WORK_MODE_LABELS};
     use crate::homeassistant::broker::{Publication, Publications};
-    use crate::homeassistant::topics::Topics;
+    use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
     use core::time::Duration;
     use std::sync::Arc;
     use tokio::sync::{mpsc, watch};
@@ -810,6 +880,7 @@ mod tests {
                 last_update: None,
                 present: false,
                 fields: Fields::default(),
+                gates: HashMap::new(),
             }
             .run(),
         );
@@ -1125,6 +1196,110 @@ mod tests {
         assert!(published.retain);
         let object: serde_json::Value = serde_json::from_slice(&published.payload).expect("valid JSON");
         assert_eq!(object["grid_power_allowed"], serde_json::json!(1));
+    }
+
+    /// The slot power setting and the work mode that decides whether it is read.
+    fn slot1(work_mode: u16) -> Vec<SettingView> {
+        vec![
+            SettingView {
+                register: 256,
+                name: "slot1_work_mode",
+                raw: work_mode,
+                value: WORK_MODE_LABELS
+                    .get(usize::from(work_mode))
+                    .expect("a known mode")
+                    .to_string(),
+                unit: "",
+            },
+            SettingView {
+                register: 257,
+                name: "slot1_output_power",
+                raw: 300,
+                value: "300".to_owned(),
+                unit: "W",
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_slot_in_smart_self_use_takes_its_power_setting_unavailable() {
+        // The device stores the value and ignores it, reading back exactly what was written — so nothing
+        // in the write itself reveals that it did nothing. Availability is the only channel that can.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(slot1(SMART_SELF_USE));
+        settle().await;
+
+        let gate = wire.on("heliobridge/0EXAMPLE00000001/availability/slot1_output_power");
+        let published = gate.last().expect("a gate message");
+        assert!(
+            published.retain,
+            "a subscriber joining later must still learn it is inert"
+        );
+        assert_eq!(published.payload, OFFLINE);
+    }
+
+    #[tokio::test]
+    async fn a_slot_in_load_first_keeps_its_power_setting_available() {
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(slot1(0));
+        settle().await;
+
+        let gate = wire.on("heliobridge/0EXAMPLE00000001/availability/slot1_output_power");
+        assert_eq!(gate.last().expect("a gate message").payload, ONLINE);
+    }
+
+    #[tokio::test]
+    async fn a_setting_nothing_overrides_gets_no_gate_topic() {
+        // Only the overridable ones carry an extra topic. Publishing one per setting would announce a
+        // condition that does not exist, and every entity would then depend on a topic nothing drives.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(vec![SettingView {
+            register: 326,
+            name: "grid_power_allowed",
+            raw: 1,
+            value: "1".to_owned(),
+            unit: "",
+        }]);
+        settle().await;
+
+        assert!(
+            wire.on("heliobridge/0EXAMPLE00000001/availability/grid_power_allowed")
+                .is_empty(),
+            "grid_power_allowed is not superseded by anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gate_waits_for_the_deciding_setting_to_be_read_back() {
+        // Reporting the control available before the work mode is known would be a claim rather than an
+        // observation, and the wrong one half the time.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(vec![SettingView {
+            register: 257,
+            name: "slot1_output_power",
+            raw: 300,
+            value: "300".to_owned(),
+            unit: "W",
+        }]);
+        settle().await;
+
+        assert!(
+            wire.on("heliobridge/0EXAMPLE00000001/availability/slot1_output_power")
+                .is_empty(),
+            "nothing should be claimed until slot1_work_mode has been read"
+        );
     }
 
     #[tokio::test(start_paused = true)]

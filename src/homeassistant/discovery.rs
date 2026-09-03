@@ -130,11 +130,14 @@ impl Discovery<'_> {
         config.insert("name".to_owned(), json!(entity.name));
         config.insert("unique_id".to_owned(), json!(self.topics.unique_id(device, entity.key)));
         config.insert("object_id".to_owned(), json!(self.topics.unique_id(device, entity.key)));
-        config.insert(
-            "state_topic".to_owned(),
-            json!(self.topics.topic_for(entity.source, device)),
-        );
-        config.insert("value_template".to_owned(), json!(self.value_template()));
+        // A control with no source is optimistic: nothing reports its value back, so Home Assistant shows
+        // what it last set. Announcing a state topic nothing publishes to would leave it unknown forever.
+        if let Some(source) = entity.source {
+            config.insert("state_topic".to_owned(), json!(self.topics.topic_for(source, device)));
+            config.insert("value_template".to_owned(), json!(self.value_template()));
+        } else {
+            config.insert("optimistic".to_owned(), json!(true));
+        }
 
         // Both signals, so an entity is available only while this program is running and the device is
         // reporting — except for the two that exist to say the device is not.
@@ -142,7 +145,7 @@ impl Discovery<'_> {
             "availability".to_owned(),
             Value::Array(
                 self.topics
-                    .availability(entity.presence, device)
+                    .availability(entity, device)
                     .into_iter()
                     .map(|topic| json!({ "topic": topic }))
                     .collect(),
@@ -253,6 +256,9 @@ impl Discovery<'_> {
             return;
         }
         let key = self.entity.key;
+        // A control with a read-back must not go optimistic; one without has nothing else it could be, and
+        // `common` has already said so. Deciding it once here keeps the two from contradicting each other.
+        let confirmed = self.entity.source.is_some();
         config.insert(
             "command_topic".to_owned(),
             json!(self.topics.command(&self.device.serial)),
@@ -263,21 +269,27 @@ impl Discovery<'_> {
             Shape::Toggle => {
                 config.insert("payload_on".to_owned(), json!(json!({ key: 1 }).to_string()));
                 config.insert("payload_off".to_owned(), json!(json!({ key: 0 }).to_string()));
-                config.insert("optimistic".to_owned(), json!(false));
+                if confirmed {
+                    config.insert("optimistic".to_owned(), json!(false));
+                }
             }
             Shape::Numeric(_) => {
                 config.insert(
                     "command_template".to_owned(),
                     json!(format!(r#"{{"{key}": {{{{ value }}}}}}"#)),
                 );
-                config.insert("optimistic".to_owned(), json!(false));
+                if confirmed {
+                    config.insert("optimistic".to_owned(), json!(false));
+                }
             }
             Shape::Choice(_) | Shape::TimeOfDay => {
                 config.insert(
                     "command_template".to_owned(),
                     json!(format!(r#"{{"{key}": "{{{{ value }}}}"}}"#)),
                 );
-                config.insert("optimistic".to_owned(), json!(false));
+                if confirmed {
+                    config.insert("optimistic".to_owned(), json!(false));
+                }
             }
             Shape::Action => {
                 config.insert("payload_press".to_owned(), json!(json!({ key: 1 }).to_string()));
@@ -554,9 +566,19 @@ mod tests {
             assert!(object.contains_key("unique_id"), "{}", entity.key);
             assert!(object.contains_key("name"), "{}", entity.key);
             assert!(object.contains_key("availability"), "{}", entity.key);
+            // A state topic exactly when something publishes one: an action has no state to report, and
+            // an optimistic control has no read-back to report it from.
             assert_eq!(
                 object.contains_key("state_topic"),
-                !matches!(entity.shape, crate::homeassistant::entity::Shape::Action),
+                entity.source.is_some() && !matches!(entity.shape, crate::homeassistant::entity::Shape::Action),
+                "{}",
+                entity.key
+            );
+            // `optimistic: false` is set for every control that *has* a read-back, so the presence of the
+            // key says nothing; only its value distinguishes the two.
+            assert_eq!(
+                object.get("optimistic") == Some(&serde_json::json!(true)),
+                entity.source.is_none(),
                 "{}",
                 entity.key
             );

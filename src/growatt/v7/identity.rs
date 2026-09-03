@@ -113,7 +113,7 @@ impl Identity {
     /// Worth reading back rather than assuming: it is how a retarget would be confirmed, and how an
     /// unexpected reversion would become visible.
     pub fn endpoint(&self) -> Option<String> {
-        let host = self.get("remote_url").or_else(|| self.get("remote_ip"))?;
+        let host = self.get("remote_url").or_else(|| self.get("server_address"))?;
         Some(match self.get("remote_port") {
             Some(port) => format!("{host}:{port}"),
             None => host.to_owned(),

@@ -64,7 +64,8 @@ fn the_endpoint_is_what_the_device_believes_it_should_dial() {
     let frame = Frame::parse(FULL_REPORT).expect("the fixture parses");
     let report = Identity::from_frame(&frame).expect("the identity report decodes");
     assert_eq!(report.endpoint().as_deref(), Some("mqtt.growatt.com:7006"));
-    assert_eq!(report.get("remote_ip"), Some("mqtt.growatt.com"));
+    // A hostname, which is why the field is not called an IP address.
+    assert_eq!(report.get("server_address"), Some("mqtt.growatt.com"));
     assert_eq!(report.get("remote_port"), Some("7006"));
 }
 

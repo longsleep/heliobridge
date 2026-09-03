@@ -82,7 +82,7 @@ use axum::extract::{FromRequestParts, Query, RawPathParams, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use tokio::net::UnixListener;
@@ -93,6 +93,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::growatt::v7::encode::{Command, WritableConfig};
+use crate::growatt::v7::meter;
 use crate::growatt::v7::registers::{CONFIG_REGISTER_LAST, ConfigRegister, HoldingRegister, SLOT_COUNT};
 use crate::model::{Raw, Register};
 
@@ -796,7 +797,17 @@ pub fn listen(path: &Path, registry: Registry) -> Result<(), ControlError> {
 
     let router = Router::new()
         .route("/healthz", get(Api::health))
-        .route("/meter", get(Api::meter_state).post(Api::meter_set))
+        .route(
+            "/meter",
+            get(Api::meter_state)
+                .put(Api::meter_enable)
+                .post(Api::meter_update)
+                .delete(Api::meter_disable),
+        )
+        .route(
+            "/devices/{device}/meter-reading",
+            put(Api::put_meter_reading).delete(Api::delete_meter_reading),
+        )
         .route("/devices", get(Api::devices))
         .route("/devices/{device}", get(Api::device))
         .route("/devices/{device}/identity", get(Api::identity))
@@ -1362,37 +1373,49 @@ impl Api {
         .into_response()
     }
 
-    /// Turn the simulated meter on or off, or change what it reports.
+    /// Start answering meter polls, reporting `watts`.
     ///
-    /// `POST` rather than `PUT`: enabling it changes what this program answers on its listening port, which
-    /// is not the idempotent setting of a resource so much as an instruction.
-    async fn meter_set(axum::Json(body): axum::Json<serde_json::Value>) -> Response {
+    /// Idempotent: a second `PUT` changes the figure without stopping and starting. Omitting `watts` keeps
+    /// whatever was last reported, so a meter can be switched back on at the figure it had.
+    async fn meter_enable(body: Option<axum::Json<serde_json::Value>>) -> Response {
         let meter = &crate::server::meter::METER;
-        let watts = body.get("watts").and_then(serde_json::Value::as_i64);
-        match body.get("enabled").and_then(serde_json::Value::as_bool) {
-            Some(false) => {
-                meter.disable();
-                tracing::info!("the simulated meter is off");
-            }
-            Some(true) => {
-                meter.enable(watts.unwrap_or_else(|| meter.watts()));
-                tracing::info!(watts = meter.watts(), "the simulated meter is on");
-            }
-            // Only a figure: change it without touching whether it answers, so a load can be swept without
-            // re-stating the obvious.
-            None => match watts {
-                Some(watts) => {
-                    meter.set_watts(watts);
-                    tracing::info!(watts, "the simulated meter reports a new figure");
-                }
-                None => {
-                    return problem(
-                        StatusCode::BAD_REQUEST,
-                        "send {\"enabled\": true|false} and/or {\"watts\": <number>}",
-                    );
-                }
-            },
+        let watts = body
+            .and_then(|axum::Json(body)| body.get("watts").and_then(serde_json::Value::as_i64))
+            .unwrap_or_else(|| meter.watts());
+        meter.enable(watts);
+        tracing::info!(watts = meter.watts(), "the simulated meter is on");
+        Self::meter_state().await
+    }
+
+    /// Stop answering meter polls.
+    ///
+    /// The figure is kept rather than cleared, so turning it back on resumes where it left off. What
+    /// changes is that a non-TLS connection is dropped again, as it is when this has never been used.
+    async fn meter_disable() -> Response {
+        let meter = &crate::server::meter::METER;
+        meter.disable();
+        tracing::info!("the simulated meter is off");
+        Self::meter_state().await
+    }
+
+    /// Report a different figure, without changing whether the meter answers.
+    ///
+    /// Separate from `PUT` so a load can be swept without re-stating that the meter is on, and so that
+    /// sweeping one does not silently switch it on if it was off — which would be a change nobody asked
+    /// for in the middle of a measurement.
+    async fn meter_update(axum::Json(body): axum::Json<serde_json::Value>) -> Response {
+        let meter = &crate::server::meter::METER;
+        let Some(watts) = body.get("watts").and_then(serde_json::Value::as_i64) else {
+            return problem(StatusCode::BAD_REQUEST, r#"expected a body like {"watts":250}"#);
+        };
+        if !meter.enabled() {
+            return problem(
+                StatusCode::CONFLICT,
+                "the simulated meter is not answering; PUT to start it",
+            );
         }
+        meter.set_watts(watts);
+        tracing::info!(watts, "the simulated meter reports a new figure");
         Self::meter_state().await
     }
 
@@ -1459,6 +1482,65 @@ impl Api {
             }),
         )
         .await
+    }
+
+    /// Supply a meter reading to the device, as a meter would.
+    ///
+    /// `PUT {"watts": <signed>}` — positive for import, negative for export. The datalogger writes four
+    /// registers from 309 after polling a meter and this writes the same block. Its own resource rather
+    /// than a writable register because these are not settings: they are a data channel with no read-back.
+    ///
+    /// **A reading expires after about two minutes, and nothing here refreshes it.** A caller supplying
+    /// readings has to write again inside that window, from a figure it has actually measured; see
+    /// [`crate::growatt::v7::meter`] for why that is deliberate rather than an omission.
+    ///
+    /// No read-back, because the device offers none for these registers: the honest report is that the
+    /// write was sent. What the device made of it appears in telemetry as `meter_active_power`, and
+    /// `meter_connected` says whether it currently holds a reading at all.
+    async fn put_meter_reading(
+        Session { handle, .. }: Session,
+        body: Result<axum::Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+    ) -> Response {
+        const EXPECTED: &str = r#"expected a body like {"watts":250}"#;
+
+        let Ok(axum::Json(body)) = body else {
+            return problem(StatusCode::BAD_REQUEST, EXPECTED);
+        };
+        let Some(watts) = body.get("watts").and_then(serde_json::Value::as_i64) else {
+            return problem(StatusCode::BAD_REQUEST, EXPECTED);
+        };
+        let Ok(watts) = i32::try_from(watts) else {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "watts is far outside anything this equipment sees",
+            );
+        };
+
+        let command = match meter::command(watts, true) {
+            Ok(command) => command,
+            Err(error) => return problem(StatusCode::BAD_REQUEST, &error.to_string()),
+        };
+        // Logged here or nowhere: these registers answer no read-back, so this line is the only record of
+        // what the device was told.
+        tracing::info!(watts, "supplying a meter reading");
+        dispatch(&handle, Action::Send(command)).await
+    }
+
+    /// Withdraw the supplied reading, telling the device its meter has gone.
+    ///
+    /// Writes the all-zero block the firmware itself writes for a meter that is not answering, so the
+    /// device drops the reading at once rather than waiting out the expiry.
+    ///
+    /// A verb rather than a flag on the value, because `0 W` is a *valid* reading — the grid is balanced,
+    /// and the device acts on it by holding its output. Conflating the two would make "my meter has gone"
+    /// unsayable.
+    async fn delete_meter_reading(Session { handle, .. }: Session) -> Response {
+        let command = match meter::command(0, false) {
+            Ok(command) => command,
+            Err(error) => return problem(StatusCode::BAD_REQUEST, &error.to_string()),
+        };
+        tracing::info!("withdrawing the supplied meter reading");
+        dispatch(&handle, Action::Send(command)).await
     }
 
     /// Serve a cached value, or explain that it has not arrived yet.

@@ -133,13 +133,47 @@ pub enum Presence {
     Bridge,
 }
 
-/// What a numeric setting accepts.
+/// A condition, beyond the device reporting at all, under which an entity has no honest value.
+///
+/// Availability rather than a state: these are entities whose value would otherwise look perfectly
+/// ordinary while meaning nothing. A superseded setting reads back exactly what was written to it, and a
+/// meter reading of `0` looks like a measurement — so in both cases nothing in the value itself reveals
+/// that it is inert, and going unavailable is the only way to say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// Available only while another *setting* holds something other than `value`.
+    SettingIsNot {
+        /// The setting that decides.
+        setting: &'static str,
+        /// The value under which this entity is inert.
+        value: u16,
+    },
+    /// Available only while a *telemetry* reading is non-zero.
+    ReadingIsSet {
+        /// The reading that decides.
+        reading: &'static str,
+    },
+}
+
+/// The reading that says whether the device currently has a meter reporting.
+pub const METER_CONNECTED: &str = "meter_connected";
+
+/// The control that supplies a meter reading to the device.
+pub const METER_READING: &str = "supplied_meter_reading";
+
+/// The control that withdraws it.
+pub const WITHDRAW_METER_READING: &str = "withdraw_meter_reading";
+
+/// What a numeric control accepts.
+///
+/// Signed, though every *setting* the device holds is unsigned: a supplied meter reading is a signed
+/// quantity, since export is negative, and it is published as a number like any other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bounds {
     /// Smallest accepted value.
-    pub min: u16,
+    pub min: i32,
     /// Largest accepted value.
-    pub max: u16,
+    pub max: i32,
 }
 
 /// The parts of an entity that differ by component.
@@ -194,10 +228,17 @@ pub struct Entity {
     pub precision: Option<u8>,
     /// The component-specific part.
     pub shape: Shape,
-    /// Which topic carries its state.
-    pub source: Source,
+    /// Which topic carries its state, or `None` for a control that has none.
+    ///
+    /// `None` makes the control *optimistic*: Home Assistant shows the value it last set, because
+    /// nothing reports the value back. Only correct where the device offers no read-back and something
+    /// else carries the truth — a supplied meter reading is reported by the device as
+    /// `meter_active_power`, so that sensor is the feedback rather than an echo of what was written.
+    pub source: Option<Source>,
     /// What its availability depends on.
     pub presence: Presence,
+    /// A further condition for it to be available, where it has one.
+    pub gate: Option<Gate>,
 }
 
 impl Entity {
@@ -207,7 +248,13 @@ impl Entity {
     /// an entity can never offer a value the device would refuse.
     pub fn for_setting(register: &HoldingRegister) -> Self {
         let (component, shape) = match register.domain {
-            Domain::Range { min, max } => (Component::Number, Shape::Numeric(Bounds { min, max })),
+            Domain::Range { min, max } => (
+                Component::Number,
+                Shape::Numeric(Bounds {
+                    min: i32::from(min),
+                    max: i32::from(max),
+                }),
+            ),
             Domain::Flag => (Component::Switch, Shape::Toggle),
             Domain::TimeOfDay => (Component::Text, Shape::TimeOfDay),
             Domain::Enum(labels) => (Component::Select, Shape::Choice(labels)),
@@ -224,8 +271,12 @@ impl Entity {
             // A setting is a whole number of watts, percent or minutes; its step carries the resolution.
             precision: None,
             shape,
-            source: Source::Settings,
+            source: Some(Source::Settings),
             presence: Presence::Device,
+            gate: register.superseded_by.map(|by| Gate::SettingIsNot {
+                setting: by.setting,
+                value: by.when,
+            }),
         }
     }
 
@@ -246,7 +297,8 @@ impl Entity {
         // A flags word and a label share this much: neither is a quantity, so neither may carry a unit, a
         // device class or a state class. `0` faults is not a measurement of nothing.
         let flags = is_flags(register.name);
-        let numeric = !flags && matches!(register.kind, Kind::Int | Kind::Float | Kind::Float32);
+        let signal = is_signal(register.name);
+        let numeric = !flags && !signal && matches!(register.kind, Kind::Int | Kind::Float | Kind::Float32);
         let device_class = numeric
             .then(|| device_class(register.name, register.unit))
             .flatten()
@@ -255,18 +307,25 @@ impl Entity {
         Some(Self {
             key: register.name,
             name: label(register.name),
-            component: Component::Sensor,
-            device_class,
+            component: if signal {
+                Component::BinarySensor
+            } else {
+                Component::Sensor
+            },
+            device_class: if signal { Some("connectivity") } else { device_class },
             unit: numeric.then(|| symbol(register.unit)).flatten(),
             category: diagnostic(register.name),
             precision: numeric.then(|| precision(register.scaling)),
             shape: if flags {
                 Shape::Flags
+            } else if signal {
+                Shape::Signal { on: "1", off: "0" }
             } else {
                 Shape::Reading(numeric.then(|| state_class(device_class)))
             },
-            source: Source::Telemetry,
+            source: Some(Source::Telemetry),
             presence: Presence::Device,
+            gate: register.gated_by.map(|reading| Gate::ReadingIsSet { reading }),
         })
     }
 
@@ -288,8 +347,9 @@ impl Entity {
                 on: "online",
                 off: "offline",
             },
-            source: Source::Status,
+            source: Some(Source::Status),
             presence: Presence::Bridge,
+            gate: None,
         }
     }
 
@@ -309,8 +369,9 @@ impl Entity {
             precision: None,
             // No state class: Home Assistant refuses one on a timestamp, and there is nothing to average.
             shape: Shape::Reading(None),
-            source: Source::Status,
+            source: Some(Source::Status),
             presence: Presence::Bridge,
+            gate: None,
         }
     }
 
@@ -335,8 +396,9 @@ impl Entity {
             category: Some(Category::Diagnostic),
             precision: None,
             shape: Shape::Reading(None),
-            source: Source::Status,
+            source: Some(Source::Status),
             presence: Presence::Bridge,
+            gate: None,
         }
     }
 
@@ -355,8 +417,9 @@ impl Entity {
             category: Some(Category::Diagnostic),
             precision: Some(0),
             shape: Shape::Reading(Some(StateClass::Measurement)),
-            source: Source::Config,
+            source: Some(Source::Config),
             presence: Presence::Device,
+            gate: None,
         }
     }
 
@@ -374,8 +437,9 @@ impl Entity {
             category: Some(Category::Diagnostic),
             precision: Some(0),
             shape: Shape::Reading(None),
-            source: Source::Config,
+            source: Some(Source::Config),
             presence: Presence::Device,
+            gate: None,
         }
     }
 
@@ -400,8 +464,73 @@ impl Entity {
             category: Some(Category::Config),
             precision: None,
             shape: Shape::Action,
-            source: Source::Config,
+            source: Some(Source::Config),
             presence: Presence::Device,
+            gate: None,
+        }
+    }
+
+    /// The meter reading to supply to the device.
+    ///
+    /// Optimistic, because the device offers no read-back for these registers. The feedback is the
+    /// `meter_active_power` sensor — the device's own report of the reading it currently holds, which
+    /// falls to zero by itself when a reading expires. So Home Assistant shows what it asked for, and the
+    /// sensor beside it shows what the device is acting on; the two disagreeing is exactly the signal that
+    /// something has stopped writing.
+    ///
+    /// **This is not a setting, and writing it once achieves nothing lasting.** A reading expires after
+    /// about two minutes, so whatever drives this has to write it again inside that window, from a figure
+    /// it has actually measured. Nothing in this program refreshes it.
+    ///
+    /// Bounds are wider than the equipment can do anything with, deliberately: the reading describes the
+    /// *house*, not the device, and a household can import far more than a 2 kW inverter can offset.
+    pub fn meter_reading() -> Self {
+        Self {
+            key: METER_READING,
+            name: "Supplied meter reading".to_owned(),
+            component: Component::Number,
+            device_class: Some("power"),
+            unit: Some("W"),
+            category: Some(Category::Config),
+            precision: None,
+            shape: Shape::Numeric(Bounds {
+                min: -20_000,
+                max: 20_000,
+            }),
+            source: None,
+            presence: Presence::Device,
+            // Deliberately ungated. Writing a reading is what *makes* the device hold one, so gating this
+            // on the device already holding one would leave the only way in permanently unavailable.
+            // Whether a reading is in effect is reported by `meter_connected` beside it.
+            gate: None,
+        }
+    }
+
+    /// Withdraw the supplied reading, telling the device its meter has gone.
+    ///
+    /// A button rather than the off half of a switch: there is no meaningful "on" to pair it with, since
+    /// arming without a figure would supply nothing. It writes the all-zero block the firmware itself
+    /// writes for a meter that stopped answering, which drops the reading at once instead of waiting out
+    /// the two-minute expiry.
+    ///
+    /// Distinct from supplying `0`, which is a *valid* reading meaning the grid is balanced — and which
+    /// the device acts on by holding its output where it is.
+    pub fn withdraw_meter_reading() -> Self {
+        Self {
+            key: WITHDRAW_METER_READING,
+            name: "Withdraw meter reading".to_owned(),
+            component: Component::Button,
+            device_class: None,
+            unit: None,
+            category: Some(Category::Config),
+            precision: None,
+            shape: Shape::Action,
+            source: None,
+            presence: Presence::Device,
+            // Nothing to withdraw when the device holds no reading.
+            gate: Some(Gate::ReadingIsSet {
+                reading: METER_CONNECTED,
+            }),
         }
     }
 
@@ -419,8 +548,9 @@ impl Entity {
             category: Some(Category::Diagnostic),
             precision: None,
             shape: Shape::Reading(None),
-            source: Source::Config,
+            source: Some(Source::Config),
             presence: Presence::Device,
+            gate: None,
         }
     }
 
@@ -520,7 +650,7 @@ impl Catalogue {
                 // reads from telemetry, which is fresher by up to an hour. The settings cache learns of a
                 // change made in the vendor app only from the next hourly snapshot.
                 if reported.contains(register.name) {
-                    entity.source = Source::Telemetry;
+                    entity.source = Some(Source::Telemetry);
                 }
                 if self.permitted.allows(register.name) {
                     entity
@@ -542,8 +672,12 @@ impl Catalogue {
             .chain([Entity::connected(), Entity::last_update(), Entity::bridge_version()])
             .chain([Entity::wifi_signal(), Entity::data_interval(), Entity::serial_number()])
             // An action has nothing to publish but a control, so refusing writes withdraws it entirely
-            // rather than downgrading it to a reading the way a setting does.
+            // rather than downgrading it to a reading the way a setting does. The meter controls go the
+            // same way: both are write-only, so read-only versions of them would be entities that can
+            // neither be read nor written.
             .chain(self.permitted.writes.then(Entity::restart))
+            .chain(self.permitted.writes.then(Entity::meter_reading))
+            .chain(self.permitted.writes.then(Entity::withdraw_meter_reading))
             .collect()
     }
 
@@ -646,6 +780,15 @@ fn state_class(device_class: Option<&'static str>) -> StateClass {
 /// documents them as flags words with a bit table each; nothing else in either map is a bitfield.
 fn is_flags(name: &str) -> bool {
     name.ends_with("_faults")
+}
+
+/// Whether a reading is a 0/1 condition rather than a quantity.
+///
+/// Named rather than derived, for the same reason as [`is_flags`]: the register map says a value is a
+/// 16-bit integer, and only this knows that it is really a yes or no. A binary sensor rather than a sensor
+/// reading `0`, so an automation can ask `is_state(..., 'on')`.
+fn is_signal(name: &str) -> bool {
+    name == METER_CONNECTED
 }
 
 /// How many decimals a reading resolves, from the scaling that produced it.
@@ -804,7 +947,7 @@ const NAMED: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{Catalogue, Category, Component, Entity, Shape, Source, StateClass};
+    use super::{Catalogue, Category, Component, Entity, Gate, METER_CONNECTED, Shape, Source, StateClass};
     use crate::growatt::v7::registers::{
         Availability, ConfigRegister, HOLDING_REGISTERS, HoldingRegister, INPUT_REGISTERS, InputRegister, Kind,
     };
@@ -822,7 +965,7 @@ mod tests {
         // is nothing for the device to report and no register to require in the identity report.
         let published: Vec<_> = Catalogue::everything()
             .into_iter()
-            .filter(|entity| entity.source == Source::Config && entity.shape != Shape::Action)
+            .filter(|entity| entity.source == Some(Source::Config) && entity.shape != Shape::Action)
             .collect();
         assert!(
             !published.is_empty(),
@@ -979,7 +1122,11 @@ mod tests {
             assert_eq!(matching.len(), 1, "{key} appears {} times", matching.len());
             let entity = matching.first().expect("just counted");
             assert_eq!(entity.component, Component::Number, "{key} must stay writable");
-            assert_eq!(entity.source, Source::Telemetry, "{key} should read the fresher source");
+            assert_eq!(
+                entity.source,
+                Some(Source::Telemetry),
+                "{key} should read the fresher source"
+            );
         }
     }
 
@@ -1010,10 +1157,10 @@ mod tests {
                 .find(|entity| entity.key == key)
                 .map(|entity| entity.source)
         };
-        assert_eq!(source("always_on"), Some(Source::Settings));
-        assert_eq!(source("slot1_output_power"), Some(Source::Settings));
-        assert_eq!(source("ac_power"), Some(Source::Telemetry));
-        assert_eq!(source("connected"), Some(Source::Status));
+        assert_eq!(source("always_on"), Some(Some(Source::Settings)));
+        assert_eq!(source("slot1_output_power"), Some(Some(Source::Settings)));
+        assert_eq!(source("ac_power"), Some(Some(Source::Telemetry)));
+        assert_eq!(source("connected"), Some(Some(Source::Status)));
     }
 
     #[test]
@@ -1034,8 +1181,9 @@ mod tests {
             let Some(entity) = Entity::for_reading(register) else {
                 continue;
             };
+            // A bitfield and a yes-or-no are both 16-bit integers in the map and neither is a quantity.
             let quantity = matches!(register.kind, Kind::Int | Kind::Float | Kind::Float32)
-                && !matches!(entity.shape, Shape::Flags);
+                && !matches!(entity.shape, Shape::Flags | Shape::Signal { .. });
             match entity.shape {
                 Shape::Reading(state_class) => assert_eq!(
                     state_class.is_some(),
@@ -1044,9 +1192,40 @@ mod tests {
                     entity.key
                 ),
                 Shape::Flags => assert!(!quantity, "{} is a bitfield, not a quantity", entity.key),
-                other => panic!("{} is neither a reading nor a flags word: {other:?}", entity.key),
+                // A yes-or-no is not a quantity either: no unit, no state class, nothing to average.
+                Shape::Signal { .. } => {
+                    assert!(!quantity, "{} is a condition, not a quantity", entity.key);
+                    assert!(entity.unit.is_none(), "{} is a condition and has no unit", entity.key);
+                }
+                other => panic!("{} is not a reading, a flags word or a signal: {other:?}", entity.key),
             }
         }
+    }
+
+    #[test]
+    fn the_way_to_supply_a_reading_is_not_gated_on_a_reading_existing() {
+        // The circularity this prevents: `meter_connected` is 1 only *because* a reading was supplied, so
+        // gating the control that supplies one on it would leave the only way in permanently unavailable.
+        let reading = Entity::meter_reading();
+        assert!(reading.gate.is_none(), "the reading input must stay reachable");
+
+        // Its two companions are gated, because both are meaningless with no reading held.
+        assert_eq!(
+            Entity::withdraw_meter_reading().gate,
+            Some(Gate::ReadingIsSet {
+                reading: METER_CONNECTED
+            })
+        );
+        let active = INPUT_REGISTERS
+            .iter()
+            .find(|entry| entry.name == "meter_active_power")
+            .expect("mapped");
+        assert_eq!(
+            Entity::for_reading(active).expect("an entity").gate,
+            Some(Gate::ReadingIsSet {
+                reading: METER_CONNECTED
+            })
+        );
     }
 
     #[test]

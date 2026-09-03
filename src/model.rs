@@ -235,12 +235,29 @@ impl fmt::Display for Unit {
 /// but wrong values — during the protocol work this mistake read a battery temperature as 289.79 °C
 /// instead of 44.0, and it was caught only because the number was absurd. [`Scaling::apply`] is the
 /// only place this arithmetic happens.
+/// # Two ways of being signed
+///
+/// The register block carries negative quantities in two different encodings, and they are
+/// distinguishable: a value of −131 reads `29869` under the offset encoding — a negative [`Self::delta`] —
+/// and `65405` under two's complement, which is [`RawEncoding`] applied to the raw bits before the
+/// transform above.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct Scaling {
     /// Multiplied first.
     pub multiplier: f64,
     /// Added second. Negative for the offset-encoded signed quantities.
     pub delta: f64,
+    /// How to read the raw 16 bits before multiplying.
+    pub encoding: RawEncoding,
+}
+
+/// How a raw register value's bits map to a number, before any scaling.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum RawEncoding {
+    /// The 16 bits are a magnitude in `0..=65535`.
+    Unsigned,
+    /// The 16 bits are two's complement, so the top bit is a sign: `65405` is −131.
+    TwosComplement,
 }
 
 impl Scaling {
@@ -248,62 +265,86 @@ impl Scaling {
     pub const UNIT: Self = Self {
         multiplier: 1.0,
         delta: 0.0,
+        encoding: RawEncoding::Unsigned,
     };
 
     /// The offset encoding used for signed quantities: 29 950 means −50.
     pub const SIGNED: Self = Self {
         multiplier: 1.0,
         delta: -30_000.0,
+        encoding: RawEncoding::Unsigned,
+    };
+
+    /// Two's complement, unscaled: `65405` means −131.
+    pub const TWOS_COMPLEMENT: Self = Self {
+        multiplier: 1.0,
+        delta: 0.0,
+        encoding: RawEncoding::TwosComplement,
     };
 
     /// Tenths, unsigned.
     pub const TENTHS: Self = Self {
         multiplier: 0.1,
         delta: 0.0,
+        encoding: RawEncoding::Unsigned,
     };
 
     /// Hundredths, unsigned.
     pub const HUNDREDTHS: Self = Self {
         multiplier: 0.01,
         delta: 0.0,
+        encoding: RawEncoding::Unsigned,
     };
 
     /// Thousandths, unsigned.
     pub const THOUSANDTHS: Self = Self {
         multiplier: 0.001,
         delta: 0.0,
+        encoding: RawEncoding::Unsigned,
     };
 
     /// Temperature in tenths of a Kelvin above absolute zero.
     pub const KELVIN_TENTHS: Self = Self {
         multiplier: 0.1,
         delta: -273.1,
+        encoding: RawEncoding::Unsigned,
     };
 
-    /// A scaling with an explicit multiplier and delta.
+    /// A scaling with an explicit multiplier and delta, reading the raw value as unsigned.
     pub const fn new(multiplier: f64, delta: f64) -> Self {
-        Self { multiplier, delta }
+        Self {
+            multiplier,
+            delta,
+            encoding: RawEncoding::Unsigned,
+        }
     }
 
     /// Apply the transform. Multiply, then add.
     ///
-    /// `f64::from` is lossless for `u16`, so no precision is lost before the multiply. `mul_add` is
-    /// the same `raw × multiplier + delta` with a single rounding instead of two.
+    /// `f64::from` is lossless for both `u16` and `i16`, so no precision is lost before the multiply.
+    /// `mul_add` is the same `raw × multiplier + delta` with a single rounding instead of two.
     pub fn apply(self, raw: Raw) -> f64 {
-        f64::from(raw.get()).mul_add(self.multiplier, self.delta)
+        let widened = match self.encoding {
+            RawEncoding::Unsigned => f64::from(raw.get()),
+            RawEncoding::TwosComplement => f64::from(raw.get().cast_signed()),
+        };
+        widened.mul_add(self.multiplier, self.delta)
     }
 
     /// The same, for a raw value that spans two registers.
     ///
     /// Separate from [`Self::apply`] because [`Raw`] is a single register by definition, and widening it
     /// would make every setting in the holding map claim a range it does not have.
+    ///
+    /// Two's complement is not honoured here: no 32-bit quantity in the register map uses it, and a
+    /// 16-bit sign bit means nothing in the middle of a wider value.
     pub fn apply_u32(self, raw: u32) -> f64 {
         f64::from(raw).mul_add(self.multiplier, self.delta)
     }
 
-    /// Whether this scaling encodes a signed quantity via a negative delta.
+    /// Whether this scaling can produce a negative quantity, by either encoding.
     pub fn is_signed(self) -> bool {
-        self.delta < 0.0
+        self.delta < 0.0 || self.encoding == RawEncoding::TwosComplement
     }
 }
 
@@ -416,6 +457,25 @@ mod tests {
         assert!((Scaling::SIGNED.apply(Raw(30_100)) - 100.0).abs() < 1e-9);
         assert!(Scaling::SIGNED.is_signed());
         assert!(!Scaling::UNIT.is_signed());
+    }
+
+    #[test]
+    fn twos_complement_reads_the_sign_bit() {
+        assert!((Scaling::TWOS_COMPLEMENT.apply(Raw(65_405)) - -131.0).abs() < 1e-9);
+        assert!((Scaling::TWOS_COMPLEMENT.apply(Raw(0)) - 0.0).abs() < 1e-9);
+        assert!((Scaling::TWOS_COMPLEMENT.apply(Raw(580)) - 580.0).abs() < 1e-9);
+        assert!(Scaling::TWOS_COMPLEMENT.is_signed());
+    }
+
+    #[test]
+    fn the_two_signed_encodings_disagree_on_the_same_bits() {
+        // Which is why one can be told from the other: a household load of -131 W arrives as 65405, and
+        // reading it under the offset encoding — or as unsigned — gives a number nothing would mistake
+        // for correct.
+        let raw = Raw(65_405);
+        assert!((Scaling::TWOS_COMPLEMENT.apply(raw) - -131.0).abs() < 1e-9);
+        assert!((Scaling::SIGNED.apply(raw) - 35_405.0).abs() < 1e-9);
+        assert!((Scaling::UNIT.apply(raw) - 65_405.0).abs() < 1e-9);
     }
 
     #[test]

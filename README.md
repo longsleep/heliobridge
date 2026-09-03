@@ -36,10 +36,14 @@ The device talks to it, and Home Assistant both shows it and drives it.
   topics — this program's own as a last will, the device's own as a telemetry watchdog — so a reading
   goes `unavailable` instead of flat-lining when the device drops off. Nothing publishes a substitute
   value, which is what keeps the Energy dashboard honest.
-
 - **Accepts commands from Home Assistant**, through the same allowlist and the same read-back as the
   control API, so what appears in Home Assistant afterwards is what the device stored rather than what
   it was asked for.
+- **Supplies the smart meter reading that smart self-use needs**, written straight into the inverter's
+  holding registers. The device's own supported meters reach the same registers by polling a Shelly over
+  the LAN, by Modbus, by a sub-GHz radio, or — for the vendor's documented integration — from the meter
+  manufacturer's cloud by way of Growatt's. Writing the figure directly needs none of that: any source
+  Home Assistant can read becomes usable, and no account anywhere is involved.
 
 Also unimplemented: **retargeting the device's broker endpoint** by writing its config registers,
 which would remove the need for the DNS override below. The protocol for it is understood; it stays
@@ -208,6 +212,8 @@ what the discovery messages tell Home Assistant to send, and what `mosquitto_pub
 {"grid_power_allowed": 1}
 {"slot1_work_mode": "smart_self_use"}
 {"slot1_start_time": "23:59"}
+{"supplied_meter_reading": -250}
+{"withdraw_meter_reading": 1}
 ```
 
 A command goes through the same allowlist and the same read-back as the control API. The value republished
@@ -222,13 +228,57 @@ Both close the entity and the command topic together, so a retained or hand-publ
 a control that was not offered.
 
 For the Energy dashboard: `pv_energy_total` as solar production, `battery_charge_energy_today` and
-`battery_discharge_energy_today` as the battery pair. The grid slots need a house meter — this device has no
-meter between the house and the grid, so it cannot separate self-consumption from what crossed the boundary.
+`battery_discharge_energy_today` as the battery pair. The grid slots need a meter at the boundary, which this
+device does not have: it cannot separate self-consumption from what crossed it. Supplying a reading (below)
+does not change that — whatever measures the boundary is already the better source for those slots.
 
 Several devices may share one broker: every device-facing topic and every `unique_id` carries the serial.
 `HELIOBRIDGE_MQTT_INSTANCE` distinguishes two *bridges* on one broker, and appears in one topic only — this
 program's own availability, where a shared name would make one bridge's shutdown mark another's entities
 unavailable.
+
+## Smart self-use
+
+Work mode 2 regulates the inverter's output from a smart meter's reading of the grid connection. The device
+accepts that reading written into four holding registers, so it needs no meter of its own:
+
+```console
+$ curl --unix-socket /run/heliobridge.sock -X PUT \
+    -H 'content-type: application/json' -d '{"watts": 250}' \
+    "http://local/devices/$SERIAL/meter-reading"
+```
+
+Positive is importing, negative is exporting. `DELETE` on the same path withdraws it. From Home Assistant the
+same two operations are the **Supplied meter reading** number and the **Withdraw meter reading** button.
+
+**The reading is an error signal, not a target.** For each new reading the device adjusts its *own* output by
+approximately that amount:
+
+```text
+new_output ≈ old_output + reading
+```
+
+Supply what a meter at the grid connection would read — `household load − ac_output_power` — and the output
+converges on covering the house and keeps tracking it. Supply a fixed target instead and the output walks in
+one direction until the battery limits it.
+
+**A reading expires after about two minutes, and nothing here refreshes it.** Whatever holds the measurement
+writes it again inside that window; stop writing and the device drops the reading and behaves as though no
+meter were present.
+
+**Two entities report what the device makes of it.** `meter_connected` says whether it currently holds a
+reading at all — the only way to distinguish a genuine 0 W reading, meaning the grid is balanced, from no
+meter, since both read 0 W. `meter_active_power` carries the reading it holds, and goes `unavailable` when it
+holds none rather than reading a misleading zero.
+
+Two behaviours worth expecting. Allow **three minutes** after selecting the mode before the output follows —
+the vendor's own instructions say the same, and the first reading or two are ignored. And while a slot is in
+work mode 2 the device **ignores that slot's `slot{n}_output_power`**; the entity is published `unavailable`
+to say so, because the register still stores and reads back whatever is written to it.
+
+⚠ Write a figure you have measured. The device acts on the reading without checking it against anything it
+measures itself, so a wrong one is obeyed — an import that no load justifies will discharge the battery to
+serve a load that is not there.
 
 ## Control API
 
@@ -236,22 +286,33 @@ HTTP over the Unix socket, so `curl --unix-socket` is the whole client. Errors a
 `application/problem+json`.
 
 ```
-GET  /healthz
-GET  /devices                                  connected devices
-GET  /devices/{device}                         summary: model, firmware, endpoint, clock skew
-GET  /devices/{device}/identity                the datalogger's self-report
-GET  /devices/{device}/telemetry               every decoded input register
-GET  /devices/{device}/telemetry/{key}
-GET  /devices/{device}/settings                cached settings
-GET  /devices/{device}/settings/{key}
-PUT  /devices/{device}/settings/{key}          write, then read back to confirm
-POST /devices/{device}/settings/{key}/read     refresh from the device
-GET  /devices/{device}/config/{key}            datalogger configuration
-POST /devices/{device}/config/{key}/read
-POST /devices/{device}/config/read             ?registers=a,b,c or ?all — streamed
-GET  /devices/{device}/actions
-POST /devices/{device}/actions/{key}           restart the datalogger, clear its log
+GET    /healthz
+GET    /devices                              connected devices
+GET    /devices/{device}                     summary: model, firmware, endpoint, clock skew
+GET    /devices/{device}/identity            the datalogger's self-report
+GET    /devices/{device}/telemetry           every decoded input register
+GET    /devices/{device}/telemetry/{key}
+GET    /devices/{device}/settings            cached settings
+GET    /devices/{device}/settings/{key}
+PUT    /devices/{device}/settings/{key}      write, then read back to confirm
+POST   /devices/{device}/settings/{key}/read refresh from the device
+GET    /devices/{device}/config/{key}        datalogger configuration
+PUT    /devices/{device}/config/{key}        write one config register
+POST   /devices/{device}/config/{key}/read
+POST   /devices/{device}/config/read         ?registers=a,b,c or ?all — streamed
+GET    /devices/{device}/actions
+POST   /devices/{device}/actions/{key}       restart the datalogger
+PUT    /devices/{device}/meter-reading       supply a meter reading: {"watts": <signed>}
+DELETE /devices/{device}/meter-reading       withdraw it
+GET    /meter                                the simulated meter: what it reports, and polls served
+PUT    /meter                                start answering polls: {"watts": <number>}
+POST   /meter                                report a different figure, without starting it
+DELETE /meter                                stop answering polls
 ```
+
+A supplied meter reading expires after about two minutes and nothing here refreshes it, so a caller that
+wants one to persist writes it again inside that window. The device reports what it holds as
+`meter_active_power`, and `meter_connected` says whether it holds one at all.
 
 A `{key}` is a field name or a register number. The config space is 146 registers, 0 to 145; the device
 volunteers 32 of them on connect and answers the rest only when asked.

@@ -10,6 +10,7 @@ pub mod decode;
 pub mod encode;
 pub mod frame;
 pub mod identity;
+pub mod meter;
 pub mod registers;
 
 pub use decode::{Telemetry, Timestamp};

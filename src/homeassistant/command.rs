@@ -21,7 +21,9 @@ use serde_json::Value;
 use snafu::Snafu;
 
 use crate::growatt::v7::encode::{Command, EncodeError, WritableConfig};
+use crate::growatt::v7::meter;
 use crate::growatt::v7::registers::{Domain, HoldingRegister, SLOT_COUNT};
+use crate::homeassistant::entity::{METER_READING, WITHDRAW_METER_READING};
 use crate::model::Register;
 
 /// What a command topic is allowed to change.
@@ -127,6 +129,12 @@ pub struct Change {
     pub command: Command,
     /// How to deliver it.
     pub delivery: Delivery,
+    /// What was asked for, where the answer will not say.
+    ///
+    /// A setting's outcome carries the value the device stored, so nothing needs to be remembered for it.
+    /// A fire-and-forget write has no such answer, and one of them — a supplied meter reading — carries a
+    /// figure that matters: "a reading was sent" is not a record of what the device was told.
+    pub requested: Option<String>,
 }
 
 impl Change {
@@ -155,6 +163,9 @@ impl Change {
     fn one(key: &str, value: &Value, permitted: Permitted) -> Result<Self, CommandError> {
         if let Some(action) = Self::action(key, permitted) {
             return action;
+        }
+        if let Some(reading) = Self::meter_reading(key, value, permitted) {
+            return reading;
         }
 
         let register = HoldingRegister::resync_set(SLOT_COUNT)
@@ -185,7 +196,64 @@ impl Change {
             register: register.register,
             command,
             delivery: Delivery::Confirmed,
+            requested: None,
         })
+    }
+
+    /// The supplied meter reading, if the key names one of its two controls.
+    ///
+    /// Not a setting and not a config action, so it resolves here rather than through either table: the
+    /// registers hold a reading the device consumes, they answer no read-back, and the value expires. What
+    /// arrives is therefore delivered and reported as sent.
+    ///
+    /// Withdrawing is its own key rather than a magic value of the reading, because `0` is a *valid*
+    /// reading — the grid is balanced — and the device acts on it by holding its output. Conflating the two
+    /// would make "my meter has gone" unsayable.
+    fn meter_reading(key: &str, value: &Value, permitted: Permitted) -> Option<Result<Self, CommandError>> {
+        let withdrawing = match key {
+            METER_READING => false,
+            WITHDRAW_METER_READING => true,
+            _ => return None,
+        };
+
+        if !permitted.allows(key) {
+            return Some(Err(CommandError::Refused { key: key.to_owned() }));
+        }
+
+        // A button carries no value worth reading; a reading is a signed number of watts.
+        let watts = if withdrawing {
+            0
+        } else {
+            match value.as_i64().and_then(|watts| i32::try_from(watts).ok()) {
+                Some(watts) => watts,
+                None => {
+                    return Some(Err(CommandError::Shape {
+                        key: key.to_owned(),
+                        expected: "a signed number of watts".to_owned(),
+                        got: rendered(value),
+                    }));
+                }
+            }
+        };
+
+        Some(
+            meter::command(watts, !withdrawing)
+                .map_err(|source| CommandError::Domain {
+                    key: key.to_owned(),
+                    source,
+                })
+                .map(|command| Self {
+                    key: key.to_owned(),
+                    register: meter::FIRST_REGISTER,
+                    command,
+                    delivery: Delivery::FireAndForget,
+                    requested: Some(if withdrawing {
+                        "withdrawn".to_owned()
+                    } else {
+                        format!("{watts} W")
+                    }),
+                }),
+        )
     }
 
     /// The config-space action a key names, if it names one.
@@ -215,6 +283,7 @@ impl Change {
                 value,
             },
             delivery: Delivery::FireAndForget,
+            requested: None,
         }))
     }
 
@@ -284,7 +353,7 @@ fn rendered(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Change, CommandError, POWER_PLUS, Permitted, WritableConfig};
+    use super::{Change, CommandError, Delivery, POWER_PLUS, Permitted, WritableConfig};
     use crate::model::Register;
 
     fn parse(payload: &str) -> Result<Vec<Change>, CommandError> {
@@ -431,7 +500,7 @@ mod tests {
         assert_eq!(change.register.number(), 32);
         // Fire-and-forget: the config space acknowledges nothing, so waiting for a read-back would report a
         // working restart as a failure to confirm.
-        assert_eq!(change.delivery, super::Delivery::FireAndForget);
+        assert_eq!(change.delivery, Delivery::FireAndForget);
     }
 
     #[test]
@@ -461,6 +530,31 @@ mod tests {
     }
 
     #[test]
+    fn a_supplied_reading_carries_its_value_for_the_log() {
+        // These registers answer no read-back, so the log line is the only record of what the device was
+        // told. Without this the log says a reading was sent and not which one.
+        let changes =
+            Change::from_payload(br#"{"supplied_meter_reading": 250}"#, Permitted::default()).expect("accepted");
+        assert_eq!(changes[0].requested.as_deref(), Some("250 W"));
+        assert_eq!(changes[0].delivery, Delivery::FireAndForget);
+
+        let export =
+            Change::from_payload(br#"{"supplied_meter_reading": -400}"#, Permitted::default()).expect("accepted");
+        assert_eq!(export[0].requested.as_deref(), Some("-400 W"));
+
+        let withdraw =
+            Change::from_payload(br#"{"withdraw_meter_reading": 1}"#, Permitted::default()).expect("accepted");
+        assert_eq!(withdraw[0].requested.as_deref(), Some("withdrawn"));
+    }
+
+    #[test]
+    fn a_setting_needs_no_remembered_value_because_the_read_back_carries_it() {
+        let changes = Change::from_payload(br#"{"slot1_output_power": 300}"#, Permitted::default()).expect("accepted");
+        assert_eq!(changes[0].requested, None);
+        assert_eq!(changes[0].delivery, Delivery::Confirmed);
+    }
+
+    #[test]
     fn every_writable_entity_can_be_commanded_by_the_name_it_publishes() {
         // The two halves must agree: an entity Home Assistant can change has to be a name this accepts,
         // or the command silently goes nowhere.
@@ -477,7 +571,14 @@ mod tests {
             let action = WritableConfig::ALL
                 .into_iter()
                 .any(|config| config.is_action() && !config.is_destructive() && config.name() == entity.key);
-            assert!(setting || action, "{} is writable but not commandable", entity.key);
+            // And the supplied meter reading, which is neither: a data channel with no read-back.
+            let reading = entity.key == crate::homeassistant::entity::METER_READING
+                || entity.key == crate::homeassistant::entity::WITHDRAW_METER_READING;
+            assert!(
+                setting || action || reading,
+                "{} is writable but not commandable",
+                entity.key
+            );
         }
     }
 }

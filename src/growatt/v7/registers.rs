@@ -77,6 +77,9 @@ pub enum Kind {
 /// Labels for `work_mode`, input register 8 and slot register `+2`.
 pub const WORK_MODE_LABELS: &[&str] = &["load_first", "battery_first", "smart_self_use"];
 
+/// The `work_mode` value that regulates from a meter reading.
+pub const SMART_SELF_USE: u16 = 2;
+
 /// Labels for `battery_charge_status`, input register 10.
 pub const BATTERY_STATUS_LABELS: &[&str] = &["idle", "charging", "discharging"];
 
@@ -95,6 +98,11 @@ pub struct InputRegister {
     pub scaling: Scaling,
     /// How well the meaning is established.
     pub confidence: Confidence,
+    /// Another reading that must be non-zero for this one to mean anything, where one exists.
+    ///
+    /// For a value whose absence is indistinguishable from a legitimate reading: a meter reporting 0 W and
+    /// no meter at all are both `0` in register 19, and only register 6 separates them.
+    pub gated_by: Option<&'static str>,
 }
 
 impl InputRegister {
@@ -113,6 +121,7 @@ impl InputRegister {
             unit,
             scaling,
             confidence,
+            gated_by: None,
         }
     }
 
@@ -131,6 +140,7 @@ impl InputRegister {
             unit,
             scaling,
             confidence,
+            gated_by: None,
         }
     }
 
@@ -143,6 +153,7 @@ impl InputRegister {
             unit: Unit::None,
             scaling: Scaling::UNIT,
             confidence,
+            gated_by: None,
         }
     }
 
@@ -160,6 +171,7 @@ impl InputRegister {
             unit: Unit::None,
             scaling: Scaling::UNIT,
             confidence,
+            gated_by: None,
         }
     }
 
@@ -172,7 +184,14 @@ impl InputRegister {
             unit: Unit::None,
             scaling: Scaling::UNIT,
             confidence,
+            gated_by: None,
         }
+    }
+
+    /// The same entry, meaningless unless `reading` is non-zero.
+    const fn gated_by(mut self, reading: &'static str) -> Self {
+        self.gated_by = Some(reading);
+        self
     }
 
     /// The absolute frame offset a given register is read from.
@@ -245,22 +264,31 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::int(3, "grid_faults", Observed),
         Entry::int(4, "output_faults", Observed),
         Entry::float(5, "ac_power", Watt, Scaling::SIGNED, Verified),
+        // Whether a smart meter is currently reporting. Rises one telemetry cycle after a reading reaches
+        // the device and clears about 123 s after the last one, which is the reading's lifetime. It is what
+        // separates a genuine reading of 0 W from no meter at all, since register 19 shows 0 for both.
+        Entry::int(6, "meter_connected", Observed),
         Entry::float(7, "pv_power_total", Watt, Scaling::UNIT, Verified),
         Entry::enumerated(8, "work_mode", WORK_MODE_LABELS, Verified),
         Entry::enumerated(10, "battery_charge_status", BATTERY_STATUS_LABELS, Observed),
         Entry::float(11, "battery_charge_power", Watt, Scaling::SIGNED, Verified),
         Entry::int(12, "battery_pack_count", Observed),
         Entry::float(13, "battery_soc_total", Percent, Scaling::UNIT, Verified),
-        // Unsigned, not signed. Measured across 12 426 frames: the raw value ranges 0..442 and equals
-        // |ac_power| within 3 W in every one, reading 0 exactly when AC output is 0 — which the signed
-        // encoding would render as -30 000 W. The names are inherited from another implementation's map and
-        // remain unverified; the scaling no longer is.
-        Entry::float(16, "household_load_total", Watt, Scaling::UNIT, Inferred),
-        Entry::float(17, "household_load_excl_groplug", Watt, Scaling::UNIT, Inferred),
-        // A second signed-power pair, holding a constant 30000 — exactly 0 W — throughout the capture,
-        // and absent from every published map. The shape fits the same accessory story: power that only
-        // a GroPlug would contribute. Carried as unknown rather than named on that resemblance alone.
-        Entry::float(19, "unknown_19", Watt, Scaling::SIGNED, Inferred),
+        // Household draw: the meter reading minus AC power. Two's complement rather than offset-encoded,
+        // and negative whenever the house exports more than the device produces. Register 17 excludes load
+        // measured through interconnected vendor smart plugs; with none attached the two are equal.
+        Entry::float(16, "household_load_total", Watt, Scaling::TWOS_COMPLEMENT, Inferred),
+        Entry::float(
+            17,
+            "household_load_excl_groplug",
+            Watt,
+            Scaling::TWOS_COMPLEMENT,
+            Inferred,
+        ),
+        // A smart meter's own measurement of grid flow, positive on import. Zero whenever no meter is
+        // reporting, whatever the real grid current. Register 20 is adjacent and identically shaped but
+        // stays at zero even with a meter reading present.
+        Entry::float(19, "meter_active_power", Watt, Scaling::SIGNED, Observed).gated_by("meter_connected"),
         Entry::float(20, "unknown_20", Watt, Scaling::SIGNED, Inferred),
         Entry::text(21, "serial_number_part_1", 2, Observed),
         Entry::text(23, "serial_number_part_2", 2, Observed),
@@ -450,6 +478,21 @@ pub struct HoldingRegister {
     pub unit: Unit,
     /// How well the meaning is established.
     pub confidence: Confidence,
+    /// Another setting whose value can make this one ineffective, where one does.
+    pub superseded_by: Option<Supersession>,
+}
+
+/// A setting that overrides another, so that writing the other has no effect.
+///
+/// The device accepts and stores a superseded value, and reads it back unchanged — so a write cannot tell
+/// that it did nothing. Only knowing the pairing can, which is why it is carried here rather than
+/// discovered.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Supersession {
+    /// The setting whose value decides.
+    pub setting: &'static str,
+    /// The raw value of that setting under which the superseded one has no effect.
+    pub when: u16,
 }
 
 impl HoldingRegister {
@@ -468,6 +511,7 @@ impl HoldingRegister {
             domain: Domain::Range { min, max },
             unit,
             confidence,
+            superseded_by: None,
         }
     }
 
@@ -479,6 +523,7 @@ impl HoldingRegister {
             domain: Domain::Flag,
             unit: Unit::None,
             confidence,
+            superseded_by: None,
         }
     }
 
@@ -490,6 +535,7 @@ impl HoldingRegister {
             domain: Domain::TimeOfDay,
             unit: Unit::None,
             confidence,
+            superseded_by: None,
         }
     }
 
@@ -506,7 +552,14 @@ impl HoldingRegister {
             domain: Domain::Enum(labels),
             unit: Unit::None,
             confidence,
+            superseded_by: None,
         }
+    }
+
+    /// The same entry, marked as overridden by another setting.
+    const fn superseded(mut self, by: Supersession) -> Self {
+        self.superseded_by = Some(by);
+        self
     }
 
     /// Look up a holding register, including the schedule slots.
@@ -534,7 +587,15 @@ impl HoldingRegister {
         Some(match field {
             0 | 1 => Self::time(register.number(), name, Confidence::Verified),
             2 => Self::enumerated(register.number(), name, WORK_MODE_LABELS, Confidence::Verified),
-            3 => Self::range(register.number(), name, 0, 1000, Unit::Watt, Confidence::Verified),
+            // Smart self-use regulates from a meter reading and does not read this register. The slot's
+            // own work mode names the setting that decides, so the pairing follows the slot rather than
+            // being fixed to slot 1.
+            3 => Self::range(register.number(), name, 0, 1000, Unit::Watt, Confidence::Verified).superseded(
+                Supersession {
+                    setting: names.get(2)?,
+                    when: SMART_SELF_USE,
+                },
+            ),
             _ => Self::flag(register.number(), name, Confidence::Verified),
         })
     }
@@ -823,7 +884,7 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         // hold factory values and describe no live network, so a client must not use them to reach it.
         Entry::new(14, "static_network_ip", Inert, Vendor),
         Entry::new(16, "mac_address", Identity, Observed),
-        Entry::new(17, "remote_ip", Endpoint, Verified),
+        Entry::new(17, "server_address", Endpoint, Verified),
         Entry::new(18, "remote_port", Endpoint, Verified),
         Entry::new(19, "remote_url", Endpoint, Verified),
         Entry::new(20, "model_id", Metadata, Observed),
@@ -840,7 +901,7 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         Entry::on_request(54, "ble_handshake_key", Identity, Verified),
         // The joined network and its passphrase, both in clear.
         Entry::on_request(56, "wifi_ssid", Identity, Observed),
-        Entry::on_request(57, "wifi_passphrase", Identity, Observed),
+        Entry::on_request(57, "wifi_password", Identity, Observed),
         // The running build's ESP-IDF version.
         Entry::on_request(61, "sdk_version", Metadata, Observed),
         // Selects between DHCP and the static configuration of 14/25/26. "1" disables DHCP and takes the
@@ -916,9 +977,9 @@ mod tests {
         assert_eq!(ac.unit, Unit::Watt);
         assert!(ac.scaling.is_signed());
 
-        // 6 and 9 are gaps in the map, not registers with unknown meaning.
-        assert!(InputRegister::lookup(Register(6)).is_none());
+        // 9 and 14 are gaps in the map, not registers with unknown meaning.
         assert!(InputRegister::lookup(Register(9)).is_none());
+        assert!(InputRegister::lookup(Register(14)).is_none());
     }
 
     #[test]
@@ -1095,7 +1156,7 @@ mod tests {
         // reclassified one would quietly widen what a committed capture may contain.
         for (number, name) in [
             (54, "ble_handshake_key"),
-            (57, "wifi_passphrase"),
+            (57, "wifi_password"),
             (144, "assembled_values"),
         ] {
             let entry = ConfigRegister::lookup(Register(number)).expect(name);
