@@ -3,7 +3,7 @@
 use snafu::{OptionExt, Snafu, ensure};
 
 use crate::growatt::v7::frame::{Frame, MessageType};
-use crate::growatt::v7::registers::{INPUT_REGISTERS, InputRegister, Kind};
+use crate::growatt::v7::registers::{HoldingRegister, INPUT_REGISTERS, InputRegister, Kind};
 use crate::model::{Raw, Reading, Register, Value};
 
 /// Absolute offset of the six-octet timestamp.
@@ -42,6 +42,15 @@ pub enum DecodeError {
         end: usize,
         /// Octets actually available.
         available: usize,
+    },
+
+    /// A snapshot declared a register range that runs backwards.
+    #[snafu(display("snapshot declares registers {start}..{end}, which runs backwards"))]
+    Range {
+        /// First register declared.
+        start: Register,
+        /// Last register declared.
+        end: Register,
     },
 
     /// Text did not decode as ASCII.
@@ -295,6 +304,97 @@ pub trait FromFrame: Sized {
     /// Returns [`DecodeError::WrongMessageType`] if the frame is a different message, or
     /// [`DecodeError::Truncated`] if a fixed-offset field runs past the end of it.
     fn from_frame(frame: &Frame) -> Result<Self, DecodeError>;
+}
+
+/// The hourly settings snapshot: the device's own view of its holding registers.
+///
+/// The device sends this unprompted, about once an hour, and it is the only message that reports the
+/// whole settings space at once. Everything else about settings is read one register at a time, which is
+/// why this matters: a change made in the vendor application, or by anything else holding the device's
+/// credentials, appears here and nowhere else short of a reconnect.
+///
+/// # The frame declares its own range
+///
+/// Two octet pairs before the register block hold the first and last register carried, so the mapping is
+/// read from the frame rather than assumed:
+///
+/// ```text
+/// offset(register n) = 587 + 2 × (n − start)
+/// ```
+///
+/// A register inside that range is **not** necessarily meaningful — the space is a union of per-component
+/// banks with gaps between them — so only registers the holding map names are decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsSnapshot {
+    /// First register the frame carries.
+    pub start: Register,
+    /// Last register the frame carries.
+    pub end: Register,
+    /// Raw values for the registers in range that the holding map names, in register order.
+    pub values: Vec<(Register, Raw)>,
+}
+
+/// Absolute offset of the first register number the snapshot declares.
+pub const SNAPSHOT_START_OFFSET: usize = 583;
+
+/// Absolute offset of the last register number it declares.
+pub const SNAPSHOT_END_OFFSET: usize = 585;
+
+/// Absolute offset of the first register value.
+pub const SNAPSHOT_BLOCK_OFFSET: usize = 587;
+
+impl FromFrame for SettingsSnapshot {
+    fn from_frame(frame: &Frame) -> Result<Self, DecodeError> {
+        let actual = frame.message_type();
+        ensure!(
+            actual == MessageType::SettingsSnapshot,
+            WrongMessageTypeSnafu {
+                expected: MessageType::SettingsSnapshot,
+                actual,
+            }
+        );
+
+        let word = |offset: usize, field| {
+            frame.u16_at(offset).map(Raw::get).context(TruncatedSnafu {
+                field,
+                offset,
+                end: offset.saturating_add(2),
+                available: frame.wire_len(),
+            })
+        };
+        let start = word(SNAPSHOT_START_OFFSET, "snapshot start")?;
+        let end = word(SNAPSHOT_END_OFFSET, "snapshot end")?;
+
+        // A range that runs backwards, or one longer than the frame could hold, is a frame this decoder
+        // does not understand rather than a device fault — report it rather than reading past the end.
+        ensure!(
+            start <= end,
+            RangeSnafu {
+                start: Register(start),
+                end: Register(end),
+            }
+        );
+
+        let mut values = Vec::new();
+        for number in start..=end {
+            if HoldingRegister::lookup(Register(number)).is_none() {
+                continue;
+            }
+            let index = usize::from(number.saturating_sub(start));
+            let offset = SNAPSHOT_BLOCK_OFFSET.saturating_add(index.saturating_mul(2));
+            // A short frame yields the registers it does carry, like telemetry: the device has been seen
+            // declaring a range wider than the block it sent.
+            if let Some(raw) = frame.u16_at(offset) {
+                values.push((Register(number), raw));
+            }
+        }
+
+        Ok(Self {
+            start: Register(start),
+            end: Register(end),
+            values,
+        })
+    }
 }
 
 /// A view over the input-register block of a frame.

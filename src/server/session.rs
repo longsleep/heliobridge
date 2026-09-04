@@ -25,7 +25,7 @@ use crate::control::{
 };
 use crate::growatt::cloud::{CloudRelay, Message as CloudMessage, Relay};
 use crate::growatt::policy::{CloudCommands, Direction, Intent, Originator, Policy};
-use crate::growatt::v7::decode::{FromFrame, ReadResponse, Telemetry, WriteAck};
+use crate::growatt::v7::decode::{FromFrame, ReadResponse, SettingsSnapshot, Telemetry, WriteAck};
 use crate::growatt::v7::encode::{Command, EncodeError};
 use crate::growatt::v7::frame::{Frame, MessageType};
 use crate::growatt::v7::identity::Identity;
@@ -710,7 +710,15 @@ where
                 }
             },
 
-            MessageType::SettingsSnapshot | MessageType::ConfigWrite => {
+            MessageType::SettingsSnapshot => match SettingsSnapshot::from_frame(frame) {
+                Ok(snapshot) => self.accept_snapshot(&snapshot),
+                Err(error) => {
+                    self.stats.rejected = self.stats.rejected.saturating_add(1);
+                    tracing::warn!(%error, "could not decode a settings snapshot");
+                }
+            },
+
+            MessageType::ConfigWrite => {
                 self.stats.undecoded = self.stats.undecoded.saturating_add(1);
                 tracing::info!(
                     %message_type,
@@ -978,6 +986,34 @@ where
         self.publish_settings();
         self.settle(read, response.raw);
         self.start_next_read();
+    }
+
+    /// Take the device's own view of its holding registers from the hourly snapshot.
+    ///
+    /// The only message that reports the whole settings space at once, and so the only way a change made
+    /// outside this program — in the vendor application, or by anything else holding the device's
+    /// credentials — becomes visible without reconnecting and reading every register back.
+    ///
+    /// Read-backs still win where the two disagree in time: this is a snapshot of an hour ago at worst,
+    /// while a read-back is the answer to a question just asked. They are stored the same way because
+    /// both are the device reporting what it holds; the snapshot simply arrives for free.
+    fn accept_snapshot(&mut self, snapshot: &SettingsSnapshot) {
+        let mut changed = 0_usize;
+        for &(register, raw) in &snapshot.values {
+            if self.settings.insert(register, raw) != Some(raw) {
+                changed = changed.saturating_add(1);
+            }
+        }
+        tracing::info!(
+            start = %snapshot.start,
+            end = %snapshot.end,
+            carried = snapshot.values.len(),
+            changed,
+            "settings snapshot"
+        );
+        if changed > 0 {
+            self.publish_settings();
+        }
     }
 
     /// Record what the datalogger says about itself.

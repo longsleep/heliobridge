@@ -21,7 +21,8 @@ The device talks to it, and Home Assistant both shows it and drives it.
 - **Decodes the protocol.** Obfuscated legacy Growatt framing, CRC-16/MODBUS, the input register
   map for telemetry, the holding register map for settings, and the datalogger's own config space.
   Records the device replays from its internal archive after a reconnect are decoded and logged but
-  never treated as current, since they can be over an hour old.
+  never treated as current, since they can be over an hour old. The hourly settings snapshot is taken
+  too, which is how a change made in the vendor app becomes visible without reconnecting.
 - **Serves everything over a control API** on a Unix socket — telemetry, settings, identity,
   datalogger configuration — and accepts writes.
 - **Writes settings with read-back confirmation**, from an allowlist, because the device silently
