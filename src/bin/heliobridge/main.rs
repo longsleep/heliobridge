@@ -294,11 +294,9 @@ impl<'a> Bridge<'a> {
                     "firmware the cloud advertises will be logged and kept{}",
                     if settings.fetch { ", downloading it" } else { " once fetching is enabled" }
                 );
-                FirmwareStore::new(Arc::new(growatt::vendor::Growatt)).keeping(
-                    settings.dir,
-                    settings.fetch,
-                    settings.max_bytes,
-                )
+                FirmwareStore::new(Arc::new(growatt::vendor::Growatt))
+                    .keeping(settings.dir, settings.fetch, settings.max_bytes)
+                    .map_err(|error| format!("firmware directory unusable: {}", chain(&error)))?
             }
             None => FirmwareStore::new(Arc::new(growatt::vendor::Growatt)),
         });

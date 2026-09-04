@@ -108,6 +108,15 @@ pub enum FetchError {
     #[error("timed out after {}s", TRANSFER_TIMEOUT.as_secs())]
     TimedOut,
 
+    /// The directory to keep images in could not be created.
+    #[error("could not create {}", dir.display())]
+    Directory {
+        /// The directory asked for.
+        dir: PathBuf,
+        /// What the filesystem said.
+        source: std::io::Error,
+    },
+
     /// The file could not be written.
     #[error("could not write the download")]
     Io {
@@ -167,10 +176,22 @@ impl<V: Vendor> FirmwareStore<V> {
 
     /// Also keep images under `dir`, refusing any single transfer over `max_bytes`, downloading only if
     /// `fetch`.
-    #[must_use]
-    pub fn keeping(mut self, dir: PathBuf, fetch: bool, max_bytes: u64) -> Self {
+    ///
+    /// The directory is created here, not at the first advertisement — which may be an hour away, on a
+    /// path nobody is watching by then. It also means an operator can see that the setting took effect
+    /// without waiting for a campaign.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Directory`] if the directory cannot be created. Later write failures are reported per
+    /// transfer instead; this is the one that means nothing would ever be kept.
+    pub fn keeping(mut self, dir: PathBuf, fetch: bool, max_bytes: u64) -> Result<Self, FetchError> {
+        std::fs::create_dir_all(&dir).map_err(|source| FetchError::Directory {
+            dir: dir.clone(),
+            source,
+        })?;
         self.keep = Some(Keep { dir, fetch, max_bytes });
-        self
+        Ok(self)
     }
 
     /// Whether this store downloads, as opposed to logging and keeping nothing.
@@ -393,7 +414,9 @@ mod tests {
     }
 
     fn store(dir: &std::path::Path, fetch: bool, max_bytes: u64) -> FirmwareStore<Fake> {
-        FirmwareStore::new(Arc::new(Fake { agent: "esp-07s" })).keeping(dir.to_path_buf(), fetch, max_bytes)
+        FirmwareStore::new(Arc::new(Fake { agent: "esp-07s" }))
+            .keeping(dir.to_path_buf(), fetch, max_bytes)
+            .expect("a temporary directory can be created")
     }
 
     /// A one-shot HTTP server: answers once, and hands back the request head it saw.
@@ -555,8 +578,34 @@ mod tests {
     }
 
     #[test]
+    fn the_directory_exists_as_soon_as_keeping_is_switched_on() {
+        // Not at the first advertisement: a campaign arrives about once an hour, and an operator who
+        // enabled the setting should see the directory now rather than then.
+        let dir = tempdir("created-eagerly").join("nested");
+        let kept = store(&dir, true, 1024);
+        assert!(dir.is_dir(), "{} was not created", dir.display());
+        assert_eq!(kept.dir(), Some(dir.as_path()));
+        // Switching it on again over an existing directory is not an error.
+        assert_eq!(store(&dir, true, 1024).dir(), Some(dir.as_path()));
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_created_is_refused() {
+        // A file where the directory should be: the failure an operator most plausibly arranges, and one
+        // worth a startup message rather than silence.
+        let dir = tempdir("occupied");
+        std::fs::create_dir_all(dir.parent().expect("a parent")).expect("the parent exists");
+        std::fs::write(&dir, b"in the way").expect("the file is written");
+        let error = FirmwareStore::new(Arc::new(Fake { agent: "esp-07s" }))
+            .keeping(dir.clone(), true, 1024)
+            .expect_err("refused");
+        assert!(matches!(error, FetchError::Directory { .. }), "{error}");
+        std::fs::remove_file(&dir).ok();
+    }
+
+    #[test]
     fn a_store_that_does_not_fetch_says_so() {
-        assert!(!store(std::path::Path::new("/nonexistent"), false, 1024).fetches());
+        assert!(!store(&tempdir("no-fetch"), false, 1024).fetches());
         // A store with nowhere to keep anything still notices advertisements; that is the default.
         let logging_only = FirmwareStore::new(Arc::new(Fake { agent: "esp-07s" }));
         assert!(!logging_only.fetches());
