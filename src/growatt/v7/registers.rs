@@ -371,11 +371,11 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         // register 5. Register 5 reports whichever output is live; this one only the grid.
         Entry::float(116, "on_grid_power", Watt, Scaling::new(0.1, -3000.0), Verified),
         Entry::float(117, "unknown_117", NoUnit, Scaling::SIGNED, Inferred),
-        // Two registers reading 0x0E0C and 0x0E0B, i.e. plain integers rather than the ASCII a
-        // version string would be. A pair of component version numbers is the best available
-        // reading, and is unconfirmed.
-        Entry::int(119, "sw_version_part_1", Inferred),
-        Entry::int(120, "sw_version_part_2", Inferred),
+        // Four component versions in two registers, one per octet. Together with the datalogger's own
+        // version they make the six-field string the vendor identifies a release by; see
+        // `super::version`. Not published as entities in their own right — the assembled version is.
+        Entry::int(119, "inverter_mppt_version", Verified),
+        Entry::int(120, "pd_bms_version", Verified),
     ]
 };
 

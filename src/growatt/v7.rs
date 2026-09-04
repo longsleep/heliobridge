@@ -12,8 +12,10 @@ pub mod frame;
 pub mod identity;
 pub mod meter;
 pub mod registers;
+pub mod version;
 
 pub use decode::{Telemetry, Timestamp};
 pub use encode::{Command, EncodeError, SlotConfig, SlotField, WritableRegister};
 pub use frame::{Frame, FrameError, MessageType};
 pub use identity::Identity;
+pub use version::FirmwareVersion;

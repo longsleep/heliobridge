@@ -155,6 +155,16 @@ pub enum Gate {
     },
 }
 
+/// The assembled six-field firmware version.
+pub const FIRMWARE_VERSION: &str = "firmware_version";
+
+/// The two readings that carry the component versions, published as one assembled string instead.
+///
+/// Each holds two components in its octets, so on their own they are a number nobody can read: 3596 means
+/// "inverter 14, MPPT 12". Publishing them would put two undecodable diagnostics on the page beside the
+/// version they compose.
+const VERSION_PARTS: [&str; 2] = ["inverter_mppt_version", "pd_bms_version"];
+
 /// When the last telemetry frame arrived, which does not exist until one has.
 pub const LAST_UPDATE: &str = "last_update";
 
@@ -289,6 +299,10 @@ impl Entity {
     /// noise on a dashboard, and it stays available through the control API for investigation.
     pub fn for_reading(register: &InputRegister) -> Option<Self> {
         if register.name.starts_with("unknown_") {
+            return None;
+        }
+        // Published as the assembled version instead.
+        if VERSION_PARTS.contains(&register.name) {
             return None;
         }
         // Text registers are the serial, split across four of them. The device already carries its serial
@@ -537,6 +551,30 @@ impl Entity {
         }
     }
 
+    /// The product's full firmware version, one field per component.
+    ///
+    /// Assembled rather than reported: four fields come from two telemetry registers, the CT field is a
+    /// constant, and the datalogger's own version comes from the config space. The vendor's application
+    /// shows this string and its update service keys downloads on it, so it is the version an owner will
+    /// be asked for — where the datalogger version alone answers a different question.
+    ///
+    /// Its own topic, because it needs a telemetry frame to exist at all.
+    pub fn firmware_version() -> Self {
+        Self {
+            key: FIRMWARE_VERSION,
+            name: "Firmware version".to_owned(),
+            component: Component::Sensor,
+            device_class: None,
+            unit: None,
+            category: Some(Category::Diagnostic),
+            precision: None,
+            shape: Shape::Reading(None),
+            source: Some(Source::Status),
+            presence: Presence::Device,
+            gate: None,
+        }
+    }
+
     /// The serial the device identifies itself by.
     ///
     /// Already the device page's `serial_number`, and repeated as an entity because that field cannot be
@@ -601,7 +639,7 @@ impl Entity {
     ///   a resync takes;
     /// - [`LAST_UPDATE`], which does not exist until a frame has arrived.
     pub fn published_alone(&self) -> bool {
-        matches!(self.shape, Shape::TimeOfDay) || self.key == LAST_UPDATE
+        matches!(self.shape, Shape::TimeOfDay) || self.key == LAST_UPDATE || self.key == FIRMWARE_VERSION
     }
 
     /// Whether this entity accepts commands.
@@ -667,8 +705,8 @@ impl Catalogue {
                 // The charge limits are the two fields that exist in both address spaces: a writable
                 // holding register, and an input register carried in every telemetry frame. One entity,
                 // then — a duplicate key is an entity Home Assistant drops without saying so — and it
-                // reads from telemetry, which is fresher by up to an hour. The settings cache learns of a
-                // change made in the vendor app only from the next hourly snapshot.
+                // reads from telemetry, which is fresher by up to an hour: the settings cache learns of a
+                // change made in the vendor app from the hourly snapshot, and from nothing sooner.
                 if reported.contains(register.name) {
                     entity.source = Some(Source::Telemetry);
                 }
@@ -691,6 +729,7 @@ impl Catalogue {
             .chain(settings)
             .chain([Entity::connected(), Entity::last_update(), Entity::bridge_version()])
             .chain([Entity::wifi_signal(), Entity::data_interval(), Entity::serial_number()])
+            .chain([Entity::firmware_version()])
             // An action has nothing to publish but a control, so refusing writes withdraws it entirely
             // rather than downgrading it to a reading the way a setting does. The meter controls go the
             // same way: both are write-only, so read-only versions of them would be entities that can
@@ -716,10 +755,15 @@ impl Catalogue {
     /// costs one empty retained publish per session on a topic that is already empty; the alternative is a
     /// stale entity on someone's dashboard that only a hand-run `mosquitto_pub` can remove.
     ///
-    /// Empty, and correctly so: no released version of this program has ever announced an entity that a
-    /// later one withdrew. An entity that existed only between two commits needs no entry — nobody's broker
-    /// ever held it. The list is for entities that reached a release.
-    pub const RETIRED: &'static [(Component, &'static str)] = &[];
+    /// An entity that existed only between two commits needs no entry — nobody's broker ever held it. The
+    /// list is for entities that reached a release.
+    pub const RETIRED: &'static [(Component, &'static str)] = &[
+        // Input registers 119 and 120 were published as two raw integers while their meaning was unknown.
+        // They hold four component versions, one per octet, and are published as the assembled
+        // `firmware_version` instead — a dashboard reading of `3596` meant nothing to anyone.
+        (Component::Sensor, "sw_version_part_1"),
+        (Component::Sensor, "sw_version_part_2"),
+    ];
 
     /// Every entity any configuration of this device could produce.
     ///
@@ -967,7 +1011,9 @@ const NAMED: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{Catalogue, Category, Component, Entity, Gate, METER_CONNECTED, Shape, Source, StateClass};
+    use super::{
+        Catalogue, Category, Component, Entity, Gate, METER_CONNECTED, Shape, Source, StateClass, VERSION_PARTS,
+    };
     use crate::growatt::v7::registers::{
         Availability, ConfigRegister, HOLDING_REGISTERS, HoldingRegister, INPUT_REGISTERS, InputRegister, Kind,
     };
@@ -1135,7 +1181,7 @@ mod tests {
         // The charge limits are a writable holding register *and* an input register in every frame. Two
         // entities would share a unique_id, which Home Assistant resolves by dropping one without saying
         // so — and the telemetry copy is the fresher source, since the settings cache learns of a change
-        // made elsewhere only from the next hourly snapshot.
+        // made elsewhere only when the next hourly snapshot arrives.
         let entities = Catalogue::default().entities();
         for key in ["charge_limit_upper", "charge_limit_lower"] {
             let matching: Vec<&Entity> = entities.iter().filter(|entity| entity.key == key).collect();
@@ -1365,13 +1411,28 @@ mod tests {
 
     #[test]
     fn every_named_reading_becomes_a_sensor() {
+        // Except the three kinds that are deliberately withheld: an unnamed register nobody can read, the
+        // serial split across four text registers, and the version parts published as one assembled
+        // string. Each exclusion is a decision, so the count states them rather than tolerating a
+        // shortfall.
         let published = INPUT_REGISTERS.iter().filter_map(Entity::for_reading).count();
         let named = INPUT_REGISTERS
             .iter()
             .filter(|entry| !entry.name.starts_with("unknown_") && !matches!(entry.kind, Kind::Text { .. }))
             .count();
-        assert_eq!(published, named);
+        assert_eq!(published, named - VERSION_PARTS.len());
         assert!(named > 30, "only {named} named registers");
+
+        for part in VERSION_PARTS {
+            let entry = INPUT_REGISTERS
+                .iter()
+                .find(|entry| entry.name == part)
+                .expect("a version part is a named register");
+            assert!(
+                Entity::for_reading(entry).is_none(),
+                "{part} carries two components in its octets and means nothing published alone"
+            );
+        }
     }
 
     #[test]

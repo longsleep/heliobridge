@@ -18,7 +18,7 @@ use serde_json::{Map, Number, Value, json};
 use crate::control::{ConfigView, SettingView, TelemetryView};
 use crate::homeassistant::broker::Publication;
 use crate::homeassistant::entity::Entity;
-use crate::homeassistant::entity::LAST_UPDATE;
+use crate::homeassistant::entity::{FIRMWARE_VERSION, LAST_UPDATE};
 use crate::homeassistant::topics::{OFFLINE, ONLINE};
 
 /// Which fields a device publishes.
@@ -88,6 +88,13 @@ impl StatePayload {
         // A constant for the life of the process, so it rides along with the topic that is published
         // whenever this bridge's view of the device changes rather than needing one of its own.
         object.insert("bridge_version".to_owned(), json!(crate::VERSION));
+        Self(object)
+    }
+
+    /// The assembled firmware version, for the sub-topic that carries it alone.
+    pub fn firmware_version(version: &str) -> Self {
+        let mut object = Map::new();
+        object.insert(FIRMWARE_VERSION.to_owned(), json!(version));
         Self(object)
     }
 

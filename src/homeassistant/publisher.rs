@@ -25,12 +25,14 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::control::{Action as ControlAction, Connected, Registry, SessionHandle, TelemetryView};
+use crate::growatt::v7::version::FirmwareVersion;
 use crate::homeassistant::broker::{Broker, BrokerConfig, BrokerError, Event, Publication, Publications};
 use crate::homeassistant::command::{Change, Delivery, Permitted};
 use crate::homeassistant::discovery::{DeviceBlock, Discovery};
-use crate::homeassistant::entity::{Catalogue, Component, Entity, Gate, LAST_UPDATE, Source};
+use crate::homeassistant::entity::{Catalogue, Component, Entity, FIRMWARE_VERSION, Gate, LAST_UPDATE, Source};
 use crate::homeassistant::state::{Fields, StatePayload};
 use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
+use crate::model::Raw;
 
 /// How long without a telemetry frame before the device is reported absent.
 ///
@@ -663,6 +665,38 @@ impl Link {
             let topic = self.topics.field(Source::Status, &self.device, LAST_UPDATE);
             self.publish(StatePayload::last_update(&stamp).retained(topic));
         }
+
+        if let Some(version) = self.firmware_version() {
+            let topic = self.topics.field(Source::Status, &self.device, FIRMWARE_VERSION);
+            self.publish(StatePayload::firmware_version(&version).retained(topic));
+        }
+    }
+
+    /// The device's full firmware version, once both halves of it have arrived.
+    ///
+    /// Four of its six fields are the octets of two telemetry registers and one comes from the identity
+    /// report, so this is the only value that needs both — which is why it is assembled here rather than
+    /// decoded in either. `None` until a frame and a report have each been seen, which is why it goes on a
+    /// topic of its own.
+    fn firmware_version(&self) -> Option<String> {
+        let datalogger = self
+            .session
+            .identity
+            .borrow()
+            .as_ref()?
+            .entries
+            .iter()
+            .find(|entry| entry.name == Some("sw_version"))
+            .map(|entry| entry.value.clone())?;
+
+        // Read off the borrow rather than binding it, so the guard lives for the statement and no longer.
+        let (inverter_mppt, pd_bms) = self.session.telemetry.borrow().as_ref().and_then(|view| {
+            Some((
+                Raw(reading(view, "inverter_mppt_version")?),
+                Raw(reading(view, "pd_bms_version")?),
+            ))
+        })?;
+        Some(FirmwareVersion::assemble(inverter_mppt, pd_bms, &datalogger)?.to_string())
     }
 
     /// Publish the datalogger configuration worth showing.
