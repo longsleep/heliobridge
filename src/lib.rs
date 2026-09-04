@@ -30,13 +30,13 @@
 
 pub mod config;
 pub mod control;
+pub mod driver;
 pub mod growatt;
 pub mod homeassistant;
 pub mod model;
 pub mod mqtt;
 pub mod record;
 pub mod server;
-pub mod vendor;
 
 /// The crate version, as published.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

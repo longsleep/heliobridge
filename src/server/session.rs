@@ -23,6 +23,7 @@ use crate::control::{
     Action as ControlAction, ConfigView, IdentityView, Outcome, QUEUE_DEPTH as CONTROL_QUEUE_DEPTH, ReadingView,
     Registration, Registry, Request as ControlRequest, SessionHandle, SettingView, StatusView, TelemetryView,
 };
+use crate::driver::Driver;
 use crate::growatt::cloud::{CloudRelay, Message as CloudMessage, Relay};
 use crate::growatt::policy::{CloudCommands, Direction, Intent, Originator, Policy};
 use crate::growatt::product::Product;
@@ -38,7 +39,6 @@ use crate::record::{Recorder, Stream as RecordStream};
 use crate::server::access::Devices;
 use crate::server::clock::{Clock, Skew};
 use crate::server::firmware::FirmwareStore;
-use crate::vendor::Vendor;
 use crate::{TARGET_VALUES, TARGET_WIRE};
 
 /// Keepalive the device asks for: seven minutes.
@@ -147,7 +147,7 @@ pub struct SessionStats {
 /// Generic over the stream so the whole state machine can be driven over an in-memory duplex in
 /// tests, with no TLS, no sockets and no device.
 #[derive(Debug)]
-pub struct Session<S, V: Vendor> {
+pub struct Session<S, D: Driver> {
     stream: PacketStream<S>,
     device_id: Option<String>,
     subscribed: bool,
@@ -170,7 +170,7 @@ pub struct Session<S, V: Vendor> {
     /// caution about telemetry labels is said once rather than per report.
     product: Product,
     recorder: Option<Recorder>,
-    firmware: Option<FirmwareStore<V>>,
+    firmware: Option<FirmwareStore<D>>,
     slots: u16,
     /// Registers waiting to be read, each knowing why.
     ///
@@ -254,10 +254,10 @@ enum ReadPurpose {
     },
 }
 
-impl<S, V> Session<S, V>
+impl<S, D> Session<S, D>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    V: Vendor,
+    D: Driver,
 {
     /// Wrap a connected stream, using the host's local clock for the time push.
     pub fn new(stream: S) -> Self {
@@ -328,7 +328,7 @@ where
 
     /// Keep firmware the cloud advertises, or only log that it was advertised.
     #[must_use]
-    pub fn with_firmware(mut self, firmware: Option<FirmwareStore<V>>) -> Self {
+    pub fn with_firmware(mut self, firmware: Option<FirmwareStore<D>>) -> Self {
         self.firmware = firmware;
         self
     }
@@ -1697,8 +1697,8 @@ mod tests {
         CONNACK_NOT_AUTHORISED, Clock, Devices, Frame, GRANTED_QOS, MessageType, Raw, Session, TIME_PUSH_DELAY,
         Timestamp,
     };
+    use crate::driver::Unknown;
     use crate::mqtt::{Connect, Packet, Publish, QoS, Subscribe};
-    use crate::vendor::Unknown;
 
     const SERIAL: &str = "0EXAMPLE00000001";
 

@@ -7,8 +7,8 @@
 //!
 //! What the advertisement *says* — which register carries one, the value's prefix, the path layout, the
 //! identity the device presents when it fetches — reaches this module only through
-//! [`Vendor`](crate::vendor::Vendor). Nothing here names a register, a message format or a vendor, so a
-//! second vendor's campaign would need no change on this side.
+//! [`Firmware`](crate::driver::Firmware). Nothing here names a register, a message format or a
+//! manufacturer, so a second driver's campaign would need no change on this side.
 //!
 //! # An advertisement only exists while the cloud relay does
 //!
@@ -47,7 +47,7 @@ use hyper_util::rt::TokioExecutor;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use crate::vendor::{AdvertisedFirmware, Vendor};
+use crate::driver::{AdvertisedFirmware, Firmware};
 
 /// How long a transfer may take, connection included.
 const TRANSFER_TIMEOUT: Duration = Duration::from_mins(2);
@@ -144,17 +144,17 @@ pub struct Stored {
 /// is optional, and downloading is a further opt-in inside that: an advertisement is observed traffic,
 /// whereas fetching reaches out to a vendor host.
 #[derive(Debug)]
-pub struct FirmwareStore<V: Vendor> {
-    vendor: std::sync::Arc<V>,
+pub struct FirmwareStore<D: Firmware> {
+    driver: std::sync::Arc<D>,
     keep: Option<Keep>,
 }
 
 // Derived `Clone` would demand `V: Clone`, which a vendor has no reason to be: the handle is an `Arc`, and
 // cloning it is what a spawned transfer needs.
-impl<V: Vendor> Clone for FirmwareStore<V> {
+impl<D: Firmware> Clone for FirmwareStore<D> {
     fn clone(&self) -> Self {
         Self {
-            vendor: std::sync::Arc::clone(&self.vendor),
+            driver: std::sync::Arc::clone(&self.driver),
             keep: self.keep.clone(),
         }
     }
@@ -168,10 +168,10 @@ struct Keep {
     max_bytes: u64,
 }
 
-impl<V: Vendor> FirmwareStore<V> {
+impl<D: Firmware> FirmwareStore<D> {
     /// Read advertisements the way `vendor` says, and only log them.
-    pub fn new(vendor: std::sync::Arc<V>) -> Self {
-        Self { vendor, keep: None }
+    pub fn new(driver: std::sync::Arc<D>) -> Self {
+        Self { driver, keep: None }
     }
 
     /// Also keep images under `dir`, refusing any single transfer over `max_bytes`, downloading only if
@@ -214,9 +214,9 @@ impl<V: Vendor> FirmwareStore<V> {
         // Parsed and interpreted by the vendor, in that order: what comes back between the two calls is
         // the vendor's own typed value, and this module neither constructs nor inspects it.
         let Some(firmware) = self
-            .vendor
+            .driver
             .parse(payload)
-            .and_then(|message| self.vendor.advertised_firmware(&message))
+            .and_then(|frame| self.driver.advertised(&frame))
         else {
             return false;
         };
@@ -295,7 +295,7 @@ impl<V: Vendor> FirmwareStore<V> {
         // reuse. The request itself comes from `growatt::firmware`, headers and all, so nothing here can
         // add a header the device would not send -- which a higher-level client would do on its own.
         let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
-        let request = self.vendor.firmware_request(firmware).body(Empty::new())?;
+        let request = self.driver.request(firmware).body(Empty::new())?;
         let response = match tokio::time::timeout(TRANSFER_TIMEOUT, client.request(request)).await {
             Ok(result) => result?,
             Err(_) => return Err(FetchError::TimedOut),
@@ -373,7 +373,7 @@ impl<V: Vendor> FirmwareStore<V> {
 #[cfg(test)]
 mod tests {
     use super::{FetchError, FirmwareStore};
-    use crate::vendor::{AdvertisedFirmware, Vendor};
+    use crate::driver::{AdvertisedFirmware, Firmware, Wire};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -383,29 +383,31 @@ mod tests {
     ///
     /// Deliberately not Growatt's: these tests are about downloading and storing, and using the real
     /// implementation would tie them to a register number and a URL layout that have nothing to do with
-    /// what is being checked. That the seam permits this *is* the point of the seam — and its `Message`
+    /// what is being checked. That the seam permits this *is* the point of the seam — and its `Frame`
     /// being a borrowed `&str` shows the associated type earning its keep.
     #[derive(Debug)]
     struct Fake {
         agent: &'static str,
     }
 
-    impl Vendor for Fake {
-        type Message<'a> = &'a str;
+    impl Wire for Fake {
+        type Frame<'a> = &'a str;
 
-        fn parse<'a>(&self, payload: &'a [u8]) -> Option<Self::Message<'a>> {
+        fn parse<'a>(&self, payload: &'a [u8]) -> Option<Self::Frame<'a>> {
             std::str::from_utf8(payload).ok()
         }
+    }
 
-        fn advertised_firmware(&self, message: &Self::Message<'_>) -> Option<AdvertisedFirmware> {
+    impl Firmware for Fake {
+        fn advertised(&self, frame: &Self::Frame<'_>) -> Option<AdvertisedFirmware> {
             Some(AdvertisedFirmware {
-                url: Url::parse(message).ok()?,
+                url: Url::parse(frame).ok()?,
                 file: "WIFI-4.0.2.6.bin".to_owned(),
                 source: "the test".to_owned(),
             })
         }
 
-        fn firmware_request(&self, firmware: &AdvertisedFirmware) -> http::request::Builder {
+        fn request(&self, firmware: &AdvertisedFirmware) -> http::request::Builder {
             http::Request::builder()
                 .uri(firmware.url.as_str())
                 .header(http::header::USER_AGENT, self.agent)

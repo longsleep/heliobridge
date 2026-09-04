@@ -41,12 +41,12 @@
 //! real, observed requirement.
 
 pub mod cloud;
+pub mod driver;
 pub mod firmware;
 pub mod header;
 pub mod policy;
 pub mod product;
 pub mod v7;
-pub mod vendor;
 
 use core::fmt;
 

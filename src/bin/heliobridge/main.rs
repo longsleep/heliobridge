@@ -294,11 +294,11 @@ impl<'a> Bridge<'a> {
                     "firmware the cloud advertises will be logged and kept{}",
                     if settings.fetch { ", downloading it" } else { " once fetching is enabled" }
                 );
-                FirmwareStore::new(Arc::new(growatt::vendor::Growatt))
+                FirmwareStore::new(Arc::new(growatt::driver::Growatt))
                     .keeping(settings.dir, settings.fetch, settings.max_bytes)
                     .map_err(|error| format!("firmware directory unusable: {}", chain(&error)))?
             }
-            None => FirmwareStore::new(Arc::new(growatt::vendor::Growatt)),
+            None => FirmwareStore::new(Arc::new(growatt::driver::Growatt)),
         });
         let options = server::SessionOptions {
             time_push: self.config.should_push_time(),

@@ -21,6 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
 use crate::control::Registry;
+use crate::driver::Driver;
 use crate::growatt::cloud::CloudRelay;
 use crate::growatt::policy::Policy;
 use crate::record::Recorder;
@@ -28,7 +29,6 @@ use crate::server::access::{Devices, Peers};
 use crate::server::firmware::FirmwareStore;
 use crate::server::probe;
 use crate::server::session::Session;
-use crate::vendor::Vendor;
 
 /// Why the listener stopped.
 #[derive(Debug, Snafu)]
@@ -49,7 +49,7 @@ pub enum ListenerError {
 /// Not comparable: it carries a [`Recorder`] handle, and two handles to the same recorder are the same
 /// recorder in every sense that matters, which is not a thing equality can usefully express.
 #[derive(Debug)]
-pub struct SessionOptions<V: Vendor> {
+pub struct SessionOptions<D: Driver> {
     /// Whether to push the server's wall-clock time after the device connects.
     ///
     /// Off only when the cloud's own configuration write is being relayed through, since two parties
@@ -67,7 +67,7 @@ pub struct SessionOptions<V: Vendor> {
     pub recorder: Option<Recorder>,
 
     /// Where firmware the cloud advertises is kept, and whether to go and get it.
-    pub firmware: Option<FirmwareStore<V>>,
+    pub firmware: Option<FirmwareStore<D>>,
 
     /// How many schedule slots to read back at startup.
     pub slots: u16,
@@ -81,7 +81,7 @@ pub struct SessionOptions<V: Vendor> {
 
 // Derived `Clone` would demand `V: Clone`, which a vendor has no reason to be: what is cloned per
 // connection is a handle to it.
-impl<V: Vendor> Clone for SessionOptions<V> {
+impl<D: Driver> Clone for SessionOptions<D> {
     fn clone(&self) -> Self {
         Self {
             time_push: self.time_push,
@@ -96,7 +96,7 @@ impl<V: Vendor> Clone for SessionOptions<V> {
     }
 }
 
-impl<V: Vendor> Default for SessionOptions<V> {
+impl<D: Driver> Default for SessionOptions<D> {
     fn default() -> Self {
         Self {
             time_push: true,
@@ -117,10 +117,10 @@ impl<V: Vendor> Default for SessionOptions<V> {
 ///
 /// [`ListenerError::Bind`] if the address is unavailable. Per-connection failures are logged and do not
 /// stop the listener.
-pub async fn serve<V: Vendor>(
+pub async fn serve<D: Driver>(
     address: std::net::SocketAddr,
     tls: Arc<ServerConfig>,
-    options: SessionOptions<V>,
+    options: SessionOptions<D>,
     peers: Peers,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), ListenerError> {
@@ -188,11 +188,11 @@ pub async fn serve<V: Vendor>(
 
 /// Complete the TLS handshake and run one session.
 #[tracing::instrument(skip(stream, acceptor, options), fields(%peer))]
-async fn handle<V: Vendor>(
+async fn handle<D: Driver>(
     stream: TcpStream,
     peer: std::net::SocketAddr,
     acceptor: TlsAcceptor,
-    options: SessionOptions<V>,
+    options: SessionOptions<D>,
 ) {
     // Nagle off: the device waits for small acknowledgements, and delaying a PUBACK to coalesce it with
     // nothing costs latency for no benefit.
@@ -279,10 +279,10 @@ fn flatten(error: &dyn std::error::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Devices, Peers, SessionOptions};
+    use crate::driver::Unknown;
     use crate::growatt::cloud::{CloudConfig, CloudRelay};
     use crate::growatt::policy::Policy;
     use crate::mqtt::Trust;
-    use crate::vendor::Unknown;
 
     #[test]
     fn defaults_relay_nothing_record_nothing_and_push_time() {

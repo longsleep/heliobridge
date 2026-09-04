@@ -1,15 +1,15 @@
 //! How Growatt advertises firmware, and what its own device looks like when it fetches.
 //!
-//! Knowledge only: no I/O, no downloading, no logging. [`super::vendor::Growatt`] wires this into the
+//! Knowledge only: no I/O, no downloading, no logging. [`super::driver::Growatt`] wires this into the
 //! server's seam; acting on an advertisement — deciding whether to download, and keeping what arrives — is
 //! [`crate::server::firmware`]'s business.
 
 use url::Url;
 
+use crate::driver::AdvertisedFirmware;
 use crate::growatt::v7::decode::{ConfigWrite, FromFrame};
 use crate::growatt::v7::frame::Frame;
 use crate::model::Register;
-use crate::vendor::AdvertisedFirmware;
 
 /// The configuration register the cloud writes to advertise an update.
 pub const UPDATE_URL_REGISTER: Register = Register(80);
