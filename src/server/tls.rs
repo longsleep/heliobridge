@@ -22,12 +22,6 @@ use snafu::{ResultExt, Snafu};
 
 use crate::mqtt::ClientIdentity;
 
-/// Subject common name of a generated certificate.
-pub const GENERATED_CN: &str = "*.growatt.com";
-
-/// Subject alternative names of a generated certificate.
-pub const GENERATED_SANS: [&str; 2] = ["*.growatt.com", "mqtt.growatt.com"];
-
 /// File name of the generated certificate inside the state directory.
 pub const CERT_FILE: &str = "device-facing.crt";
 
@@ -110,6 +104,10 @@ impl core::fmt::Display for CertificateOrigin {
 ///
 /// Resolution order: supplied paths, then the state directory, then generate and persist.
 ///
+/// `names` are what a generated certificate must carry, common name first — the names the device expects
+/// to be talking to, which only a driver knows. They are unused when a certificate is supplied or cached,
+/// because then the answer is already on disk.
+///
 /// # Errors
 ///
 /// [`TlsError`] naming the file or step that failed.
@@ -117,6 +115,7 @@ pub fn server_config(
     cert_path: Option<&Path>,
     key_path: Option<&Path>,
     state_dir: &Path,
+    names: &[&str],
 ) -> Result<(Arc<ServerConfig>, CertificateOrigin), TlsError> {
     let (chain, key, origin) = if let (Some(cert), Some(key)) = (cert_path, key_path) {
         (load_certificates(cert)?, load_key(key)?, CertificateOrigin::Supplied)
@@ -126,7 +125,7 @@ pub fn server_config(
         if cert.exists() && key.exists() {
             (load_certificates(&cert)?, load_key(&key)?, CertificateOrigin::Cached)
         } else {
-            let (chain, key_der) = generate(state_dir)?;
+            let (chain, key_der) = generate(state_dir, names)?;
             (chain, key_der, CertificateOrigin::Generated)
         }
     };
@@ -142,15 +141,21 @@ pub fn server_config(
 }
 
 /// Generate an RSA-2048 self-signed certificate and persist it.
-fn generate(state_dir: &Path) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError> {
+///
+/// Every name becomes a subject alternative name, and the first is also the common name.
+fn generate(
+    state_dir: &Path,
+    names: &[&str],
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError> {
     std::fs::create_dir_all(state_dir).context(StateDirSnafu {
         path: state_dir.to_path_buf(),
     })?;
 
-    let mut params =
-        rcgen::CertificateParams::new(GENERATED_SANS.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>())
-            .context(GenerateSnafu)?;
-    params.distinguished_name.push(rcgen::DnType::CommonName, GENERATED_CN);
+    let mut params = rcgen::CertificateParams::new(names.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>())
+        .context(GenerateSnafu)?;
+    if let Some(common_name) = names.first() {
+        params.distinguished_name.push(rcgen::DnType::CommonName, *common_name);
+    }
 
     let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).context(GenerateSnafu)?;
     let certificate = params.self_signed(&key_pair).context(GenerateSnafu)?;
@@ -237,7 +242,10 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CERT_FILE, CertificateOrigin, GENERATED_SANS, KEY_FILE, server_config};
+    use super::{CERT_FILE, CertificateOrigin, KEY_FILE, server_config};
+
+    /// Stand-in for a driver's names: this module has none of its own any more.
+    const NAMES: &[&str] = &["*.example.invalid", "mqtt.example.invalid"];
 
     /// A scratch directory that removes itself.
     struct Scratch(std::path::PathBuf);
@@ -260,20 +268,20 @@ mod tests {
     fn generates_and_then_reuses_a_certificate() {
         let scratch = Scratch::new("tls-generate");
 
-        let (_, origin) = server_config(None, None, &scratch.0).expect("generate");
+        let (_, origin) = server_config(None, None, &scratch.0, NAMES).expect("generate");
         assert_eq!(origin, CertificateOrigin::Generated);
         assert!(scratch.0.join(CERT_FILE).exists());
         assert!(scratch.0.join(KEY_FILE).exists());
 
         // A restart must not mint a new certificate; the device would see a changed one.
-        let (_, origin) = server_config(None, None, &scratch.0).expect("reuse");
+        let (_, origin) = server_config(None, None, &scratch.0, NAMES).expect("reuse");
         assert_eq!(origin, CertificateOrigin::Cached);
     }
 
     #[test]
     fn the_generated_certificate_is_rsa_with_the_expected_names() {
         let scratch = Scratch::new("tls-shape");
-        server_config(None, None, &scratch.0).expect("generate");
+        server_config(None, None, &scratch.0, NAMES).expect("generate");
         let pem = std::fs::read_to_string(scratch.0.join(CERT_FILE)).expect("read");
         assert!(pem.starts_with("-----BEGIN CERTIFICATE-----"));
 
@@ -285,9 +293,6 @@ mod tests {
             "expected a PEM private key, got {:?}",
             key.lines().next()
         );
-
-        assert_eq!(GENERATED_SANS.len(), 2);
-        assert!(GENERATED_SANS.contains(&"mqtt.growatt.com"));
     }
 
     #[cfg(unix)]
@@ -295,7 +300,7 @@ mod tests {
     fn the_generated_key_is_not_world_readable() {
         use std::os::unix::fs::PermissionsExt as _;
         let scratch = Scratch::new("tls-perms");
-        server_config(None, None, &scratch.0).expect("generate");
+        server_config(None, None, &scratch.0, NAMES).expect("generate");
         let mode = std::fs::metadata(scratch.0.join(KEY_FILE))
             .expect("stat")
             .permissions()
@@ -307,12 +312,12 @@ mod tests {
     fn a_supplied_certificate_is_preferred() {
         let scratch = Scratch::new("tls-supplied");
         // Generate once to obtain a valid pair, then supply it explicitly from elsewhere.
-        server_config(None, None, &scratch.0).expect("generate");
+        server_config(None, None, &scratch.0, NAMES).expect("generate");
         let cert = scratch.0.join(CERT_FILE);
         let key = scratch.0.join(KEY_FILE);
 
         let other = Scratch::new("tls-supplied-empty");
-        let (_, origin) = server_config(Some(&cert), Some(&key), &other.0).expect("supplied");
+        let (_, origin) = server_config(Some(&cert), Some(&key), &other.0, NAMES).expect("supplied");
         assert_eq!(origin, CertificateOrigin::Supplied);
         // The state directory must be left untouched when a certificate is supplied.
         assert!(!other.0.join(CERT_FILE).exists());
@@ -322,7 +327,8 @@ mod tests {
     fn a_missing_file_is_reported_with_its_path() {
         let missing = std::path::Path::new("/nonexistent/heliobridge/cert.pem");
         let key = std::path::Path::new("/nonexistent/heliobridge/key.pem");
-        let err = server_config(Some(missing), Some(key), std::path::Path::new("/tmp")).expect_err("should fail");
+        let err =
+            server_config(Some(missing), Some(key), std::path::Path::new("/tmp"), NAMES).expect_err("should fail");
         assert!(
             err.to_string().contains("cert.pem"),
             "error should name the file: {err}"

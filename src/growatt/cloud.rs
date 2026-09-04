@@ -27,6 +27,7 @@
 //! difference is deliberate — it means a stalled cloud cannot delay an acknowledgement the device is
 //! waiting for.
 
+use core::future::Future;
 use core::time::Duration;
 
 use rustls::pki_types::ServerName;
@@ -35,7 +36,15 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::client::TlsStream;
 
+use crate::driver::upstream::{self, Endpoint, Message, Target};
 use crate::mqtt::{ClientTls, Connect, PROTOCOL_LEVEL, Packet, PacketStream, Publish, QoS, Subscribe};
+
+/// Names a certificate presented to the device must carry, common name first.
+///
+/// The device dials `mqtt.growatt.com` and reaches this program instead, so what it is offered has to look
+/// like what it expected. This device does not verify it (F9), which is a fact about one firmware rather
+/// than a promise about the next.
+pub const CERTIFICATE_NAMES: &[&str] = &["*.growatt.com", "mqtt.growatt.com"];
 
 /// Default cloud endpoint.
 pub const DEFAULT_HOST: &str = "mqtt.growatt.com";
@@ -84,76 +93,9 @@ pub enum RelayError {
     },
 }
 
-/// Where and how to reach the cloud.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CloudConfig {
-    /// Host name. Also the TLS server name, so it must be a name rather than an address.
-    pub host: String,
-    /// Port.
-    pub port: u16,
-}
-
-impl Default for CloudConfig {
-    fn default() -> Self {
-        Self {
-            host: DEFAULT_HOST.to_owned(),
-            port: DEFAULT_PORT,
-        }
-    }
-}
-
-impl CloudConfig {
-    /// `host:port`, for connecting and for logs.
-    pub fn address(&self) -> String {
-        format!("{}:{}", self.host, self.port)
-    }
-
-    /// The host as a TLS server name.
-    ///
-    /// # Errors
-    ///
-    /// [`RelayError::InvalidHost`] if it cannot be one — checked up front so a misconfiguration is
-    /// reported at startup rather than on every reconnection attempt.
-    pub fn server_name(&self) -> Result<ServerName<'static>, RelayError> {
-        ServerName::try_from(self.host.clone()).map_err(|_| RelayError::InvalidHost {
-            host: self.host.clone(),
-        })
-    }
-}
-
-/// Everything the relay needs: where to reach the cloud, and whom to trust when doing it.
-///
-/// The two travel together because a relay cannot be started without both, and because the TLS
-/// configuration is loaded once for the process — pairing them here is what stops a caller from
-/// accidentally building a second one per device connection.
-#[derive(Debug, Clone)]
-pub struct CloudRelay {
-    /// The endpoint to dial.
-    pub endpoint: CloudConfig,
-    /// The process's one outbound TLS configuration.
-    pub tls: ClientTls,
-}
-
-/// One MQTT publish, moving in either direction through the relay.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Message {
-    /// Topic exactly as it appeared on the hop it came from. Empty means the device's uplink topic, which
-    /// only the relay knows how to spell.
-    pub topic: String,
-    /// Delivery guarantee, preserved so the far side sees what the near side sent.
-    pub qos: QoS,
-    /// The protocol frame, untouched.
-    pub payload: Vec<u8>,
-}
-
-impl Message {
-    /// A device frame headed for the cloud, on the default uplink topic.
-    pub const fn uplink(payload: Vec<u8>, qos: QoS) -> Self {
-        Self {
-            topic: String::new(),
-            qos,
-            payload,
-        }
+impl From<upstream::InvalidHost> for RelayError {
+    fn from(error: upstream::InvalidHost) -> Self {
+        Self::InvalidHost { host: error.host }
     }
 }
 
@@ -179,8 +121,8 @@ impl Relay {
     ///
     /// [`RelayError::InvalidHost`] if the configured host cannot be a TLS server name. Failures to
     /// *connect* are not errors here: the task retries, and the session continues either way.
-    pub fn start(device_id: &str, cloud: CloudRelay) -> Result<Self, RelayError> {
-        let task = RelayTask::new(device_id, cloud)?;
+    pub fn start(device_id: &str, target: Target) -> Result<Self, RelayError> {
+        let task = RelayTask::new(device_id, target)?;
 
         let (to_cloud_tx, to_cloud_rx) = mpsc::channel(QUEUE_DEPTH);
         let (from_cloud_tx, from_cloud_rx) = mpsc::channel(QUEUE_DEPTH);
@@ -194,11 +136,16 @@ impl Relay {
         })
     }
 
-    /// Hand a message to the cloud, without waiting.
-    ///
-    /// Returns whether it was queued. A full queue means the cloud is not keeping up, and the message is
-    /// dropped: the device is waiting on this server, not on Growatt.
-    pub fn try_forward(&mut self, message: Message) -> bool {
+    /// How many messages this session failed to hand to the cloud.
+    pub const fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
+impl upstream::Relay for Relay {
+    /// A full queue means the cloud is not keeping up, and the message is dropped: the device is waiting
+    /// on this server, not on Growatt.
+    fn try_forward(&mut self, message: Message) -> bool {
         if self.to_cloud.try_send(message).is_ok() {
             return true;
         }
@@ -206,16 +153,8 @@ impl Relay {
         false
     }
 
-    /// Receive the next message the cloud sent for the device.
-    ///
-    /// Resolves to `None` when the relay task has stopped, after which the session should stop polling.
-    pub async fn next_from_cloud(&mut self) -> Option<Message> {
-        self.from_cloud.recv().await
-    }
-
-    /// How many messages this session failed to hand to the cloud.
-    pub const fn dropped(&self) -> u64 {
-        self.dropped
+    fn next_from_cloud(&mut self) -> impl Future<Output = Option<Message>> + Send {
+        self.from_cloud.recv()
     }
 }
 
@@ -223,7 +162,7 @@ impl Relay {
 /// functions.
 struct RelayTask {
     device_id: String,
-    config: CloudConfig,
+    config: Endpoint,
     server_name: ServerName<'static>,
     tls: ClientTls,
 }
@@ -237,13 +176,13 @@ enum Outcome {
 }
 
 impl RelayTask {
-    fn new(device_id: &str, cloud: CloudRelay) -> Result<Self, RelayError> {
-        let server_name = cloud.endpoint.server_name()?;
+    fn new(device_id: &str, target: Target) -> Result<Self, RelayError> {
+        let server_name = target.endpoint.server_name()?;
         Ok(Self {
             device_id: device_id.to_owned(),
-            config: cloud.endpoint,
+            config: target.endpoint,
             server_name,
-            tls: cloud.tls,
+            tls: target.tls,
         })
     }
 
@@ -476,16 +415,23 @@ impl RelayTask {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CloudConfig, CloudRelay, DEFAULT_HOST, DEFAULT_PORT, DEVICE_PASSWORD, KEEPALIVE_SECS, Message, Relay, RelayTask,
-    };
+    use super::{DEFAULT_HOST, DEFAULT_PORT, DEVICE_PASSWORD, KEEPALIVE_SECS, Message, Relay, RelayTask};
+    use crate::driver::upstream::{Endpoint, Relay as _, Target};
     use crate::mqtt::{Packet, QoS, Trust};
 
     const SERIAL: &str = "0EXAMPLE00000001";
 
+    /// The endpoint a Growatt device dials, which used to be this module's `Default`.
+    fn growatt_endpoint() -> Endpoint {
+        Endpoint {
+            host: DEFAULT_HOST.to_owned(),
+            port: DEFAULT_PORT,
+        }
+    }
+
     /// A relay configuration pointing at `endpoint`, trusting whatever the environment says.
-    fn relay_to(endpoint: CloudConfig) -> CloudRelay {
-        CloudRelay {
+    fn relay_to(endpoint: Endpoint) -> Target {
+        Target {
             endpoint,
             tls: Trust::BuiltIn.client_tls().expect("the shipped roots load"),
         }
@@ -493,7 +439,7 @@ mod tests {
 
     #[test]
     fn defaults_point_at_the_vendor_endpoint() {
-        let config = CloudConfig::default();
+        let config = growatt_endpoint();
         assert_eq!(config.host, DEFAULT_HOST);
         assert_eq!(config.port, DEFAULT_PORT);
         assert_eq!(config.address(), "mqtt.growatt.com:7006");
@@ -501,7 +447,7 @@ mod tests {
 
     #[test]
     fn an_unusable_host_is_refused_before_anything_is_spawned() {
-        let config = CloudConfig {
+        let config = Endpoint {
             host: "not a host name".to_owned(),
             port: 7006,
         };
@@ -512,7 +458,7 @@ mod tests {
     #[test]
     fn the_upstream_connect_impersonates_the_device() {
         // The relay's identity upstream must be the device's, not its own.
-        let task = RelayTask::new(SERIAL, relay_to(CloudConfig::default())).expect("valid config");
+        let task = RelayTask::new(SERIAL, relay_to(growatt_endpoint())).expect("valid config");
         let wire = task.upstream_connect().encode().expect("encode");
 
         let (decoded, _) = Packet::decode(&wire).expect("decode").expect("complete");
@@ -533,7 +479,7 @@ mod tests {
 
     #[test]
     fn an_uplink_publish_uses_the_device_topic_and_a_fresh_packet_id() {
-        let task = RelayTask::new(SERIAL, relay_to(CloudConfig::default())).expect("valid config");
+        let task = RelayTask::new(SERIAL, relay_to(growatt_endpoint())).expect("valid config");
         let mut packet_id = 2;
 
         match task.uplink_publish(Message::uplink(vec![1, 2, 3], QoS::AtLeastOnce), &mut packet_id) {
@@ -556,7 +502,7 @@ mod tests {
 
     #[test]
     fn an_explicit_topic_is_preserved() {
-        let task = RelayTask::new(SERIAL, relay_to(CloudConfig::default())).expect("valid config");
+        let task = RelayTask::new(SERIAL, relay_to(growatt_endpoint())).expect("valid config");
         let mut packet_id = 2;
         let message = Message {
             topic: "c/33/other".to_owned(),
@@ -572,7 +518,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_queue_drops_rather_than_blocks() {
         // The property that keeps the cloud from ever delaying the device: forwarding never waits.
-        let config = CloudConfig {
+        let config = Endpoint {
             // A name that resolves nowhere, so the task cannot drain the queue.
             host: "cloud.invalid".to_owned(),
             port: 7006,

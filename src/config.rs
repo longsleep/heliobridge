@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::growatt::cloud::{self, CloudConfig};
+use crate::driver::upstream::Endpoint;
 use crate::growatt::policy::{Answers, Mode, Policy};
 use crate::homeassistant::command::Permitted;
 use crate::homeassistant::publisher::{self, PublisherOptions};
@@ -282,15 +282,17 @@ pub struct Config {
     #[arg(long, env = "HELIOBRIDGE_CLOUD_RELAY", default_value_t = false)]
     pub cloud_relay: bool,
 
-    /// Cloud endpoint to relay to, as `host:port`.
+    /// Cloud host to relay to. Defaults to the one the driver's own devices dial.
     ///
-    /// The host is also the TLS server name, so it must be a name rather than an address.
-    #[arg(long, env = "HELIOBRIDGE_CLOUD_HOST", default_value = cloud::DEFAULT_HOST)]
-    pub cloud_host: String,
+    /// The host is also the TLS server name, so it must be a name rather than an address. Left unset
+    /// deliberately rather than defaulted here: which cloud a device belongs to is the driver's knowledge,
+    /// and repeating it in a command-line default would be a second place to get it wrong.
+    #[arg(long, env = "HELIOBRIDGE_CLOUD_HOST")]
+    pub cloud_host: Option<String>,
 
-    /// Cloud port.
-    #[arg(long, env = "HELIOBRIDGE_CLOUD_PORT", default_value_t = cloud::DEFAULT_PORT)]
-    pub cloud_port: u16,
+    /// Cloud port. Defaults to the driver's own.
+    #[arg(long, env = "HELIOBRIDGE_CLOUD_PORT")]
+    pub cloud_port: Option<u16>,
 
     /// How much authority the vendor cloud keeps while relaying.
     ///
@@ -408,7 +410,7 @@ impl Config {
         self.state_dir = given_path(Some(self.state_dir)).unwrap_or_else(default_state_dir);
         self.mqtt_base = given_or(self.mqtt_base, DEFAULT_MQTT_BASE);
         self.mqtt_discovery_prefix = given_or(self.mqtt_discovery_prefix, DEFAULT_DISCOVERY_PREFIX);
-        self.cloud_host = given_or(self.cloud_host, cloud::DEFAULT_HOST);
+        self.cloud_host = given(self.cloud_host);
         self.log = given_or(self.log, DEFAULT_LOG);
         self
     }
@@ -431,10 +433,13 @@ impl Config {
     }
 
     /// The cloud endpoint to relay to, or `None` when relaying is off.
-    pub fn cloud(&self) -> Option<CloudConfig> {
-        self.cloud_relay.then(|| CloudConfig {
-            host: self.cloud_host.clone(),
-            port: self.cloud_port,
+    ///
+    /// `driver` is where the device would have connected by itself; configuration only overrides it, which
+    /// is why this takes one rather than knowing any address of its own.
+    pub fn cloud(&self, driver: Endpoint) -> Option<Endpoint> {
+        self.cloud_relay.then(|| Endpoint {
+            host: self.cloud_host.clone().unwrap_or(driver.host),
+            port: self.cloud_port.unwrap_or(driver.port),
         })
     }
 
@@ -665,7 +670,8 @@ mod tests {
         assert_eq!(cleared.mqtt_discovery_prefix, DEFAULT_DISCOVERY_PREFIX);
         assert_eq!(cleared.state_dir, default_state_dir());
         assert_eq!(cleared.log, DEFAULT_LOG);
-        assert!(!cleared.cloud_host.is_empty());
+        // An emptied host is no host at all, and the driver's own then applies.
+        assert_eq!(cleared.cloud_host, None);
         // An empty base would make every published topic start with a slash.
         assert_eq!(cleared.topics().base, DEFAULT_MQTT_BASE);
     }

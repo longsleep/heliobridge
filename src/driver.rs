@@ -13,8 +13,8 @@
 //!
 //! # One capability per trait, one bundle to name them
 //!
-//! The seam is split by capability — [`Wire`] for framing, [`Firmware`] for update campaigns, and more to
-//! come — rather than gathered into a single wide trait. A consumer bounds on the capability it uses and
+//! The seam is split by capability — [`Wire`] for framing, [`Firmware`] for update campaigns, [`Upstream`]
+//! for the manufacturer's cloud, and more to come — rather than gathered into a single wide trait. A consumer bounds on the capability it uses and
 //! nothing else, which keeps its requirements legible: `server::firmware` needs [`Firmware`], and the fact
 //! that it needs nothing else is worth being able to see.
 //!
@@ -34,15 +34,17 @@
 //!
 //! # Scope, honestly stated
 //!
-//! Only framing and firmware exist so far. Telemetry, settings, the register maps, the policy for cloud
-//! writes and the cloud relay itself still reach the server as Growatt types directly. This module is the
+//! Framing, firmware and the cloud relay exist so far. Telemetry, settings, the register maps and the
+//! policy for cloud writes still reach the server as Growatt types directly. This module is the
 //! direction of travel and the place the next capability goes, not a finished abstraction layer, and it
 //! says so rather than implying more separation than exists.
 
 pub mod firmware;
+pub mod upstream;
 pub mod wire;
 
 pub use firmware::{AdvertisedFirmware, Firmware};
+pub use upstream::{Endpoint, Message, Relay, Target, Upstream};
 pub use wire::Wire;
 
 /// Everything the server asks of a driver.
@@ -50,9 +52,9 @@ pub use wire::Wire;
 /// A bundle rather than a trait in its own right: it has no methods, and a blanket impl gives it to any
 /// type implementing every capability. Bound on this where a whole driver is meant — a session — and on a
 /// single capability everywhere else.
-pub trait Driver: Wire + Firmware {}
+pub trait Driver: Wire + Firmware + Upstream {}
 
-impl<T> Driver for T where T: Wire + Firmware {}
+impl<T> Driver for T where T: Wire + Firmware + Upstream {}
 
 /// A driver that recognises nothing.
 ///
@@ -69,6 +71,27 @@ impl Wire for Unknown {
 
     fn parse<'a>(&self, _payload: &'a [u8]) -> Option<Self::Frame<'a>> {
         None
+    }
+}
+
+impl Upstream for Unknown {
+    type Relay = upstream::NoRelay;
+    type Error = upstream::NoUpstream;
+
+    /// Nowhere: a driver that recognises nothing knows no cloud to point at either.
+    fn endpoint(&self) -> Endpoint {
+        Endpoint {
+            host: String::new(),
+            port: 0,
+        }
+    }
+
+    fn certificate_names(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn relay(&self, _device_id: &str, _target: Target) -> Result<Self::Relay, Self::Error> {
+        Err(upstream::NoUpstream)
     }
 }
 

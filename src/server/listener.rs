@@ -22,7 +22,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::control::Registry;
 use crate::driver::Driver;
-use crate::growatt::cloud::CloudRelay;
+use crate::driver::upstream::Target;
 use crate::growatt::policy::Policy;
 use crate::record::Recorder;
 use crate::server::access::{Devices, Peers};
@@ -50,6 +50,8 @@ pub enum ListenerError {
 /// recorder in every sense that matters, which is not a thing equality can usefully express.
 #[derive(Debug)]
 pub struct SessionOptions<D: Driver> {
+    /// The driver every session on this listener speaks.
+    pub driver: Arc<D>,
     /// Whether to push the server's wall-clock time after the device connects.
     ///
     /// Off only when the cloud's own configuration write is being relayed through, since two parties
@@ -58,7 +60,7 @@ pub struct SessionOptions<D: Driver> {
     pub time_push: bool,
 
     /// Relay traffic to the vendor cloud, so the phone app keeps working.
-    pub cloud: Option<CloudRelay>,
+    pub cloud: Option<Target>,
 
     /// What the relay carries in each direction. Ignored unless `cloud` is set.
     pub policy: Policy,
@@ -79,11 +81,12 @@ pub struct SessionOptions<D: Driver> {
     pub devices: Devices,
 }
 
-// Derived `Clone` would demand `V: Clone`, which a vendor has no reason to be: what is cloned per
+// Derived `Clone` would demand `D: Clone`, which a driver has no reason to be: what is cloned per
 // connection is a handle to it.
 impl<D: Driver> Clone for SessionOptions<D> {
     fn clone(&self) -> Self {
         Self {
+            driver: Arc::clone(&self.driver),
             time_push: self.time_push,
             cloud: self.cloud.clone(),
             policy: self.policy,
@@ -96,9 +99,10 @@ impl<D: Driver> Clone for SessionOptions<D> {
     }
 }
 
-impl<D: Driver> Default for SessionOptions<D> {
+impl<D: Driver + Default> Default for SessionOptions<D> {
     fn default() -> Self {
         Self {
+            driver: Arc::new(D::default()),
             time_push: true,
             cloud: None,
             policy: Policy::default(),
@@ -233,7 +237,7 @@ async fn handle<D: Driver>(
 
     tracing::info!("TLS established");
 
-    let mut session = Session::new(stream)
+    let mut session = Session::new(stream, options.driver)
         .with_time_push(options.time_push)
         .with_cloud(options.cloud)
         .with_policy(options.policy)
@@ -280,9 +284,10 @@ fn flatten(error: &dyn std::error::Error) -> String {
 mod tests {
     use super::{Devices, Peers, SessionOptions};
     use crate::driver::Unknown;
-    use crate::growatt::cloud::{CloudConfig, CloudRelay};
+    use crate::driver::upstream::{Endpoint, Target};
     use crate::growatt::policy::Policy;
     use crate::mqtt::Trust;
+    use std::sync::Arc;
 
     #[test]
     fn defaults_relay_nothing_record_nothing_and_push_time() {
@@ -298,9 +303,13 @@ mod tests {
         // the cloud, so the wiring in `main` turns our push off. Nothing here enforces that — it is a
         // policy decision, and this type only carries it.
         let options = SessionOptions::<Unknown> {
+            driver: Arc::new(Unknown),
             time_push: false,
-            cloud: Some(CloudRelay {
-                endpoint: CloudConfig::default(),
+            cloud: Some(Target {
+                endpoint: Endpoint {
+                    host: "cloud.example.invalid".to_owned(),
+                    port: 7006,
+                },
                 tls: Trust::BuiltIn.client_tls().expect("the shipped roots load"),
             }),
             policy: Policy::OPEN,

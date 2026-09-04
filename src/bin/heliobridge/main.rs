@@ -9,7 +9,7 @@ use std::sync::Arc;
 use heliobridge::VERSION;
 use heliobridge::config::{Command, Config, LogFormat};
 use heliobridge::control::{self, Registry};
-use heliobridge::growatt::cloud::CloudRelay;
+use heliobridge::driver::upstream::{Target, Upstream as _};
 use heliobridge::growatt::{self};
 use heliobridge::homeassistant::broker::{BrokerConfig, BrokerUrl};
 use heliobridge::homeassistant::command;
@@ -85,6 +85,9 @@ fn run(config: &Config) -> Result<(), String> {
 /// a step that is switched off is a method that does nothing.
 struct Bridge<'a> {
     config: &'a Config,
+    /// The one place in the program that names a manufacturer. Everything below reaches it through
+    /// [`heliobridge::driver`].
+    driver: Arc<growatt::driver::Growatt>,
     /// Runs every task. The recorder, the control API and the publisher all spawn into it, so it must
     /// exist before any of them.
     runtime: tokio::runtime::Runtime,
@@ -92,7 +95,7 @@ struct Bridge<'a> {
     server_tls: Arc<ServerConfig>,
     /// What everything this program dials trusts.
     client_tls: ClientTls,
-    cloud: Option<CloudRelay>,
+    cloud: Option<Target>,
     recorder: Option<Recorder>,
     registry: Option<Registry>,
 }
@@ -100,13 +103,14 @@ struct Bridge<'a> {
 impl<'a> Bridge<'a> {
     /// The parts that are not optional: a runtime, a certificate to present, and anchors to trust.
     fn new(config: &'a Config) -> Result<Self, String> {
+        let driver = Arc::new(growatt::driver::Growatt);
         let pair = config.tls_pair().map_err(str::to_owned)?;
         let (cert, key) = match pair {
             Some((cert, key)) => (Some(cert.as_path()), Some(key.as_path())),
             None => (None, None),
         };
 
-        let (server_tls, origin) = server::server_config(cert, key, &config.state_dir)
+        let (server_tls, origin) = server::server_config(cert, key, &config.state_dir, driver.certificate_names())
             .map_err(|error| format!("TLS setup failed: {}", chain(&error)))?;
         tracing::info!(%origin, state_dir = %config.state_dir.display(), "certificate ready");
 
@@ -121,6 +125,7 @@ impl<'a> Bridge<'a> {
 
         Ok(Self {
             config,
+            driver,
             runtime,
             server_tls,
             client_tls,
@@ -132,7 +137,7 @@ impl<'a> Bridge<'a> {
 
     /// Relay to the vendor cloud, when asked for.
     fn with_cloud_relay(mut self) -> Result<Self, String> {
-        let Some(endpoint) = self.config.cloud() else {
+        let Some(endpoint) = self.config.cloud(self.driver.endpoint()) else {
             return Ok(self);
         };
 
@@ -153,7 +158,7 @@ impl<'a> Bridge<'a> {
              Telemetry, identity and settings snapshots are always forwarded"
         );
 
-        self.cloud = Some(CloudRelay {
+        self.cloud = Some(Target {
             endpoint,
             tls: self.client_tls.clone(),
         });
@@ -294,13 +299,14 @@ impl<'a> Bridge<'a> {
                     "firmware the cloud advertises will be logged and kept{}",
                     if settings.fetch { ", downloading it" } else { " once fetching is enabled" }
                 );
-                FirmwareStore::new(Arc::new(growatt::driver::Growatt))
+                FirmwareStore::new(Arc::clone(&self.driver))
                     .keeping(settings.dir, settings.fetch, settings.max_bytes)
                     .map_err(|error| format!("firmware directory unusable: {}", chain(&error)))?
             }
-            None => FirmwareStore::new(Arc::new(growatt::driver::Growatt)),
+            None => FirmwareStore::new(Arc::clone(&self.driver)),
         });
         let options = server::SessionOptions {
+            driver: Arc::clone(&self.driver),
             time_push: self.config.should_push_time(),
             cloud: self.cloud,
             policy: self.config.policy(),

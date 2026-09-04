@@ -9,7 +9,9 @@
 //! carrying several message shapes would put an enumeration here instead, and nothing on the server's side
 //! would change.
 
+use crate::driver::upstream::{Endpoint, Target, Upstream};
 use crate::driver::{AdvertisedFirmware, Firmware, Wire};
+use crate::growatt::cloud::{self, Relay, RelayError};
 use crate::growatt::firmware;
 use crate::growatt::v7::frame::Frame;
 
@@ -22,6 +24,26 @@ impl Wire for Growatt {
 
     fn parse<'a>(&self, payload: &'a [u8]) -> Option<Self::Frame<'a>> {
         Frame::parse(payload).ok()
+    }
+}
+
+impl Upstream for Growatt {
+    type Relay = Relay;
+    type Error = RelayError;
+
+    fn endpoint(&self) -> Endpoint {
+        Endpoint {
+            host: cloud::DEFAULT_HOST.to_owned(),
+            port: cloud::DEFAULT_PORT,
+        }
+    }
+
+    fn certificate_names(&self) -> &'static [&'static str] {
+        cloud::CERTIFICATE_NAMES
+    }
+
+    fn relay(&self, device_id: &str, target: Target) -> Result<Self::Relay, Self::Error> {
+        Relay::start(device_id, target)
     }
 }
 

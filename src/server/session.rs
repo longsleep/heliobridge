@@ -13,6 +13,7 @@
 
 use core::time::Duration;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -24,7 +25,7 @@ use crate::control::{
     Registration, Registry, Request as ControlRequest, SessionHandle, SettingView, StatusView, TelemetryView,
 };
 use crate::driver::Driver;
-use crate::growatt::cloud::{CloudRelay, Message as CloudMessage, Relay};
+use crate::driver::upstream::{Message as CloudMessage, Relay as _, Target};
 use crate::growatt::policy::{CloudCommands, Direction, Intent, Originator, Policy};
 use crate::growatt::product::Product;
 use crate::growatt::v7::decode::{FromFrame, ReadResponse, SettingsSnapshot, Telemetry, WriteAck};
@@ -149,6 +150,8 @@ pub struct SessionStats {
 #[derive(Debug)]
 pub struct Session<S, D: Driver> {
     stream: PacketStream<S>,
+    /// What the bytes mean. One driver, shared by every session and by the tasks they spawn.
+    driver: Arc<D>,
     device_id: Option<String>,
     subscribed: bool,
     stats: SessionStats,
@@ -158,8 +161,8 @@ pub struct Session<S, D: Driver> {
     next_packet_id: u16,
     device_time: Option<Timestamp>,
     warned_about_skew: bool,
-    cloud: Option<CloudRelay>,
-    relay: Option<Relay>,
+    cloud: Option<Target>,
+    relay: Option<D::Relay>,
     /// What the relay carries in each direction. Consulted only while relaying.
     policy: Policy,
     /// Cloud commands awaiting an answer, so answers to ours are not forwarded.
@@ -260,16 +263,17 @@ where
     D: Driver,
 {
     /// Wrap a connected stream, using the host's local clock for the time push.
-    pub fn new(stream: S) -> Self {
-        Self::with_clock(stream, Clock::system())
+    pub fn new(stream: S, driver: Arc<D>) -> Self {
+        Self::with_clock(stream, driver, Clock::system())
     }
 
     /// Wrap a connected stream with an explicit clock.
     ///
     /// Tests pass a fixed clock; nothing else should need this.
-    pub fn with_clock(stream: S, clock: Clock) -> Self {
+    pub fn with_clock(stream: S, driver: Arc<D>, clock: Clock) -> Self {
         Self {
             stream: PacketStream::new(stream, MAX_PACKET_LEN),
+            driver,
             device_id: None,
             subscribed: false,
             stats: SessionStats::default(),
@@ -364,7 +368,7 @@ where
     /// The relay cannot start until the device's serial is known, so this stores the configuration and the
     /// connection is made from CONNECT.
     #[must_use]
-    pub fn with_cloud(mut self, cloud: Option<CloudRelay>) -> Self {
+    pub fn with_cloud(mut self, cloud: Option<Target>) -> Self {
         self.cloud = cloud;
         self
     }
@@ -868,7 +872,7 @@ where
     }
 
     /// The next message from the cloud, or never if there is no relay.
-    async fn from_cloud(relay: Option<&mut Relay>) -> Option<CloudMessage> {
+    async fn from_cloud(relay: Option<&mut D::Relay>) -> Option<CloudMessage> {
         match relay {
             Some(relay) => relay.next_from_cloud().await,
             None => core::future::pending().await,
@@ -1491,7 +1495,7 @@ where
         let (Some(cloud), Some(device_id)) = (self.cloud.clone(), self.device_id.clone()) else {
             return;
         };
-        match Relay::start(&device_id, cloud) {
+        match self.driver.relay(&device_id, cloud) {
             Ok(relay) => self.relay = Some(relay),
             // Not fatal. The device is served either way, which is the whole point of the relay being
             // optional.
@@ -1699,6 +1703,7 @@ mod tests {
     };
     use crate::driver::Unknown;
     use crate::mqtt::{Connect, Packet, Publish, QoS, Subscribe};
+    use std::sync::Arc;
 
     const SERIAL: &str = "0EXAMPLE00000001";
 
@@ -1762,7 +1767,7 @@ mod tests {
             .await
             .expect("the duplex buffers the whole script");
 
-        let mut session = Session::<_, Unknown>::new(server);
+        let mut session = Session::new(server, Arc::new(Unknown));
         let stats = session.run().await.expect("session should end cleanly");
         // Dropping the server half is what gives the client its end-of-file below.
         drop(session);
@@ -1791,7 +1796,7 @@ mod tests {
         full.extend_from_slice(&[0xE0, 0x00]);
         client.write_all(&full).await.expect("buffered");
 
-        let mut session = Session::<_, Unknown>::new(server).with_devices(devices);
+        let mut session = Session::new(server, Arc::new(Unknown)).with_devices(devices);
         session.run().await.expect("session should end cleanly");
         drop(session);
 
@@ -1934,7 +1939,7 @@ mod tests {
         client.write_all(script).await.expect("buffered");
 
         let mut session =
-            Session::<_, Unknown>::with_clock(server, Clock::from_fn(fixed_clock)).with_time_push(enabled);
+            Session::with_clock(server, Arc::new(Unknown), Clock::from_fn(fixed_clock)).with_time_push(enabled);
 
         // Run until the session ends. The script has no DISCONNECT, so it ends on the read timeout —
         // which tokio's paused clock reaches instantly once the time push has fired.
@@ -2101,7 +2106,7 @@ mod tests {
         script.extend_from_slice(&[0xE0, 0x00]);
         client.write_all(&script).await.expect("buffered");
 
-        let mut session = Session::<_, Unknown>::new(server);
+        let mut session = Session::new(server, Arc::new(Unknown));
         session.run().await.expect("session");
         assert_eq!(session.device_id(), Some(SERIAL));
     }
