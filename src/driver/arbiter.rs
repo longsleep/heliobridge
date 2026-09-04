@@ -52,14 +52,11 @@
 //! local controller writes. Withholding them also happens to make the uplink indistinguishable from an
 //! unmodified device, which is a fair secondary benefit but not the reason.
 //!
-//! # Growatt-specific, generation-neutral
+//! # Intents, not frames
 //!
-//! This sits beside [`super::cloud`] because there is nothing general about it: the relay exists to keep
-//! *Growatt's* cloud working, and what may pass is a judgement about that vendor's server.
-//!
-//! Within that scope it is generation-neutral. The module names *intents*, not frames: recognising a
-//! frame as an intent is the codec's job, per generation (see [`super::v7::classify`]), while deciding
-//! whether an intent may pass belongs here. Adding a generation means writing a classifier, not
+//! Nothing here names a frame, a register map or a protocol generation. Recognising a frame as an intent
+//! is [`Arbiter::intent`], which a driver answers for its own protocol and its own generations; deciding
+//! whether an intent may pass belongs here. Supporting another generation means writing a classifier, not
 //! revisiting these rules.
 
 use core::fmt;
