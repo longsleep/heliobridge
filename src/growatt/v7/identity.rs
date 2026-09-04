@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(report.entries.len(), 1);
         assert!(!report.truncated);
         assert_eq!(report.value(Register(122)), Some("DEV:"));
-        assert_eq!(report.entries[0].name(), None, "register 122 is not documented");
+        assert_eq!(report.entries[0].name(), Some("accessory_list"));
     }
 
     #[test]

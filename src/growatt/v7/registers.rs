@@ -923,6 +923,9 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         Entry::on_request(109, "unknown_109", Inert, Inferred),
         // A string of labelled fields: `state`, `err_wifi`, `reconnect`, `server`.
         Entry::on_request(121, "link_diagnostics", Inert, Inferred),
+        // The registered accessories, reported as `DEV:` when empty and as one `&`-separated entry each
+        // otherwise. Also the register that adds and removes them; see `WritableConfig::AccessoryList`.
+        Entry::new(122, "accessory_list", Dynamic, Observed),
         // Fifteen slots, each a timestamped connection-event record.
         Entry::on_request(124, "connection_event_00", Dynamic, Observed),
         Entry::on_request(125, "connection_event_01", Dynamic, Observed),

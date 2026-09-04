@@ -162,8 +162,9 @@ fn unrecognised_keys_are_carried_rather_than_rejected() {
         !unknown.is_empty(),
         "this device reports keys outside the documented map; carrying them is how the next one is named"
     );
-    // Registers 102 and 122 both read "DEV:" and are documented as unknown in Appendix C.
-    assert!(unknown.contains(&122), "got {unknown:?}");
+    // Register 102 reads "DEV:" like the accessory list at 122, and is still undocumented: nothing
+    // establishes what it lists, so it is carried by number.
+    assert!(unknown.contains(&102), "got {unknown:?}");
 }
 
 #[test]

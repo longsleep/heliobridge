@@ -311,11 +311,17 @@ pub enum WritableConfig {
     /// Register 35. **Resets the datalogger to factory defaults** — not a log wipe, whatever the
     /// vendor's own web interface labels it **[F]**. See [`Self::is_destructive`].
     FactoryReset,
-    /// Register 122, the list of network accessories the device polls **[F]**.
+    /// Register 122, the list of network accessories the device polls **[O]**.
     ///
-    /// Takes a command rather than a value: `ADD:<type>-<mode>-<payload>`, `DEL:…` or `CRL:…`, with mode 1
-    /// giving an address and a serial and mode 7 naming something to find by mDNS. See the specification's
-    /// Appendix C. Writable because a meter cannot otherwise be registered without the vendor's cloud.
+    /// Takes a command rather than a value — `ADD:`, `DEL:` or `CRL:` — followed by one or more entries
+    /// separated by `&`, each `<type>-<mode>-<parameters>`. Mode 1 is an outbound TCP client whose
+    /// parameters are `<address>,<name>`, the address capped at 17 octets; mode 7 hands the entry to
+    /// another task instead of connecting, and `CRL:` applies to it alone. See the specification's §9.3.
+    ///
+    /// Writable because an accessory cannot otherwise be registered without the vendor's cloud. Two
+    /// consequences a caller should know: the list is RAM-only and lost on a datalogger restart, and
+    /// registering an accessory makes the device write holding register 313, which it never writes back to
+    /// zero.
     AccessoryList,
     /// Register 19, the broker host name. **Retargets the device** — see [`Self::is_retarget`].
     RemoteUrl,
