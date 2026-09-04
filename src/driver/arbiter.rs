@@ -2,6 +2,17 @@
 //!
 //! Without a relay there is no second party and none of this applies.
 //!
+//! # Whose vocabulary this is
+//!
+//! The modes are this program's own: how much authority an operator leaves the cloud is a decision about
+//! this product, not about any manufacturer's protocol, and `--relay-mode` is where it is made. So the
+//! rules live here, stated in terms of [`Intent`] — what a frame is *trying to do*, which is as much as a
+//! policy needs to know.
+//!
+//! A driver's whole part in this is [`Arbiter::intent`]: looking at one of its own frames and saying which
+//! of these it is. Nothing else about its protocol is consulted, and a driver cannot widen or narrow what
+//! an operator asked for.
+//!
 //! # Downlink: three modes, described from the vendor app's side
 //!
 //! | [`Mode`] | The app can | The app cannot |
@@ -59,12 +70,24 @@ use tokio::time::Instant;
 
 use crate::model::Register;
 
+use super::wire::Wire;
+
 /// How long a cloud command stays claimable by its answer.
 ///
 /// Acknowledgement latency was observed between 1.0 s and 4.3 s, and a read was answered in about 0.6 s.
 /// Fifteen seconds is generous against the slowest of those without keeping stale entries long enough to be
 /// claimed by a later, unrelated answer.
 pub const COMMAND_TTL: Duration = Duration::from_secs(15);
+
+/// Reading a frame's purpose, so a policy can be applied to it.
+pub trait Arbiter: Wire {
+    /// What this frame is trying to do, given the direction it is travelling.
+    ///
+    /// [`Intent::Unrecognised`] is the honest answer for anything the driver cannot place, including a
+    /// frame too short to read. The downlink policy refuses that, which is the safe direction to be wrong
+    /// in.
+    fn intent(&self, frame: &Self::Frame<'_>, direction: Direction) -> Intent;
+}
 
 /// Which way a frame is travelling.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]

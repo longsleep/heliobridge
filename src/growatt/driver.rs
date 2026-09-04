@@ -9,6 +9,7 @@
 //! carrying several message shapes would put an enumeration here instead, and nothing on the server's side
 //! would change.
 
+use crate::driver::arbiter::{Arbiter, Direction, Intent};
 use crate::driver::upstream::{Endpoint, Target, Upstream};
 use crate::driver::{AdvertisedFirmware, Firmware, Wire};
 use crate::growatt::cloud::{self, Relay, RelayError};
@@ -24,6 +25,12 @@ impl Wire for Growatt {
 
     fn parse<'a>(&self, payload: &'a [u8]) -> Option<Self::Frame<'a>> {
         Frame::parse(payload).ok()
+    }
+}
+
+impl Arbiter for Growatt {
+    fn intent(&self, frame: &Self::Frame<'_>, direction: Direction) -> Intent {
+        frame.intent(direction)
     }
 }
 

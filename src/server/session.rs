@@ -25,8 +25,8 @@ use crate::control::{
     Registration, Registry, Request as ControlRequest, SessionHandle, SettingView, StatusView, TelemetryView,
 };
 use crate::driver::Driver;
+use crate::driver::arbiter::{CloudCommands, Direction, Intent, Originator, Policy};
 use crate::driver::upstream::{Message as CloudMessage, Relay as _, Target};
-use crate::growatt::policy::{CloudCommands, Direction, Intent, Originator, Policy};
 use crate::growatt::product::Product;
 use crate::growatt::v7::decode::{FromFrame, ReadResponse, SettingsSnapshot, Telemetry, WriteAck};
 use crate::growatt::v7::encode::{Command, EncodeError};
@@ -1511,6 +1511,8 @@ where
 
         // An unreadable frame classifies as unrecognised, which the uplink allows: the cloud understands
         // frames this build does not.
+        // Still the frame's own method: the uplink hands this one an already-parsed Growatt frame, and
+        // that path moves behind the seam with the rest of framing.
         let intent = frame.map_or(Intent::Unrecognised, |frame| frame.intent(Direction::ToCloud));
         let originator = if intent.needs_attribution() {
             self.cloud_commands.claim(&intent, Instant::now())
@@ -1567,18 +1569,15 @@ where
         // Classify before deciding. A frame this build cannot parse is unrecognised, and the downlink
         // policy refuses that — the opposite default from the uplink, and deliberately so: an
         // unrecognised frame heading for the device is the shape an unknown firmware trigger would take.
-        let parsed = Frame::parse(&message.payload);
-        let intent = match &parsed {
-            Ok(frame) => frame.intent(Direction::ToDevice),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    topic = %message.topic,
-                    len = message.payload.len(),
-                    "a cloud message this build cannot parse"
-                );
-                Intent::Unrecognised
-            }
+        let intent = if let Some(frame) = self.driver.parse(&message.payload) {
+            self.driver.intent(&frame, Direction::ToDevice)
+        } else {
+            tracing::warn!(
+                topic = %message.topic,
+                len = message.payload.len(),
+                "a cloud message this driver cannot parse"
+            );
+            Intent::Unrecognised
         };
 
         let refusal = self

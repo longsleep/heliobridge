@@ -13,8 +13,8 @@
 //!
 //! # One capability per trait, one bundle to name them
 //!
-//! The seam is split by capability — [`Wire`] for framing, [`Firmware`] for update campaigns, [`Upstream`]
-//! for the manufacturer's cloud, and more to come — rather than gathered into a single wide trait. A consumer bounds on the capability it uses and
+//! The seam is split by capability — [`Wire`] for framing, [`Arbiter`] for what a frame is trying to do,
+//! [`Firmware`] for update campaigns, [`Upstream`] for the manufacturer's cloud, and more to come — rather than gathered into a single wide trait. A consumer bounds on the capability it uses and
 //! nothing else, which keeps its requirements legible: `server::firmware` needs [`Firmware`], and the fact
 //! that it needs nothing else is worth being able to see.
 //!
@@ -39,10 +39,12 @@
 //! direction of travel and the place the next capability goes, not a finished abstraction layer, and it
 //! says so rather than implying more separation than exists.
 
+pub mod arbiter;
 pub mod firmware;
 pub mod upstream;
 pub mod wire;
 
+pub use arbiter::{Arbiter, Direction, Intent, Policy};
 pub use firmware::{AdvertisedFirmware, Firmware};
 pub use upstream::{Endpoint, Message, Relay, Target, Upstream};
 pub use wire::Wire;
@@ -52,9 +54,9 @@ pub use wire::Wire;
 /// A bundle rather than a trait in its own right: it has no methods, and a blanket impl gives it to any
 /// type implementing every capability. Bound on this where a whole driver is meant — a session — and on a
 /// single capability everywhere else.
-pub trait Driver: Wire + Firmware + Upstream {}
+pub trait Driver: Wire + Arbiter + Firmware + Upstream {}
 
-impl<T> Driver for T where T: Wire + Firmware + Upstream {}
+impl<T> Driver for T where T: Wire + Arbiter + Firmware + Upstream {}
 
 /// A driver that recognises nothing.
 ///
@@ -71,6 +73,14 @@ impl Wire for Unknown {
 
     fn parse<'a>(&self, _payload: &'a [u8]) -> Option<Self::Frame<'a>> {
         None
+    }
+}
+
+impl Arbiter for Unknown {
+    /// Nothing is recognised, which the downlink policy refuses — the safe answer for a driver that cannot
+    /// read a frame in the first place.
+    fn intent(&self, _frame: &Self::Frame<'_>, _direction: Direction) -> Intent {
+        Intent::Unrecognised
     }
 }
 

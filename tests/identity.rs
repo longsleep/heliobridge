@@ -229,7 +229,7 @@ fn the_report_is_a_minority_of_the_space() {
 /// bodies as captured; the serial they arrived with is not part of what is asserted.
 #[test]
 fn config_writes_arrive_under_either_address() {
-    use heliobridge::growatt::policy::{Direction, Intent};
+    use heliobridge::driver::arbiter::{Direction, Intent};
     use heliobridge::growatt::v7::frame::MessageType;
 
     // register 32 = "1" (restart), 35 = "1" (clear log), 19 = the domain, 18 = the port.

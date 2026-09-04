@@ -22,8 +22,8 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::control::Registry;
 use crate::driver::Driver;
+use crate::driver::arbiter::Policy;
 use crate::driver::upstream::Target;
-use crate::growatt::policy::Policy;
 use crate::record::Recorder;
 use crate::server::access::{Devices, Peers};
 use crate::server::firmware::FirmwareStore;
@@ -284,8 +284,8 @@ fn flatten(error: &dyn std::error::Error) -> String {
 mod tests {
     use super::{Devices, Peers, SessionOptions};
     use crate::driver::Unknown;
+    use crate::driver::arbiter::Policy;
     use crate::driver::upstream::{Endpoint, Target};
-    use crate::growatt::policy::Policy;
     use crate::mqtt::Trust;
     use std::sync::Arc;
 

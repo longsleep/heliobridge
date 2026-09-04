@@ -1,8 +1,8 @@
 //! Recognising what a frame is trying to do, for the relay policy.
 //!
-//! The vocabulary is [`crate::growatt::policy::Intent`], which is vendor- and generation-neutral; this module is
-//! the generation-7 half of the translation. A new generation supplies its own [`Frame::intent`] and the
-//! policy rules stay untouched.
+//! The vocabulary is [`crate::driver::arbiter::Intent`], which the server owns; this module is the
+//! generation-7 half of the translation. A new generation supplies its own [`Frame::intent`] and the policy
+//! rules stay untouched.
 //!
 //! # Direction decides meaning
 //!
@@ -16,7 +16,7 @@
 //! [`Intent::Unrecognised`] rather than a guess. The downlink policy refuses that, which is the safe
 //! direction to be wrong in.
 
-use crate::growatt::policy::{Direction, Intent};
+use crate::driver::arbiter::{Direction, Intent};
 use crate::growatt::v7::frame::{Frame, MessageType};
 use crate::model::Register;
 
@@ -88,7 +88,7 @@ impl Frame {
 
 #[cfg(test)]
 mod tests {
-    use crate::growatt::policy::{Direction, Intent};
+    use crate::driver::arbiter::{Direction, Intent};
     use crate::growatt::v7::encode::Command;
     use crate::growatt::v7::frame::Frame;
     use crate::model::Register;
