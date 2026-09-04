@@ -10,12 +10,14 @@ use heliobridge::VERSION;
 use heliobridge::config::{Command, Config, LogFormat};
 use heliobridge::control::{self, Registry};
 use heliobridge::growatt::cloud::CloudRelay;
+use heliobridge::growatt::{self};
 use heliobridge::homeassistant::broker::{BrokerConfig, BrokerUrl};
 use heliobridge::homeassistant::command;
 use heliobridge::homeassistant::publisher::Publisher;
 use heliobridge::mqtt::{ClientTls, Trust};
 use heliobridge::record::Recorder;
 use heliobridge::server;
+use heliobridge::server::firmware::FirmwareStore;
 use rustls::ServerConfig;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -279,11 +281,33 @@ impl<'a> Bridge<'a> {
         // Read before binding, so a mistyped allowlist fails at startup rather than after the device has
         // already been refused for an hour.
         let peers = self.config.peers()?;
+        // Also read before binding: asking to fetch firmware with nowhere to put it is a startup mistake.
+        // This is where the vendor implementation meets the settings — composition belongs in `main`, and
+        // it is the only place in the program that names both halves. The store exists either way, so an
+        // advertisement is logged in a default configuration too; keeping one is what the settings add.
+        let firmware = Some(match self.config.firmware()? {
+            Some(settings) => {
+                tracing::info!(
+                    dir = %settings.dir.display(),
+                    fetch = settings.fetch,
+                    max_bytes = settings.max_bytes,
+                    "firmware the cloud advertises will be logged and kept{}",
+                    if settings.fetch { ", downloading it" } else { " once fetching is enabled" }
+                );
+                FirmwareStore::new(Arc::new(growatt::vendor::Growatt)).keeping(
+                    settings.dir,
+                    settings.fetch,
+                    settings.max_bytes,
+                )
+            }
+            None => FirmwareStore::new(Arc::new(growatt::vendor::Growatt)),
+        });
         let options = server::SessionOptions {
             time_push: self.config.should_push_time(),
             cloud: self.cloud,
             policy: self.config.policy(),
             recorder: self.recorder,
+            firmware,
             slots: self.config.slots,
             registry: self.registry,
             devices: self.config.devices(),

@@ -25,8 +25,10 @@ use crate::growatt::cloud::CloudRelay;
 use crate::growatt::policy::Policy;
 use crate::record::Recorder;
 use crate::server::access::{Devices, Peers};
+use crate::server::firmware::FirmwareStore;
 use crate::server::probe;
 use crate::server::session::Session;
+use crate::vendor::Vendor;
 
 /// Why the listener stopped.
 #[derive(Debug, Snafu)]
@@ -46,8 +48,8 @@ pub enum ListenerError {
 ///
 /// Not comparable: it carries a [`Recorder`] handle, and two handles to the same recorder are the same
 /// recorder in every sense that matters, which is not a thing equality can usefully express.
-#[derive(Debug, Clone)]
-pub struct SessionOptions {
+#[derive(Debug)]
+pub struct SessionOptions<V: Vendor> {
     /// Whether to push the server's wall-clock time after the device connects.
     ///
     /// Off only when the cloud's own configuration write is being relayed through, since two parties
@@ -64,6 +66,9 @@ pub struct SessionOptions {
     /// Record every frame, in both directions plus the ones this program originates.
     pub recorder: Option<Recorder>,
 
+    /// Where firmware the cloud advertises is kept, and whether to go and get it.
+    pub firmware: Option<FirmwareStore<V>>,
+
     /// How many schedule slots to read back at startup.
     pub slots: u16,
 
@@ -74,13 +79,31 @@ pub struct SessionOptions {
     pub devices: Devices,
 }
 
-impl Default for SessionOptions {
+// Derived `Clone` would demand `V: Clone`, which a vendor has no reason to be: what is cloned per
+// connection is a handle to it.
+impl<V: Vendor> Clone for SessionOptions<V> {
+    fn clone(&self) -> Self {
+        Self {
+            time_push: self.time_push,
+            cloud: self.cloud.clone(),
+            policy: self.policy,
+            recorder: self.recorder.clone(),
+            firmware: self.firmware.clone(),
+            slots: self.slots,
+            registry: self.registry.clone(),
+            devices: self.devices.clone(),
+        }
+    }
+}
+
+impl<V: Vendor> Default for SessionOptions<V> {
     fn default() -> Self {
         Self {
             time_push: true,
             cloud: None,
             policy: Policy::default(),
             recorder: None,
+            firmware: None,
             slots: 1,
             registry: None,
             devices: Devices::default(),
@@ -94,10 +117,10 @@ impl Default for SessionOptions {
 ///
 /// [`ListenerError::Bind`] if the address is unavailable. Per-connection failures are logged and do not
 /// stop the listener.
-pub async fn serve(
+pub async fn serve<V: Vendor>(
     address: std::net::SocketAddr,
     tls: Arc<ServerConfig>,
-    options: SessionOptions,
+    options: SessionOptions<V>,
     peers: Peers,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), ListenerError> {
@@ -165,7 +188,12 @@ pub async fn serve(
 
 /// Complete the TLS handshake and run one session.
 #[tracing::instrument(skip(stream, acceptor, options), fields(%peer))]
-async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcceptor, options: SessionOptions) {
+async fn handle<V: Vendor>(
+    stream: TcpStream,
+    peer: std::net::SocketAddr,
+    acceptor: TlsAcceptor,
+    options: SessionOptions<V>,
+) {
     // Nagle off: the device waits for small acknowledgements, and delaying a PUBACK to coalesce it with
     // nothing costs latency for no benefit.
     if let Err(error) = stream.set_nodelay(true) {
@@ -210,6 +238,7 @@ async fn handle(stream: TcpStream, peer: std::net::SocketAddr, acceptor: TlsAcce
         .with_cloud(options.cloud)
         .with_policy(options.policy)
         .with_recorder(options.recorder)
+        .with_firmware(options.firmware)
         .with_slots(options.slots)
         .with_registry(options.registry)
         .with_devices(options.devices);
@@ -253,10 +282,11 @@ mod tests {
     use crate::growatt::cloud::{CloudConfig, CloudRelay};
     use crate::growatt::policy::Policy;
     use crate::mqtt::Trust;
+    use crate::vendor::Unknown;
 
     #[test]
     fn defaults_relay_nothing_record_nothing_and_push_time() {
-        let options = SessionOptions::default();
+        let options = SessionOptions::<Unknown>::default();
         assert!(options.time_push, "the vendor server pushes time, so we do too");
         assert!(options.cloud.is_none(), "relaying is opt-in");
         assert!(options.recorder.is_none(), "recording is opt-in");
@@ -267,7 +297,7 @@ mod tests {
         // The clock has one owner. Relaying with the cloud's configuration write passing through makes it
         // the cloud, so the wiring in `main` turns our push off. Nothing here enforces that — it is a
         // policy decision, and this type only carries it.
-        let options = SessionOptions {
+        let options = SessionOptions::<Unknown> {
             time_push: false,
             cloud: Some(CloudRelay {
                 endpoint: CloudConfig::default(),
@@ -275,6 +305,7 @@ mod tests {
             }),
             policy: Policy::OPEN,
             recorder: None,
+            firmware: None,
             slots: 1,
             registry: None,
             devices: Devices::default(),
@@ -287,7 +318,7 @@ mod tests {
     fn nothing_is_filtered_until_a_list_says_so() {
         // Both allowlists are opt-in: the common case is one device on an isolated VLAN, which needs
         // neither, and a default that filtered would lock that device out on upgrade.
-        let options = SessionOptions::default();
+        let options = SessionOptions::<Unknown>::default();
         assert!(options.devices.is_open(), "any serial is served");
         assert!(Peers::default().is_open(), "any address may connect");
         assert!(Peers::default().admits("203.0.113.9".parse().expect("an address")));

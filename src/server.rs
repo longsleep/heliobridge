@@ -25,6 +25,7 @@
 
 pub mod access;
 pub mod clock;
+pub mod firmware;
 pub mod listener;
 pub mod meter;
 pub mod probe;

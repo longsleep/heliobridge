@@ -37,6 +37,8 @@ use crate::mqtt::{Packet, PacketStream, Publish, QoS, StreamError};
 use crate::record::{Recorder, Stream as RecordStream};
 use crate::server::access::Devices;
 use crate::server::clock::{Clock, Skew};
+use crate::server::firmware::FirmwareStore;
+use crate::vendor::Vendor;
 use crate::{TARGET_VALUES, TARGET_WIRE};
 
 /// Keepalive the device asks for: seven minutes.
@@ -136,6 +138,8 @@ pub struct SessionStats {
     pub refused_to_device: u64,
     /// Frames from the device the policy did not forward to the cloud.
     pub withheld_from_cloud: u64,
+    /// Firmware-update advertisements seen from the cloud, refused or not.
+    pub update_campaign: u64,
 }
 
 /// A device session over an established, already-encrypted stream.
@@ -143,7 +147,7 @@ pub struct SessionStats {
 /// Generic over the stream so the whole state machine can be driven over an in-memory duplex in
 /// tests, with no TLS, no sockets and no device.
 #[derive(Debug)]
-pub struct Session<S> {
+pub struct Session<S, V: Vendor> {
     stream: PacketStream<S>,
     device_id: Option<String>,
     subscribed: bool,
@@ -166,6 +170,7 @@ pub struct Session<S> {
     /// caution about telemetry labels is said once rather than per report.
     product: Product,
     recorder: Option<Recorder>,
+    firmware: Option<FirmwareStore<V>>,
     slots: u16,
     /// Registers waiting to be read, each knowing why.
     ///
@@ -249,9 +254,10 @@ enum ReadPurpose {
     },
 }
 
-impl<S> Session<S>
+impl<S, V> Session<S, V>
 where
     S: AsyncRead + AsyncWrite + Unpin,
+    V: Vendor,
 {
     /// Wrap a connected stream, using the host's local clock for the time push.
     pub fn new(stream: S) -> Self {
@@ -280,6 +286,7 @@ where
             identity: None,
             product: Product::Unrecognised,
             recorder: None,
+            firmware: None,
             slots: 1,
 
             awaiting: None,
@@ -316,6 +323,13 @@ where
     #[must_use]
     pub fn with_recorder(mut self, recorder: Option<Recorder>) -> Self {
         self.recorder = recorder;
+        self
+    }
+
+    /// Keep firmware the cloud advertises, or only log that it was advertised.
+    #[must_use]
+    pub fn with_firmware(mut self, firmware: Option<FirmwareStore<V>>) -> Self {
+        self.firmware = firmware;
         self
     }
 
@@ -1368,6 +1382,22 @@ where
     ///
     /// Lives here rather than in [`Intent`]'s `Display`: the policy layer is deliberately
     /// generation-neutral, and the register map is generation 7's.
+    /// Offer the octets of a cloud message to the firmware store, which asks the vendor what they mean.
+    ///
+    /// Every cloud message is offered, not only the ones this session recognises: what an advertisement
+    /// looks like — the framing, the register, the value's shape — belongs entirely to the vendor
+    /// implementation behind [`FirmwareStore`], so a second vendor's campaign would need nothing changed
+    /// here. The common case is that a message is not one, which costs a parse the vendor was going to do
+    /// anyway.
+    fn offer_to_firmware(&mut self, message: &CloudMessage, refused: bool) {
+        let Some(store) = self.firmware.clone() else {
+            return;
+        };
+        if store.offer(&message.payload, refused) {
+            self.stats.update_campaign = self.stats.update_campaign.saturating_add(1);
+        }
+    }
+
     fn intent_field(intent: &Intent) -> Option<&'static str> {
         match intent {
             Intent::WriteConfig { register } => ConfigRegister::lookup(*register).map(|entry| entry.name),
@@ -1547,11 +1577,18 @@ where
             }
         };
 
-        if let Some(refusal) = self
+        let refusal = self
             .policy
             .evaluate(Direction::ToDevice, &intent, Originator::Cloud)
-            .refusal()
-        {
+            .refusal();
+
+        // Offered whether or not it is passed on, and before the refusal returns: an advertised update
+        // names the exact image the vendor considers current for this device, on a channel whose object
+        // names cannot be guessed. The refusal is what keeps it from being installed, not a reason to
+        // ignore it.
+        self.offer_to_firmware(&message, refusal.is_some());
+
+        if let Some(refusal) = refusal {
             self.stats.refused_to_device = self.stats.refused_to_device.saturating_add(1);
             // Recorded as well as counted: filtering the wrong thing is the failure a filter
             // introduces, and it is only auditable if the refusals are kept.
@@ -1661,6 +1698,7 @@ mod tests {
         Timestamp,
     };
     use crate::mqtt::{Connect, Packet, Publish, QoS, Subscribe};
+    use crate::vendor::Unknown;
 
     const SERIAL: &str = "0EXAMPLE00000001";
 
@@ -1724,7 +1762,7 @@ mod tests {
             .await
             .expect("the duplex buffers the whole script");
 
-        let mut session = Session::new(server);
+        let mut session = Session::<_, Unknown>::new(server);
         let stats = session.run().await.expect("session should end cleanly");
         // Dropping the server half is what gives the client its end-of-file below.
         drop(session);
@@ -1753,7 +1791,7 @@ mod tests {
         full.extend_from_slice(&[0xE0, 0x00]);
         client.write_all(&full).await.expect("buffered");
 
-        let mut session = Session::new(server).with_devices(devices);
+        let mut session = Session::<_, Unknown>::new(server).with_devices(devices);
         session.run().await.expect("session should end cleanly");
         drop(session);
 
@@ -1895,7 +1933,8 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         client.write_all(script).await.expect("buffered");
 
-        let mut session = Session::with_clock(server, Clock::from_fn(fixed_clock)).with_time_push(enabled);
+        let mut session =
+            Session::<_, Unknown>::with_clock(server, Clock::from_fn(fixed_clock)).with_time_push(enabled);
 
         // Run until the session ends. The script has no DISCONNECT, so it ends on the read timeout —
         // which tokio's paused clock reaches instantly once the time push has fired.
@@ -2062,7 +2101,7 @@ mod tests {
         script.extend_from_slice(&[0xE0, 0x00]);
         client.write_all(&script).await.expect("buffered");
 
-        let mut session = Session::new(server);
+        let mut session = Session::<_, Unknown>::new(server);
         session.run().await.expect("session");
         assert_eq!(session.device_id(), Some(SERIAL));
     }

@@ -66,6 +66,17 @@ url = "2"
 gethostname = "1.1.0"
 ipnet = "2.11"    # CIDR containment for the source allowlist
 
+# Fetching firmware the cloud advertises. hyper rather than a higher-level client because the request has
+# to look like the datalogger's own: a client that seeds its own `Accept` -- as reqwest does, and cannot be
+# talked out of -- would announce that something other than the device is reading the vendor's CDN. All
+# three are already in the tree behind axum and the TLS stack.
+http = "1"          # the request type, so the vendor-shaped request lives with the vendor knowledge
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+sanitize-filename = "0.6"   # a vendor URL decides a file name; this keeps it a file name
+sha2 = "0.10"               # a digest of what was downloaded, so it can be compared with a known image
+
 [dev-dependencies]
 # `test-util` gives the paused clock, so a test can prove the 4.5-second time push fires without
 # waiting 4.5 seconds. Only enabled for tests.

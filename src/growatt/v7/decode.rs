@@ -306,6 +306,84 @@ pub trait FromFrame: Sized {
     fn from_frame(frame: &Frame) -> Result<Self, DecodeError>;
 }
 
+/// A server-originated write to one or more configuration registers.
+///
+/// The body is a counted list of assignments, and the value of each is **ASCII text whatever the field
+/// means** — a port arrives as `"7006"`. Only the vendor's clock push and its firmware-update campaign have
+/// been seen using it, the first with one entry and the second likewise, but the count is real and the
+/// vendor's own application writes four entries at once when switching to static addressing.
+///
+/// Decoded rather than merely classified because the value is the interesting part: which register a cloud
+/// write targets says little, and what it puts there says everything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigWrite {
+    /// Every assignment the message carries, in order.
+    pub entries: Vec<ConfigAssignment>,
+}
+
+/// One assignment out of a [`ConfigWrite`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigAssignment {
+    /// The configuration register being written.
+    pub register: Register,
+    /// The value, as the text it arrives as. Trailing NULs are stripped; nothing else is interpreted.
+    pub value: String,
+}
+
+impl FromFrame for ConfigWrite {
+    fn from_frame(frame: &Frame) -> Result<Self, DecodeError> {
+        let actual = frame.message_type();
+        ensure!(
+            matches!(actual, MessageType::ConfigWrite),
+            WrongMessageTypeSnafu {
+                expected: MessageType::ConfigWrite,
+                actual,
+            }
+        );
+
+        let body = frame.body();
+        let pair = |offset: usize, field| {
+            let end = offset.saturating_add(2);
+            body.get(offset..end)
+                .and_then(|pair| <[u8; 2]>::try_from(pair).ok())
+                .map(u16::from_be_bytes)
+                .context(TruncatedSnafu {
+                    field,
+                    offset,
+                    end,
+                    available: body.len(),
+                })
+        };
+
+        let count = pair(0, "count")?;
+        let mut entries = Vec::with_capacity(usize::from(count));
+        let mut at = 2usize;
+        for _ in 0..count {
+            // Entry length counts the register, the value length and the value: `value + 4`. It is read
+            // rather than assumed so a longer entry shape skips correctly instead of desynchronising.
+            let entry_len = usize::from(pair(at, "entry length")?);
+            let register = Register(pair(at.saturating_add(2), "register")?);
+            let value_len = usize::from(pair(at.saturating_add(4), "value length")?);
+            let start = at.saturating_add(6);
+            let end = start.saturating_add(value_len);
+            let raw = body.get(start..end).context(TruncatedSnafu {
+                field: "value",
+                offset: start,
+                end,
+                available: body.len(),
+            })?;
+            entries.push(ConfigAssignment {
+                register,
+                value: String::from_utf8_lossy(raw).trim_end_matches('\0').to_owned(),
+            });
+            at = at
+                .saturating_add(2)
+                .saturating_add(entry_len.max(value_len.saturating_add(4)));
+        }
+        Ok(Self { entries })
+    }
+}
+
 /// The hourly settings snapshot: the device's own view of its holding registers.
 ///
 /// The device sends this unprompted, about once an hour, and it is the only message that reports the
@@ -563,8 +641,83 @@ impl TryFrom<&Frame> for Telemetry {
 
 #[cfg(test)]
 mod tests {
-    use super::{FromFrame, RECORD_MARKER_TELEMETRY, Telemetry, Timestamp};
+    use super::{ConfigWrite, FromFrame, RECORD_MARKER_TELEMETRY, Telemetry, Timestamp};
     use crate::growatt::v7::frame::{Frame, MessageType};
+    use crate::model::Register;
+
+    /// One config-write entry, as the vendor lays it out: entry length, register, value length, value.
+    fn config_entry(register: u16, value: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        let length = u16::try_from(value.len().saturating_add(4)).expect("a short value");
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&register.to_be_bytes());
+        out.extend_from_slice(&u16::try_from(value.len()).expect("a short value").to_be_bytes());
+        out.extend_from_slice(value.as_bytes());
+        out
+    }
+
+    fn config_write(entries: &[(u16, &str)]) -> Frame {
+        let mut body = u16::try_from(entries.len())
+            .expect("few entries")
+            .to_be_bytes()
+            .to_vec();
+        for (register, value) in entries {
+            body.extend_from_slice(&config_entry(*register, value));
+        }
+        Frame::new(MessageType::ConfigWrite, "0EXAMPLE00000001", &body).expect("build")
+    }
+
+    #[test]
+    fn the_clock_push_decodes_as_one_assignment() {
+        // The specification's own worked example of this message: register 31, a 19-character timestamp.
+        let frame = config_write(&[(31, "2026-08-08 02:10:29")]);
+        let decoded = ConfigWrite::from_frame(&frame).expect("decodes");
+        assert_eq!(decoded.entries.len(), 1);
+        assert_eq!(decoded.entries[0].register, Register(31));
+        assert_eq!(decoded.entries[0].value, "2026-08-08 02:10:29");
+    }
+
+    #[test]
+    fn the_update_campaign_carries_its_url_as_text() {
+        // What the vendor's cloud writes to register 80, hourly, verbatim from a capture.
+        let url =
+            "1#type01#http://cdn.growatt.com/update/device/GB/manualUpgrade/7ca7/1eacd/f37825/R-D/WIFI/4.0.2.6.bin";
+        let decoded = ConfigWrite::from_frame(&config_write(&[(80, url)])).expect("decodes");
+        assert_eq!(decoded.entries[0].register, Register(80));
+        assert_eq!(decoded.entries[0].value, url);
+    }
+
+    #[test]
+    fn several_assignments_in_one_message_all_decode() {
+        // Never seen from the vendor's server, but its own application writes four at once, so the count
+        // is not decoration.
+        let decoded = ConfigWrite::from_frame(&config_write(&[
+            (14, "192.168.5.10"),
+            (25, "255.255.255.0"),
+            (26, "192.168.5.1"),
+            (71, "1"),
+        ]))
+        .expect("decodes");
+        assert_eq!(decoded.entries.len(), 4);
+        assert_eq!(decoded.entries[3].register, Register(71));
+        assert_eq!(decoded.entries[3].value, "1");
+    }
+
+    #[test]
+    fn a_truncated_value_is_an_error_rather_than_a_short_string() {
+        // A value that runs past the body would otherwise decode as a plausible shorter one.
+        let mut body = 1u16.to_be_bytes().to_vec();
+        body.extend_from_slice(&config_entry(80, "http://example.invalid/f.bin"));
+        body.truncate(body.len() - 6);
+        let frame = Frame::new(MessageType::ConfigWrite, "0EXAMPLE00000001", &body).expect("build");
+        assert!(ConfigWrite::from_frame(&frame).is_err());
+    }
+
+    #[test]
+    fn a_frame_of_another_type_is_refused() {
+        let frame = Frame::new(MessageType::Telemetry, "0EXAMPLE00000001", &[0; 8]).expect("build");
+        assert!(ConfigWrite::from_frame(&frame).is_err());
+    }
 
     #[test]
     fn rejects_a_frame_of_the_wrong_type() {

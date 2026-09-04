@@ -15,7 +15,59 @@ use crate::homeassistant::command::Permitted;
 use crate::homeassistant::publisher::{self, PublisherOptions};
 use crate::homeassistant::topics::{self, Topics};
 use crate::record::{self, RecorderConfig};
+
 use crate::server::access::{Devices, Peers};
+
+/// Command-line and environment options for firmware the cloud advertises.
+///
+/// A group of its own rather than three more fields on [`Config`]: they belong together, and a settings
+/// type that is only ever read as a whole is easier to pass around than three loose values.
+#[derive(Debug, Clone, clap::Args)]
+pub struct FirmwareOptions {
+    /// Keep firmware the cloud advertises here. Off unless set.
+    ///
+    /// The cloud writes an update URL into datalogger configuration register 80, which this program
+    /// refuses to pass on. Advertisements arrive on the relay's cloud-to-device path, so this and the
+    /// logging alike need `--cloud-relay`; without it the device never hears from the vendor's cloud
+    /// through this program. Given a relay the advertisement is logged in full whether or not anything is
+    /// kept; setting this directory *and* `--fetch-firmware` additionally downloads the image and keeps
+    /// it, which is the only thing here that reaches out to a vendor host. Nothing installs it.
+    #[arg(long = "firmware-dir", env = "HELIOBRIDGE_FIRMWARE_DIR", value_parser = path_allowing_empty)]
+    pub dir: Option<PathBuf>,
+
+    /// Download advertised firmware rather than only logging its URL. Off by default.
+    ///
+    /// Needs `--firmware-dir`. An image already on disk is left alone, so an hourly campaign costs one
+    /// download rather than one an hour.
+    #[arg(long = "fetch-firmware", env = "HELIOBRIDGE_FETCH_FIRMWARE", default_value_t = false)]
+    pub fetch: bool,
+
+    /// Cap on a single firmware download, in bytes.
+    ///
+    /// The datalogger image is about 1.6 MB and the largest component bundle seen is 1.2 MB, so the
+    /// default leaves room for a considerably larger release while still refusing a response that is
+    /// clearly not firmware.
+    #[arg(
+        long = "firmware-max-bytes",
+        env = "HELIOBRIDGE_FIRMWARE_MAX_BYTES",
+        default_value_t = 16 * 1024 * 1024
+    )]
+    pub max_bytes: u64,
+}
+
+/// Where advertised firmware is kept, and whether to go and get it.
+///
+/// Settings only: pairing them with a vendor implementation that can recognise an advertisement happens
+/// where the program is composed, not here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirmwareSettings {
+    /// Directory to keep images in.
+    pub dir: PathBuf,
+    /// Whether to download, rather than only log what was advertised.
+    pub fetch: bool,
+    /// Cap on a single transfer.
+    pub max_bytes: u64,
+}
 
 /// Default device-facing listener address.
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:7006";
@@ -116,6 +168,10 @@ pub struct Config {
     /// socket, so a later, better decoder can re-read them.
     #[arg(long, env = "HELIOBRIDGE_RECORD_DIR", value_parser = path_allowing_empty)]
     pub record_dir: Option<PathBuf>,
+
+    /// Firmware the cloud advertises: whether to keep it, and where.
+    #[command(flatten)]
+    pub firmware: FirmwareOptions,
 
     /// Serve the control API on this Unix socket. Off unless set.
     ///
@@ -339,6 +395,7 @@ impl Config {
         self.tls_cert = given_path(self.tls_cert);
         self.tls_key = given_path(self.tls_key);
         self.record_dir = given_path(self.record_dir);
+        self.firmware.dir = given_path(self.firmware.dir.take());
         self.control_socket = given_path(self.control_socket);
         self.mqtt_url = given(self.mqtt_url);
         self.mqtt_user = given(self.mqtt_user);
@@ -463,6 +520,29 @@ impl Config {
             dir: dir.clone(),
             max_bytes: self.record_max_bytes,
         })
+    }
+
+    /// Where advertised firmware goes and whether to fetch it, or `None` when nothing is kept.
+    ///
+    /// Deliberately not a [`FirmwareStore`](crate::server::firmware::FirmwareStore): that needs a vendor
+    /// implementation to recognise an advertisement, and choosing one is composition, which belongs where
+    /// the program is assembled rather than in the settings it was assembled from.
+    ///
+    /// # Errors
+    ///
+    /// A message if fetching was asked for without a directory to fetch into. That is a configuration
+    /// mistake worth naming rather than a silent no-op, the same treatment [`Self::tls_pair`] gives half
+    /// a certificate.
+    pub fn firmware(&self) -> Result<Option<FirmwareSettings>, &'static str> {
+        match (self.firmware.dir.as_ref(), self.firmware.fetch) {
+            (None, true) => Err("--fetch-firmware needs --firmware-dir to fetch into"),
+            (None, false) => Ok(None),
+            (Some(dir), fetch) => Ok(Some(FirmwareSettings {
+                dir: dir.clone(),
+                fetch,
+                max_bytes: self.firmware.max_bytes,
+            })),
+        }
     }
 
     /// Whether both halves of a supplied certificate are present.

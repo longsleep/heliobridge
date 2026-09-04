@@ -1281,7 +1281,7 @@ impl Api {
         });
 
         (
-            [(axum::http::header::CONTENT_TYPE, "application/jsonl")],
+            [(http::header::CONTENT_TYPE, "application/jsonl")],
             axum::body::Body::from_stream(ReceiverStream::new(rx)),
         )
             .into_response()
@@ -1602,8 +1602,8 @@ fn problem(code: StatusCode, detail: &str) -> Response {
     });
     let mut response = (code, axum::Json(body)).into_response();
     response.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/problem+json"),
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/problem+json"),
     );
     response
 }

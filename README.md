@@ -94,6 +94,9 @@ regenerated when missing. Point `HELIOBRIDGE_STATE_DIR` somewhere durable to kee
 | `HELIOBRIDGE_CLOUD_RELAY` | off | Relay to the vendor cloud |
 | `HELIOBRIDGE_RELAY_MODE` | `controls` | How much authority the cloud keeps |
 | `HELIOBRIDGE_RELAY_ANSWERS` | `cloud-only` | Which answers to earlier commands reach the cloud |
+| `HELIOBRIDGE_FIRMWARE_DIR` | off | Keep firmware the cloud advertises here |
+| `HELIOBRIDGE_FETCH_FIRMWARE` | `false` | Download the advertised image, rather than only logging its URL |
+| `HELIOBRIDGE_FIRMWARE_MAX_BYTES` | `16777216` | Cap on a single firmware download |
 | `HELIOBRIDGE_RECORD_DIR` | off | Record raw frames for analysis |
 | `HELIOBRIDGE_LOG` | `info` | Tracing filter, per subsystem |
 
@@ -513,3 +516,33 @@ better than this one:
 Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE).
 
 Copyright 2026 Simon Eisenmann. See [NOTICE](NOTICE).
+
+## Firmware the cloud advertises
+
+The vendor's cloud advertises a firmware update by writing a URL into datalogger configuration register 80,
+about once an hour until the device installs it. The relay policy refuses cloud writes to the configuration
+space, so it never reaches the device.
+
+**This needs `HELIOBRIDGE_CLOUD_RELAY`.** An advertisement arrives on the relay's cloud-to-device path;
+without a relay the device never hears from the vendor's cloud through this program, so there is nothing to
+notice and nothing to fetch.
+
+With a relay, the advertisement is logged in full whether or not anything is kept, URL included:
+
+```
+the cloud advertised a firmware update source="configuration register 80"
+  url=http://cdn.growatt.com/update/device/GB/manualUpgrade/…/WIFI/4.0.2.6.bin
+  file=WIFI-4.0.2.6.bin refused=true fetch=false
+```
+
+`HELIOBRIDGE_FIRMWARE_DIR` keeps the image as well, and `HELIOBRIDGE_FETCH_FIRMWARE=true` downloads it.
+Fetching is off by default: an advertisement is traffic that arrives anyway, while downloading reaches out
+to a vendor host. An image already on disk is left alone, so an hourly campaign costs one download. The
+transfer is capped, is written under a temporary name and renamed once complete, and its SHA-256 is logged
+so the file can be compared with an image already held.
+
+The request presents the same user agent and cache directive the datalogger's own firmware sends, and
+nothing else — this program does not announce itself to the vendor's CDN.
+
+**Nothing installs firmware.** The image is stored and that is all.
+
