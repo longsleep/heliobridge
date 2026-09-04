@@ -57,7 +57,7 @@ impl DeviceBlock {
                 report
                     .entries
                     .iter()
-                    .find(|entry| entry.name == Some(name))
+                    .find(|entry| entry.name.as_deref() == Some(name))
                     .map(|entry| entry.value.clone())
             })
         };
@@ -360,7 +360,7 @@ mod tests {
                 .iter()
                 .map(|(name, value)| ConfigView {
                     register: 0,
-                    name: Some(name),
+                    name: Some((*name).to_owned()),
                     role: None,
                     value: (*value).to_owned(),
                 })

@@ -116,7 +116,7 @@ impl StatePayload {
     pub fn config(entries: &[ConfigView], fields: &Fields) -> Self {
         let mut object = Map::new();
         for entry in entries {
-            let Some(name) = entry.name else { continue };
+            let Some(name) = entry.name.as_deref() else { continue };
             if !fields.contains(name) {
                 continue;
             }

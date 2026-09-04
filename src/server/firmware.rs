@@ -393,8 +393,10 @@ mod tests {
     impl Wire for Fake {
         type Frame<'a> = &'a str;
 
-        fn parse<'a>(&self, payload: &'a [u8]) -> Option<Self::Frame<'a>> {
-            std::str::from_utf8(payload).ok()
+        fn read<'a>(&self, payload: &'a [u8]) -> Result<Self::Frame<'a>, crate::driver::Unreadable> {
+            std::str::from_utf8(payload).map_err(|error| crate::driver::Unreadable::Malformed {
+                reason: error.to_string(),
+            })
         }
     }
 

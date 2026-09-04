@@ -13,7 +13,8 @@
 //!
 //! # One capability per trait, one bundle to name them
 //!
-//! The seam is split by capability — [`Wire`] for framing, [`Arbiter`] for what a frame is trying to do,
+//! The seam is split by capability — [`Wire`] for framing, [`Report`] for what a frame says, [`Arbiter`]
+//! for what it is trying to do,
 //! [`Firmware`] for update campaigns, [`Upstream`] for the manufacturer's cloud, and more to come — rather than gathered into a single wide trait. A consumer bounds on the capability it uses and
 //! nothing else, which keeps its requirements legible: `server::firmware` needs [`Firmware`], and the fact
 //! that it needs nothing else is worth being able to see.
@@ -41,22 +42,24 @@
 
 pub mod arbiter;
 pub mod firmware;
+pub mod report;
 pub mod upstream;
 pub mod wire;
 
 pub use arbiter::{Arbiter, Direction, Intent, Policy};
 pub use firmware::{AdvertisedFirmware, Firmware};
+pub use report::{Report, Sink};
 pub use upstream::{Endpoint, Message, Relay, Target, Upstream};
-pub use wire::Wire;
+pub use wire::{Unreadable, Wire};
 
 /// Everything the server asks of a driver.
 ///
 /// A bundle rather than a trait in its own right: it has no methods, and a blanket impl gives it to any
 /// type implementing every capability. Bound on this where a whole driver is meant — a session — and on a
 /// single capability everywhere else.
-pub trait Driver: Wire + Arbiter + Firmware + Upstream {}
+pub trait Driver: Wire + Arbiter + Firmware + Report + Upstream {}
 
-impl<T> Driver for T where T: Wire + Arbiter + Firmware + Upstream {}
+impl<T> Driver for T where T: Wire + Arbiter + Firmware + Report + Upstream {}
 
 /// A driver that recognises nothing.
 ///
@@ -71,9 +74,16 @@ impl Wire for Unknown {
     /// Nothing parses, so there is nothing to describe.
     type Frame<'a> = ();
 
-    fn parse<'a>(&self, _payload: &'a [u8]) -> Option<Self::Frame<'a>> {
-        None
+    fn read<'a>(&self, _payload: &'a [u8]) -> Result<Self::Frame<'a>, Unreadable> {
+        Err(Unreadable::Unsupported {
+            generation: "none: this driver reads nothing".to_owned(),
+        })
     }
+}
+
+impl Report for Unknown {
+    /// Unreachable in practice: nothing parses, so there is never a frame to report on.
+    fn report(&self, _frame: &Self::Frame<'_>, _to: &mut dyn Sink) {}
 }
 
 impl Arbiter for Unknown {

@@ -686,7 +686,7 @@ impl Link {
             .as_ref()?
             .entries
             .iter()
-            .find(|entry| entry.name == Some("sw_version"))
+            .find(|entry| entry.name.as_deref() == Some("sw_version"))
             .map(|entry| entry.value.clone())?;
 
         // Read off the borrow rather than binding it, so the guard lives for the statement and no longer.

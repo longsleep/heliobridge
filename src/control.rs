@@ -278,10 +278,10 @@ impl SettingView {
 pub struct ConfigView {
     /// Config register number. Its own address space: config 31 is the clock, holding 31 is nothing.
     pub register: u16,
-    /// Documented field name, or `null` for a key this build cannot name.
-    pub name: Option<&'static str>,
+    /// Documented field name, or `null` for a key the driver cannot name.
+    pub name: Option<String>,
     /// What the field is for: identity, metadata, dynamic, endpoint, inert, or `null` when unknown.
-    pub role: Option<&'static str>,
+    pub role: Option<String>,
     /// The value as sent. ASCII on the wire whatever the field means.
     pub value: String,
 }
@@ -1092,7 +1092,7 @@ impl Api {
         let field = |name: &str| {
             identity
                 .as_ref()
-                .and_then(|report| report.entries.iter().find(|entry| entry.name == Some(name)))
+                .and_then(|report| report.entries.iter().find(|entry| entry.name.as_deref() == Some(name)))
                 .map(|entry| entry.value.clone())
         };
         axum::Json(serde_json::json!({

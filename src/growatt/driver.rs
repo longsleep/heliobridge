@@ -10,11 +10,13 @@
 //! would change.
 
 use crate::driver::arbiter::{Arbiter, Direction, Intent};
+use crate::driver::report::{Report, Sink};
 use crate::driver::upstream::{Endpoint, Target, Upstream};
-use crate::driver::{AdvertisedFirmware, Firmware, Wire};
+use crate::driver::{AdvertisedFirmware, Firmware, Unreadable, Wire};
 use crate::growatt::cloud::{self, Relay, RelayError};
-use crate::growatt::firmware;
 use crate::growatt::v7::frame::Frame;
+use crate::growatt::{Codec, peek_version};
+use crate::growatt::{firmware, report};
 
 /// Growatt's generation-7 protocol.
 #[derive(Debug, Clone, Copy, Default)]
@@ -23,8 +25,28 @@ pub struct Growatt;
 impl Wire for Growatt {
     type Frame<'a> = Frame;
 
-    fn parse<'a>(&self, payload: &'a [u8]) -> Option<Self::Frame<'a>> {
-        Frame::parse(payload).ok()
+    fn read<'a>(&self, payload: &'a [u8]) -> Result<Self::Frame<'a>, Unreadable> {
+        // The generation is discovered before committing to a parser, so one this build does not implement
+        // is reported as unsupported rather than as corruption.
+        match peek_version(payload) {
+            None => return Err(Unreadable::TooShort),
+            Some(version) if Codec::for_version(version).is_none() => {
+                return Err(Unreadable::Unsupported {
+                    generation: version.to_string(),
+                });
+            }
+            Some(_) => {}
+        }
+
+        Frame::parse(payload).map_err(|error| Unreadable::Malformed {
+            reason: error.to_string(),
+        })
+    }
+}
+
+impl Report for Growatt {
+    fn report(&self, frame: &Self::Frame<'_>, to: &mut dyn Sink) {
+        report::report(frame, to);
     }
 }
 

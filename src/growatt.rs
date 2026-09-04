@@ -45,6 +45,7 @@ pub mod driver;
 pub mod firmware;
 pub mod header;
 pub mod product;
+pub mod report;
 pub mod v7;
 
 use core::fmt;

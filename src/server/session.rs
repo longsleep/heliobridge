@@ -26,14 +26,12 @@ use crate::control::{
 };
 use crate::driver::Driver;
 use crate::driver::arbiter::{CloudCommands, Direction, Intent, Originator, Policy};
+use crate::driver::report::{Sink, Snapshot, Telemetry, WriteAck};
 use crate::driver::upstream::{Message as CloudMessage, Relay as _, Target};
+use crate::driver::wire::Unreadable;
 use crate::growatt::product::Product;
-use crate::growatt::v7::decode::{FromFrame, ReadResponse, SettingsSnapshot, Telemetry, WriteAck};
 use crate::growatt::v7::encode::{Command, EncodeError};
-use crate::growatt::v7::frame::{Frame, MessageType};
-use crate::growatt::v7::identity::Identity;
-use crate::growatt::v7::registers::{ConfigRegister, HoldingRegister, Role as ConfigRole};
-use crate::growatt::{Codec, peek_version};
+use crate::growatt::v7::registers::{ConfigRegister, HoldingRegister};
 use crate::model::{Confidence, Hex, Raw, Register, Timestamp, Unit};
 use crate::mqtt::{Packet, PacketStream, Publish, QoS, StreamError};
 use crate::record::{Recorder, Stream as RecordStream};
@@ -41,6 +39,168 @@ use crate::server::access::Devices;
 use crate::server::clock::{Clock, Skew};
 use crate::server::firmware::FirmwareStore;
 use crate::{TARGET_VALUES, TARGET_WIRE};
+
+/// What the device last said about itself, kept between reports.
+///
+/// An owned copy of what a driver told us, because a report is borrowed for the length of one call and
+/// this outlives many. Fields are stored as reported: naming them, or deciding which matter, is the
+/// driver's business and has already happened.
+#[derive(Debug, Clone, Default)]
+struct Described {
+    /// How many fields the last full report declared.
+    declared: u16,
+    /// Whether that report ran out early.
+    truncated: bool,
+    /// Where the device believes it should connect.
+    endpoint: Option<String>,
+    /// The driver's one-line summary, as logged.
+    summary: String,
+    /// Every field reported, in the order sent.
+    fields: Vec<DescribedField>,
+}
+
+/// One field of [`Described`].
+#[derive(Debug, Clone)]
+struct DescribedField {
+    register: Register,
+    name: Option<String>,
+    role: Option<String>,
+    value: String,
+}
+
+impl Described {
+    /// Take a report as the device's description of itself.
+    fn absorb(&mut self, report: &crate::driver::report::Identity<'_>) {
+        let fields: Vec<_> = report
+            .fields
+            .iter()
+            .map(|field| DescribedField {
+                register: field.register,
+                name: field.name.map(str::to_owned),
+                role: field.role.map(str::to_owned),
+                value: field.value.to_owned(),
+            })
+            .collect();
+
+        // A report carrying fewer fields than are held is the answer to a question about one of them, not a
+        // fresh description of the device: fold it in rather than letting one field replace thirty-two.
+        if fields.len() < self.fields.len() {
+            for field in fields {
+                match self.fields.iter_mut().find(|held| held.register == field.register) {
+                    Some(held) => *held = field,
+                    None => self.fields.push(field),
+                }
+            }
+            return;
+        }
+
+        self.declared = report.declared;
+        self.truncated = report.truncated;
+        self.endpoint.clone_from(&report.endpoint);
+        self.summary.clone_from(&report.summary);
+        self.fields = fields;
+    }
+
+    /// One field's value by name.
+    fn get(&self, name: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|field| field.name.as_deref() == Some(name))
+            .map(|field| field.value.as_str())
+    }
+}
+
+/// One frame being reported, and the session it is being reported to.
+///
+/// The driver calls the methods below; each is the session's answer to one thing a frame can say. The
+/// payload rides along so that a frame nobody recognises can still be dumped — the one case where the
+/// octets say more than the decoding did.
+struct Reported<'a, S, D: Driver> {
+    session: &'a mut Session<S, D>,
+    payload: &'a [u8],
+}
+
+impl<S, D: Driver> Sink for Reported<'_, S, D>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn telemetry(&mut self, telemetry: &Telemetry<'_>) {
+        if telemetry.buffered {
+            // Decoded, deliberately not published. This is a sample the device took earlier and held until
+            // it could reach a server — observed 68 minutes stale — so feeding it to the live state would
+            // replace good readings with old ones each time a session starts. Logged with its own timestamp
+            // so a gap in history is at least visible; filling that gap needs somewhere to put it.
+            self.session.stats.buffered = self.session.stats.buffered.saturating_add(1);
+            tracing::info!(
+                recorded = telemetry.at.map(|stamp| stamp.to_string()),
+                readings = telemetry.readings.len(),
+                "a telemetry record replayed from the device's archive, not current state"
+            );
+            return;
+        }
+
+        self.session.stats.telemetry = self.session.stats.telemetry.saturating_add(1);
+        // Kept as the only independent reference for our own clock. A zero timestamp is reported
+        // occasionally and must not overwrite a good reading with nothing.
+        if let Some(stamp) = telemetry.at.filter(|stamp| stamp.is_plausible()) {
+            self.session.device_time = Some(stamp);
+        }
+        self.session.log_telemetry(telemetry);
+        self.session.publish_telemetry(telemetry);
+        // Cheap, and telemetry is the only regular tick a session has: it is what keeps the clock
+        // comparison and the counts on the device resource current.
+        self.session.publish_status();
+    }
+
+    fn identity(&mut self, identity: &crate::driver::report::Identity<'_>) {
+        self.session.accept_identity(identity);
+    }
+
+    fn read_answer(&mut self, register: Register, value: Raw) {
+        self.session.stats.reads = self.session.stats.reads.saturating_add(1);
+        self.session.accept_read(register, value);
+    }
+
+    /// Informative rather than authoritative: an acknowledgement can report acceptance for a value the
+    /// device clamped, so the read-back still decides. A refusal is worth saying out loud, though — it is
+    /// the one case where the device volunteers that it did not do as asked.
+    fn write_ack(&mut self, ack: &WriteAck) {
+        if ack.accepted {
+            tracing::debug!(
+                start = %ack.first,
+                end = %ack.last,
+                value = ack.value.map_or_else(|| "none".to_owned(), |raw| raw.get().to_string()),
+                "device acknowledged a write"
+            );
+        } else {
+            tracing::warn!(
+                start = %ack.first,
+                end = %ack.last,
+                status = ack.status,
+                "device refused a write"
+            );
+        }
+    }
+
+    fn snapshot(&mut self, snapshot: &Snapshot<'_>) {
+        self.session.accept_snapshot(snapshot);
+    }
+
+    fn undecoded(&mut self, kind: &str, len: usize) {
+        self.session.stats.undecoded = self.session.stats.undecoded.saturating_add(1);
+        tracing::info!(kind, len, "received a frame this build does not decode yet");
+    }
+
+    fn unknown(&mut self, kind: &str, len: usize) {
+        self.session.stats.undecoded = self.session.stats.undecoded.saturating_add(1);
+        tracing::warn!(kind, len, dump = %Hex(self.payload), "unrecognised message type");
+    }
+
+    fn unreadable(&mut self, kind: &str, error: &dyn core::fmt::Display) {
+        self.session.stats.rejected = self.session.stats.rejected.saturating_add(1);
+        tracing::warn!(kind, %error, "could not decode a frame this build recognises");
+    }
+}
 
 /// Keepalive the device asks for: seven minutes.
 pub const DEVICE_KEEPALIVE: Duration = Duration::from_mins(7);
@@ -168,7 +328,7 @@ pub struct Session<S, D: Driver> {
     /// Cloud commands awaiting an answer, so answers to ours are not forwarded.
     cloud_commands: CloudCommands,
     /// What the datalogger last said about itself: firmware, model, signal, endpoint.
-    identity: Option<Identity>,
+    identity: Option<Described>,
     /// The product, as last identified from an identity report. Held so a change is noticed and the
     /// caution about telemetry labels is said once rather than per report.
     product: Product,
@@ -598,12 +758,12 @@ where
         Ok(Flow::Continue)
     }
 
-    /// Parse one protocol frame from a PUBLISH payload, logging why if it cannot be read.
+    /// Read one protocol frame from a PUBLISH payload, logging why if it cannot be read.
     ///
-    /// Separate from [`Self::handle_frame`] because the relay needs the parsed frame too, and parsing the
-    /// same octets twice per telemetry frame to serve two callers would be waste. A `None` still reaches the
+    /// Separate from [`Self::handle_frame`] because the relay needs the frame too, and reading the same
+    /// octets twice per telemetry frame to serve two callers would be waste. A `None` still reaches the
     /// cloud: an unreadable frame classifies as unrecognised, and the uplink deliberately fails open.
-    fn parse_frame(&mut self, topic: &str, payload: &[u8]) -> Option<Frame> {
+    fn parse_frame<'p>(&mut self, topic: &str, payload: &'p [u8]) -> Option<D::Frame<'p>> {
         tracing::trace!(
             target: TARGET_WIRE,
             direction = "rx",
@@ -613,143 +773,44 @@ where
             Hex(payload)
         );
 
-        // Discover the generation before committing to a parser, so an unimplemented one is reported
-        // as unsupported rather than as corruption.
-        match peek_version(payload) {
-            Some(version) if Codec::for_version(version).is_some() => {}
-            Some(version) => {
-                self.stats.rejected = self.stats.rejected.saturating_add(1);
-                tracing::warn!(
-                    %version,
-                    len = payload.len(),
-                    "unsupported protocol generation; ignoring the frame"
-                );
-                return None;
-            }
-            None => {
-                self.stats.rejected = self.stats.rejected.saturating_add(1);
-                tracing::warn!(len = payload.len(), "payload too short to be a frame");
-                return None;
-            }
-        }
-
-        match Frame::parse(payload) {
+        match self.driver.read(payload) {
             Ok(frame) => {
                 self.stats.frames = self.stats.frames.saturating_add(1);
                 Some(frame)
             }
-            Err(error) => {
+            Err(unreadable) => {
                 self.stats.rejected = self.stats.rejected.saturating_add(1);
-                // At warn with a hex dump rather than dropped: this is how the next unknown gets
-                // characterised.
-                tracing::warn!(
-                    %error,
-                    len = payload.len(),
-                    dump = %Hex(payload),
-                    "rejected a frame"
-                );
+                match unreadable {
+                    // Ordinary enough not to warrant a dump: something else is publishing on the topic, or
+                    // the device speaks a generation this build does not.
+                    Unreadable::TooShort | Unreadable::Unsupported { .. } => {
+                        tracing::warn!(%unreadable, len = payload.len(), "ignoring a payload that is not a frame");
+                    }
+                    // At warn with a hex dump rather than dropped: this is how the next unknown gets
+                    // characterised.
+                    Unreadable::Malformed { .. } => tracing::warn!(
+                        %unreadable,
+                        len = payload.len(),
+                        dump = %Hex(payload),
+                        "rejected a frame"
+                    ),
+                }
                 None
             }
         }
     }
 
-    /// Act on one parsed frame from the device.
-    fn handle_frame(&mut self, frame: &Frame, payload: &[u8]) {
-        let message_type = frame.message_type();
-
-        match message_type {
-            MessageType::Telemetry => match Telemetry::from_frame(frame) {
-                Ok(telemetry) => {
-                    self.stats.telemetry = self.stats.telemetry.saturating_add(1);
-                    // Kept as the only independent reference for our own clock. A zero timestamp is
-                    // reported occasionally and must not overwrite a good reading with nothing.
-                    if let Some(stamp) = telemetry.timestamp.filter(|t| t.is_plausible()) {
-                        self.device_time = Some(stamp);
-                    }
-                    self.log_telemetry(&telemetry);
-                    self.publish_telemetry(&telemetry);
-                    // Cheap, and telemetry is the only regular tick a session has: it is what keeps the
-                    // clock comparison and the counts on the device resource current.
-                    self.publish_status();
-                }
-                Err(error) => {
-                    self.stats.rejected = self.stats.rejected.saturating_add(1);
-                    tracing::warn!(%error, "could not decode telemetry");
-                }
-            },
-
-            MessageType::ReadSingleRegister => match ReadResponse::from_frame(frame) {
-                Ok(response) => {
-                    self.stats.reads = self.stats.reads.saturating_add(1);
-                    self.accept_read(response);
-                }
-                Err(error) => {
-                    self.stats.rejected = self.stats.rejected.saturating_add(1);
-                    tracing::warn!(%error, "could not decode a read response");
-                }
-            },
-
-            MessageType::WriteSingleRegister | MessageType::WriteRegisterRange => self.accept_write_ack(frame),
-
-            // Known message types this codec cannot decode yet. Counted and named so their arrival is
-            // visible rather than silent.
-            // The unsolicited report and the answer to a config read, which share a body layout: one carries
-            // everything the device knows about itself, the other the single register asked for.
-            MessageType::IdentityReport | MessageType::ConfigRead => match Identity::from_frame(frame) {
-                Ok(identity) => self.accept_identity(identity),
-                Err(error) => {
-                    self.stats.rejected = self.stats.rejected.saturating_add(1);
-                    tracing::warn!(%error, "could not decode the identity report");
-                }
-            },
-
-            // Decoded, deliberately not published. This is a sample the device took earlier and held until
-            // it could reach a server — observed 68 minutes stale — so feeding it to the live state would
-            // replace good readings with old ones each time a session starts. Logged with its own timestamp
-            // so a gap in history is at least visible; filling that gap needs somewhere to put it.
-            MessageType::BufferedTelemetry => match Telemetry::from_frame(frame) {
-                Ok(telemetry) => {
-                    self.stats.buffered = self.stats.buffered.saturating_add(1);
-                    tracing::info!(
-                        recorded = telemetry.timestamp.map(|stamp| stamp.to_string()),
-                        readings = telemetry.readings.len(),
-                        "a telemetry record replayed from the device's archive, not current state"
-                    );
-                }
-                Err(error) => {
-                    self.stats.rejected = self.stats.rejected.saturating_add(1);
-                    tracing::warn!(%error, "could not decode a buffered telemetry record");
-                }
-            },
-
-            MessageType::SettingsSnapshot => match SettingsSnapshot::from_frame(frame) {
-                Ok(snapshot) => self.accept_snapshot(&snapshot),
-                Err(error) => {
-                    self.stats.rejected = self.stats.rejected.saturating_add(1);
-                    tracing::warn!(%error, "could not decode a settings snapshot");
-                }
-            },
-
-            MessageType::ConfigWrite => {
-                self.stats.undecoded = self.stats.undecoded.saturating_add(1);
-                tracing::info!(
-                    %message_type,
-                    len = frame.wire_len(),
-                    "received a frame this build does not decode yet"
-                );
-            }
-
-            MessageType::Unrecognised { address, function } => {
-                self.stats.undecoded = self.stats.undecoded.saturating_add(1);
-                tracing::warn!(
-                    address = format_args!("{address:#04x}"),
-                    function = format_args!("{function:#04x}"),
-                    len = frame.wire_len(),
-                    dump = %Hex(payload),
-                    "unrecognised message type"
-                );
-            }
-        }
+    /// Act on one frame from the device.
+    ///
+    /// The driver does the reading and calls back; everything the session does about a frame is in its
+    /// [`Sink`] implementation. The payload travels alongside so that a frame nobody recognises can still
+    /// be dumped, which is the one case where the octets say more than the decoding did.
+    fn handle_frame(&mut self, frame: &D::Frame<'_>, payload: &[u8]) {
+        // Cloned so the driver is not borrowed from `self` while `self` is handed to it as the sink. An
+        // `Arc` clone per frame is nothing beside decoding one.
+        let driver = Arc::clone(&self.driver);
+        let mut reported = Reported { session: self, payload };
+        driver.report(frame, &mut reported);
     }
 
     /// Publish the server's wall-clock time to the device.
@@ -968,17 +1029,17 @@ where
     }
 
     /// Record a value the device reported, and move the sequence along.
-    fn accept_read(&mut self, response: ReadResponse) {
+    fn accept_read(&mut self, register: Register, raw: Raw) {
         let expected = self.awaiting.as_ref().map(|read| read.entry.register);
-        if expected != Some(response.register) {
+        if expected != Some(register) {
             // Not what was asked for. Kept anyway — it is still a fact about the device — but the sequence
             // is not advanced by it, or a stray response would skip whichever register is outstanding.
             tracing::warn!(
-                got = %response.register,
+                got = %register,
                 expected = expected.map_or_else(|| "nothing".to_owned(), |register| register.to_string()),
                 "unexpected read response"
             );
-            self.settings.insert(response.register, response.raw);
+            self.settings.insert(register, raw);
             self.publish_settings();
             return;
         }
@@ -987,16 +1048,16 @@ where
             return;
         };
         tracing::debug!(
-            register = %response.register,
+            register = %register,
             name = read.entry.name,
-            value = %read.entry.decode(response.raw),
-            raw = response.raw.get(),
+            value = %read.entry.decode(raw),
+            raw = raw.get(),
             "read back"
         );
 
-        self.settings.insert(response.register, response.raw);
+        self.settings.insert(register, raw);
         self.publish_settings();
-        self.settle(read, response.raw);
+        self.settle(read, raw);
         self.start_next_read();
     }
 
@@ -1009,16 +1070,16 @@ where
     /// Read-backs still win where the two disagree in time: this is a snapshot of an hour ago at worst,
     /// while a read-back is the answer to a question just asked. They are stored the same way because
     /// both are the device reporting what it holds; the snapshot simply arrives for free.
-    fn accept_snapshot(&mut self, snapshot: &SettingsSnapshot) {
+    fn accept_snapshot(&mut self, snapshot: &Snapshot<'_>) {
         let mut changed = 0_usize;
-        for &(register, raw) in &snapshot.values {
+        for &(register, raw) in snapshot.values {
             if self.settings.insert(register, raw) != Some(raw) {
                 changed = changed.saturating_add(1);
             }
         }
         tracing::info!(
-            start = %snapshot.start,
-            end = %snapshot.end,
+            start = %snapshot.first,
+            end = %snapshot.last,
             carried = snapshot.values.len(),
             changed,
             "settings snapshot"
@@ -1034,40 +1095,35 @@ where
     /// version for a device page, the signal strength as a diagnostic, the endpoint the device believes it
     /// should dial. The frame also carries the serial, a password field and a MAC-shaped constant, which is
     /// why neither the log line nor anything published walks the entries directly.
-    fn accept_identity(&mut self, identity: Identity) {
-        if identity.truncated {
-            // Not fatal — the entries that parsed are kept — but it means the layout is not what this build
+    fn accept_identity(&mut self, report: &crate::driver::report::Identity<'_>) {
+        if report.truncated {
+            // Not fatal — the fields that parsed are kept — but it means the layout is not what the driver
             // expects, and that is worth knowing about before the values are trusted.
             tracing::warn!(
-                declared = identity.declared,
-                parsed = identity.entries.len(),
-                "the identity report ended early; treating the entries that parsed as all there are"
+                declared = report.declared,
+                parsed = report.fields.len(),
+                "the identity report ended early; treating the fields that parsed as all there are"
             );
         }
-        tracing::info!(summary = %identity, "datalogger identity");
+        tracing::info!(summary = %report.summary, "datalogger identity");
 
-        // Every entry at trace, on the same target as the per-register telemetry values. The summary is one
+        // Every field at trace, on the same target as the per-register telemetry values. The summary is one
         // line by design, and one line cannot answer "did all 32 fields decode, and as what" — which is the
         // question when a report from an unfamiliar unit arrives.
         if tracing::enabled!(target: TARGET_VALUES, tracing::Level::TRACE) {
-            for entry in &identity.entries {
+            for field in &report.fields {
                 tracing::trace!(
                     target: TARGET_VALUES,
-                    register = entry.register.number(),
-                    name = entry.name().unwrap_or("<undocumented>"),
-                    role = entry.role().map_or("unknown", ConfigRole::as_str),
-                    value = %entry.value,
+                    register = field.register.number(),
+                    name = field.name.unwrap_or("<undocumented>"),
+                    role = field.role.unwrap_or("unknown"),
+                    value = field.value,
                     "config"
                 );
             }
         }
 
-        // A single-register report is the answer to a read, not a fresh description of the device: fold it in
-        // rather than letting one field replace thirty-two.
-        match self.identity.as_mut() {
-            Some(held) if identity.entries.len() < held.entries.len() => held.apply(&identity),
-            _ => self.identity = Some(identity),
-        }
+        self.identity.get_or_insert_with(Described::default).absorb(report);
         self.note_product();
         self.publish_identity();
     }
@@ -1094,32 +1150,6 @@ where
                 "serving a device this build's telemetry map was not written for; settings are \
                  shared across the family, but individual readings may be mislabelled"
             );
-        }
-    }
-
-    /// Note the device's answer to a write.
-    ///
-    /// Informative rather than authoritative: a range acknowledgement reports acceptance even for a value
-    /// the device clamped, so the read-back still decides. A refusal is worth saying out loud, though — it
-    /// is the one case where the device volunteers that it did not do as asked.
-    fn accept_write_ack(&mut self, frame: &Frame) {
-        match WriteAck::from_frame(frame) {
-            Ok(ack) if ack.accepted() => tracing::debug!(
-                start = %ack.start,
-                end = %ack.end,
-                value = ack.value.map_or_else(|| "none".to_owned(), |raw| raw.get().to_string()),
-                "device acknowledged a write"
-            ),
-            Ok(ack) => tracing::warn!(
-                start = %ack.start,
-                end = %ack.end,
-                status = ack.status,
-                "device refused a write"
-            ),
-            Err(error) => {
-                self.stats.rejected = self.stats.rejected.saturating_add(1);
-                tracing::warn!(%error, "could not decode a write acknowledgement");
-            }
         }
     }
 
@@ -1414,19 +1444,19 @@ where
             return;
         };
         let entries = identity
-            .entries
+            .fields
             .iter()
-            .map(|entry| ConfigView {
-                register: entry.register.number(),
-                name: entry.name(),
-                role: entry.role().map(ConfigRole::as_str),
-                value: entry.value.clone(),
+            .map(|field| ConfigView {
+                register: field.register.number(),
+                name: field.name.clone(),
+                role: field.role.clone(),
+                value: field.value.clone(),
             })
             .collect();
         drop(out.send(Some(IdentityView {
             declared: identity.declared,
             truncated: identity.truncated,
-            endpoint: identity.endpoint(),
+            endpoint: identity.endpoint.clone(),
             entries,
         })));
     }
@@ -1435,7 +1465,7 @@ where
     ///
     /// Every input register the frame carried, including the `unknown_*` ones with their confidence — a value
     /// nobody has identified is identified by watching it, and a trace log is a poor place to watch from.
-    fn publish_telemetry(&self, telemetry: &Telemetry) {
+    fn publish_telemetry(&self, telemetry: &Telemetry<'_>) {
         let Some(out) = self.telemetry_out.as_ref() else {
             return;
         };
@@ -1452,7 +1482,7 @@ where
             })
             .collect();
         drop(out.send(Some(TelemetryView {
-            timestamp: telemetry.timestamp.map(|stamp| stamp.to_string()),
+            timestamp: telemetry.at.map(|stamp| stamp.to_string()),
             readings,
         })));
     }
@@ -1504,16 +1534,16 @@ where
     }
 
     /// Hand a frame the device published to the cloud, if relaying.
-    fn forward_to_cloud(&mut self, publish: &Publish, frame: Option<&Frame>) {
+    fn forward_to_cloud(&mut self, publish: &Publish, frame: Option<&D::Frame<'_>>) {
         if self.relay.is_none() {
             return;
         }
 
         // An unreadable frame classifies as unrecognised, which the uplink allows: the cloud understands
         // frames this build does not.
-        // Still the frame's own method: the uplink hands this one an already-parsed Growatt frame, and
-        // that path moves behind the seam with the rest of framing.
-        let intent = frame.map_or(Intent::Unrecognised, |frame| frame.intent(Direction::ToCloud));
+        let intent = frame.map_or(Intent::Unrecognised, |frame| {
+            self.driver.intent(frame, Direction::ToCloud)
+        });
         let originator = if intent.needs_attribution() {
             self.cloud_commands.claim(&intent, Instant::now())
         } else {
@@ -1634,11 +1664,11 @@ where
     }
 
     /// Emit a decoded telemetry frame: a short line at `info`, every field at `trace`.
-    fn log_telemetry(&self, telemetry: &Telemetry) {
+    fn log_telemetry(&self, telemetry: &Telemetry<'_>) {
         let field = |name: &str| telemetry.value(name).unwrap_or(f64::NAN);
         tracing::info!(
             timestamp = telemetry
-                .timestamp
+                .at
                 .map_or_else(|| "none".to_owned(), |stamp| stamp.to_string()),
             pv_w = field("pv_power_total"),
             ac_w = field("ac_power"),
@@ -1649,7 +1679,7 @@ where
         );
 
         if tracing::enabled!(target: TARGET_VALUES, tracing::Level::TRACE) {
-            for reading in &telemetry.readings {
+            for reading in telemetry.readings {
                 tracing::trace!(
                     target: TARGET_VALUES,
                     register = reading.register.number(),
@@ -1696,11 +1726,9 @@ enum Woke {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CONNACK_NOT_AUTHORISED, Clock, Devices, Frame, GRANTED_QOS, MessageType, Raw, Session, TIME_PUSH_DELAY,
-        Timestamp,
-    };
-    use crate::driver::Unknown;
+    use super::{CONNACK_NOT_AUTHORISED, Clock, Devices, GRANTED_QOS, Raw, Session, TIME_PUSH_DELAY, Timestamp};
+    use crate::growatt::driver::Growatt;
+    use crate::growatt::v7::frame::{Frame, MessageType};
     use crate::mqtt::{Connect, Packet, Publish, QoS, Subscribe};
     use std::sync::Arc;
 
@@ -1766,7 +1794,7 @@ mod tests {
             .await
             .expect("the duplex buffers the whole script");
 
-        let mut session = Session::new(server, Arc::new(Unknown));
+        let mut session = Session::new(server, Arc::new(Growatt));
         let stats = session.run().await.expect("session should end cleanly");
         // Dropping the server half is what gives the client its end-of-file below.
         drop(session);
@@ -1795,7 +1823,7 @@ mod tests {
         full.extend_from_slice(&[0xE0, 0x00]);
         client.write_all(&full).await.expect("buffered");
 
-        let mut session = Session::new(server, Arc::new(Unknown)).with_devices(devices);
+        let mut session = Session::new(server, Arc::new(Growatt)).with_devices(devices);
         session.run().await.expect("session should end cleanly");
         drop(session);
 
@@ -1938,7 +1966,7 @@ mod tests {
         client.write_all(script).await.expect("buffered");
 
         let mut session =
-            Session::with_clock(server, Arc::new(Unknown), Clock::from_fn(fixed_clock)).with_time_push(enabled);
+            Session::with_clock(server, Arc::new(Growatt), Clock::from_fn(fixed_clock)).with_time_push(enabled);
 
         // Run until the session ends. The script has no DISCONNECT, so it ends on the read timeout —
         // which tokio's paused clock reaches instantly once the time push has fired.
@@ -2105,7 +2133,7 @@ mod tests {
         script.extend_from_slice(&[0xE0, 0x00]);
         client.write_all(&script).await.expect("buffered");
 
-        let mut session = Session::new(server, Arc::new(Unknown));
+        let mut session = Session::new(server, Arc::new(Growatt));
         session.run().await.expect("session");
         assert_eq!(session.device_id(), Some(SERIAL));
     }
