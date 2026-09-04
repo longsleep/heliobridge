@@ -25,6 +25,7 @@ use crate::control::{
 };
 use crate::growatt::cloud::{CloudRelay, Message as CloudMessage, Relay};
 use crate::growatt::policy::{CloudCommands, Direction, Intent, Originator, Policy};
+use crate::growatt::product::Product;
 use crate::growatt::v7::decode::{FromFrame, ReadResponse, SettingsSnapshot, Telemetry, WriteAck};
 use crate::growatt::v7::encode::{Command, EncodeError};
 use crate::growatt::v7::frame::{Frame, MessageType};
@@ -161,6 +162,9 @@ pub struct Session<S> {
     cloud_commands: CloudCommands,
     /// What the datalogger last said about itself: firmware, model, signal, endpoint.
     identity: Option<Identity>,
+    /// The product, as last identified from an identity report. Held so a change is noticed and the
+    /// caution about telemetry labels is said once rather than per report.
+    product: Product,
     recorder: Option<Recorder>,
     slots: u16,
     /// Registers waiting to be read, each knowing why.
@@ -274,6 +278,7 @@ where
             policy: Policy::default(),
             cloud_commands: CloudCommands::default(),
             identity: None,
+            product: Product::Unrecognised,
             recorder: None,
             slots: 1,
 
@@ -457,10 +462,8 @@ where
                     });
                 }
                 tracing::Span::current().record("device_id", &connect.client_id);
-                let product = crate::growatt::product::Product::from_serial(&connect.client_id);
                 tracing::info!(
                     client_id = %connect.client_id,
-                    %product,
                     keepalive_s = connect.keepalive,
                     clean_session = connect.clean_session,
                     username = connect.username.as_deref().unwrap_or("<none>"),
@@ -486,17 +489,8 @@ where
                     return Ok(Flow::Stop);
                 }
 
-                // Said once per session, not per frame. The settings registers agree across the product
-                // family and most telemetry registers carry the same quantity, so this is a caution about
-                // individual labels rather than a warning that nothing works.
-                if !product.telemetry_map_matches() {
-                    tracing::warn!(
-                        %product,
-                        "serving a device this build's telemetry map was not written for; \
-                         settings are shared across the family, but individual readings may be \
-                         mislabelled"
-                    );
-                }
+                // Nothing identifies the product yet — that arrives with the identity report, about a
+                // second from now. See `note_product`.
 
                 self.device_id = Some(connect.client_id);
                 self.send(&Packet::ConnAck {
@@ -1056,7 +1050,33 @@ where
             Some(held) if identity.entries.len() < held.entries.len() => held.apply(&identity),
             _ => self.identity = Some(identity),
         }
+        self.note_product();
         self.publish_identity();
+    }
+
+    /// Say which product this is, the first time a report identifies one.
+    ///
+    /// The device names itself in `device_type`, so this is the earliest point a product is known — a
+    /// second or so into the session, after the CONNECT that carried only a serial. Said again if the
+    /// answer ever changes, which would mean the device was reprovisioned under this session.
+    fn note_product(&mut self) {
+        let product = Product::reported(self.identity.as_ref().and_then(|held| held.get("device_type")));
+        if product == self.product {
+            return;
+        }
+        self.product = product;
+        tracing::info!(%product, "identified the product");
+
+        // The settings registers agree across the product family and most telemetry registers carry the
+        // same quantity, so this is a caution about individual labels rather than a warning that nothing
+        // works.
+        if !product.telemetry_map_matches() {
+            tracing::warn!(
+                %product,
+                "serving a device this build's telemetry map was not written for; settings are \
+                 shared across the family, but individual readings may be mislabelled"
+            );
+        }
     }
 
     /// Note the device's answer to a write.

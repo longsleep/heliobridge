@@ -33,12 +33,14 @@ pub const TIME_PATTERN: &str = r"^([01]\d|2[0-3]):[0-5]\d$";
 /// What Home Assistant groups the entities under.
 ///
 /// Assembled from the identity report rather than stored, so it says what the device says. Everything but
-/// the serial is optional: the report arrives about a second after the session starts, and a device page
-/// naming the model is worth more than one that waits for it.
+/// the serial is optional: the report arrives about five seconds after the session starts, and a device
+/// page that exists is worth more than one that waits for it. It is re-announced when the report lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceBlock {
     /// The serial, which is the identifier Home Assistant keys the device on.
     pub serial: String,
+    /// The product, from the type code the report carries.
+    pub product: Product,
     /// Model as the datalogger reports it.
     pub model: Option<String>,
     /// Firmware version.
@@ -61,6 +63,7 @@ impl DeviceBlock {
         };
         Self {
             serial: serial.to_owned(),
+            product: Product::reported(field("device_type").as_deref()),
             model: field("model_id"),
             firmware: field("sw_version"),
             hardware: field("hw_version"),
@@ -71,17 +74,31 @@ impl DeviceBlock {
     fn json(&self) -> Value {
         let mut device = Map::new();
         device.insert("identifiers".to_owned(), json!([self.serial]));
-        // The product comes from the serial prefix, not from the identity report: it is known at
-        // CONNECT, and a device page should not claim to be a product it is not.
-        let name = match Product::from_serial(&self.serial).name() {
+        // Named for the product where one is known, and for the vendor where it is not — a device page
+        // should not claim to be a product it is not.
+        let name = match self.product.name() {
             Some(product) => format!("{product} {}", self.serial),
             None => format!("Growatt {}", self.serial),
         };
         device.insert("name".to_owned(), json!(name));
         device.insert("manufacturer".to_owned(), json!("Growatt"));
         device.insert("serial_number".to_owned(), json!(self.serial));
+
+        // `model` is what a person reads and `model_id` is the manufacturer's code for it. The datalogger
+        // reports its own model as a code — `GTSW0000` — which Home Assistant would otherwise render as
+        // the whole identity of the thing, "GTSW0000 by Growatt". Both are kept: the product names what
+        // the device is, and the code stays available as the manufacturer wrote it.
+        if let Some(product) = self.product.name() {
+            device.insert("model".to_owned(), json!(product));
+            if let Some(code) = self.model.as_ref() {
+                device.insert("model_id".to_owned(), json!(code));
+            }
+        } else if let Some(code) = self.model.as_ref() {
+            // Nothing better to say than the code, which beats saying nothing.
+            device.insert("model".to_owned(), json!(code));
+        }
+
         for (key, value) in [
-            ("model", self.model.as_ref()),
             ("sw_version", self.firmware.as_ref()),
             ("hw_version", self.hardware.as_ref()),
         ] {
@@ -321,7 +338,8 @@ pub const fn is_control(component: Component) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceBlock, Discovery, TIME_PATTERN, is_control};
+    use super::{DeviceBlock, Discovery, Product, TIME_PATTERN, is_control};
+    use crate::control::{ConfigView, IdentityView};
     use crate::homeassistant::command::Permitted;
     use crate::homeassistant::entity::{Catalogue, Component, Entity, Presence};
     use crate::homeassistant::topics::Topics;
@@ -332,9 +350,28 @@ mod tests {
         DeviceBlock::new("0EXAMPLE00000001", None)
     }
 
-    /// The `name` of a device block built from a serial.
-    fn device_name(serial: &str) -> String {
-        let json = DeviceBlock::new(serial, None).json();
+    /// An identity report carrying the fields named, as the device sends them: numbers as text.
+    fn report(fields: &[(&'static str, &str)]) -> IdentityView {
+        IdentityView {
+            declared: fields.len().try_into().expect("a test report is a handful of fields"),
+            truncated: false,
+            endpoint: None,
+            entries: fields
+                .iter()
+                .map(|(name, value)| ConfigView {
+                    register: 0,
+                    name: Some(name),
+                    role: None,
+                    value: (*value).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The `name` of a device block for a device reporting this type code.
+    fn device_name(device_type: &str) -> String {
+        let report = report(&[("device_type", device_type)]);
+        let json = DeviceBlock::new("0EXAMPLE00000001", Some(&report)).json();
         json.get("name")
             .and_then(Value::as_str)
             .expect("a device block always names the device")
@@ -342,16 +379,56 @@ mod tests {
     }
 
     #[test]
-    fn the_device_page_is_named_for_the_product_the_serial_identifies() {
-        assert_eq!(device_name("0HVR000000000001"), "NEXA 2000 0HVR000000000001");
-        assert_eq!(device_name("0PVP000000000001"), "NOAH 2000 0PVP000000000001");
+    fn the_product_comes_from_the_reported_device_type() {
+        // The device names its own product in config key 13, so nothing here depends on the serial.
+        let report = report(&[("device_type", "72"), ("model_id", "GTSW0000")]);
+        let block = DeviceBlock::new("0EXAMPLE00000001", Some(&report));
+        assert_eq!(block.product, Product::Nexa2000);
     }
 
     #[test]
-    fn an_unrecognised_serial_is_named_for_the_vendor_rather_than_guessed() {
-        // Not refused and not labelled as either product: a serial this build has not been taught is
-        // still a device worth serving, and claiming a model would be worse than naming none.
-        assert_eq!(device_name("0EXAMPLE00000001"), "Growatt 0EXAMPLE00000001");
+    fn the_product_name_is_the_model_and_the_device_s_code_is_the_model_id() {
+        // Home Assistant renders the device as "<model> by <manufacturer>", so putting the vendor's code
+        // in `model` shows the page as "GTSW0000 by Growatt" — true, and useless to read. The code keeps
+        // its own field, which is what `model_id` is for.
+        let report = report(&[("device_type", "72"), ("model_id", "GTSW0000")]);
+        let json = DeviceBlock::new("0EXAMPLE00000001", Some(&report)).json();
+        assert_eq!(json["model"], "NEXA 2000");
+        assert_eq!(json["model_id"], "GTSW0000");
+    }
+
+    #[test]
+    fn an_unknown_product_falls_back_to_the_code_rather_than_showing_nothing() {
+        // Nothing better to say. The code at least distinguishes two unrecognised products from each
+        // other, where an absent model says only that this program has not been taught the type code.
+        let report = report(&[("device_type", "99"), ("model_id", "GTSW0000")]);
+        let json = DeviceBlock::new("0EXAMPLE00000001", Some(&report)).json();
+        assert_eq!(json["model"], "GTSW0000");
+        assert!(json.get("model_id").is_none(), "the code is not repeated");
+    }
+
+    #[test]
+    fn a_device_with_no_identity_report_yet_claims_no_product() {
+        // The type code arrives with the report, about five seconds into a session. Until then the page is
+        // announced under the vendor name and re-announced when the product is known — rather than
+        // guessing a product from the serial, which no vendor source maps.
+        let json = DeviceBlock::new("0EXAMPLE00000001", None).json();
+        assert_eq!(json["name"], "Growatt 0EXAMPLE00000001");
+        assert!(json.get("model").is_none());
+        assert!(json.get("model_id").is_none());
+    }
+
+    #[test]
+    fn the_device_page_is_named_for_the_product_the_device_reports() {
+        assert_eq!(device_name("72"), "NEXA 2000 0EXAMPLE00000001");
+        assert_eq!(device_name("61"), "NOAH 2000 0EXAMPLE00000001");
+    }
+
+    #[test]
+    fn an_unrecognised_type_code_is_named_for_the_vendor_rather_than_guessed() {
+        // Not refused and not labelled as any product: a code this build has not been taught is still a
+        // device worth serving, and claiming a model would be worse than naming none.
+        assert_eq!(device_name("99"), "Growatt 0EXAMPLE00000001");
     }
 
     /// One entity's discovery payload, parsed back.

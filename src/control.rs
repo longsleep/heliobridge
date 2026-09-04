@@ -559,7 +559,7 @@ pub struct SessionHandle {
     pub requests: mpsc::Sender<Request>,
     /// Its current settings, so a read needs no device traffic.
     pub settings: watch::Receiver<Vec<SettingView>>,
-    /// What the datalogger last said about itself. Absent until the first report, about a second in.
+    /// What the datalogger last said about itself. Absent until the first report, about five seconds in.
     pub identity: watch::Receiver<Option<IdentityView>>,
     /// The most recent telemetry frame. Absent until the first one arrives, about a second in.
     pub telemetry: watch::Receiver<Option<TelemetryView>>,
