@@ -946,6 +946,10 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         Entry::on_request(139, "dhcp_lease_0", Identity, Observed),
         Entry::on_request(140, "dhcp_lease_1", Identity, Observed),
         // A concatenation of several other registers, including the handshake key of 54.
+        // Permission for an operation the datalogger would route to an external Modbus unit rather than
+        // to the sub-MCU. Two gates require it to read `1`; otherwise the routed operation is declined and
+        // the accessory dispatcher returns early. Reads empty here, and the firmware's own default is `0`.
+        Entry::on_request(143, "routed_modbus_enabled", Metadata, Vendor),
         Entry::on_request(144, "assembled_values", Identity, Inferred),
     ]
 };
