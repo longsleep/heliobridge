@@ -27,5 +27,6 @@ pub mod command;
 pub mod discovery;
 pub mod entity;
 pub mod publisher;
+pub mod rest;
 pub mod state;
 pub mod topics;

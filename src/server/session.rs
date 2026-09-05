@@ -144,6 +144,7 @@ where
         if let Some(stamp) = telemetry.at.filter(|stamp| stamp.is_plausible()) {
             self.session.device_time = Some(stamp);
         }
+        self.session.note_battery(telemetry);
         self.session.log_telemetry(telemetry);
         self.session.publish_telemetry(telemetry);
         // Cheap, and telemetry is the only regular tick a session has: it is what keeps the clock
@@ -199,6 +200,15 @@ where
         self.session.stats.rejected = self.session.stats.rejected.saturating_add(1);
         tracing::warn!(kind, %error, "could not decode a frame this build recognises");
     }
+}
+
+/// What the pack last reported about its own condition.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct BatteryReport {
+    /// State of health, as a percentage, or `None` before the first frame carrying one.
+    health: Option<f64>,
+    /// Charge cycles counted by the pack.
+    cycles: Option<f64>,
 }
 
 /// Keepalive the device asks for: seven minutes.
@@ -321,6 +331,13 @@ pub struct Session<S, D: Driver> {
     next_packet_id: u16,
     device_time: Option<Timestamp>,
     warned_about_skew: bool,
+    /// The pack's last reported health and cycle count, so a change can be said out loud once.
+    ///
+    /// Both are written by the battery's own management, not by anything here, and both move rarely — the
+    /// health figure was seen to move exactly once in four weeks. A change is therefore an event rather
+    /// than a reading, and one nobody would find later: it is invisible in a dashboard's history if the
+    /// entity was added afterwards, and finding the last one meant re-reading 184 MB of recorded frames.
+    battery: BatteryReport,
     cloud: Option<Target>,
     relay: Option<D::Relay>,
     /// What the relay carries in each direction. Consulted only while relaying.
@@ -443,6 +460,7 @@ where
             next_packet_id: 1,
             device_time: None,
             warned_about_skew: false,
+            battery: BatteryReport::default(),
             cloud: None,
             relay: None,
             policy: Policy::default(),
@@ -1675,6 +1693,53 @@ where
             payload: message.payload,
         }))
         .await
+    }
+
+    /// Say so when the pack's health or cycle count moves.
+    ///
+    /// Neither is written by anything here: the battery's own management maintains both, and it rewrites
+    /// the health figure only when it detects a full charge — so a change marks the moment an estimate was
+    /// re-learned. That is worth a line of its own, at the level an operator sees, because the alternative
+    /// is discovering it weeks later from recorded frames.
+    ///
+    /// The cell spread and the state of charge ride along: a health figure re-learned from a charge that
+    /// ended early, with the cells apart, is the shape of a pessimistic estimate rather than a worn pack,
+    /// and those two numbers are what distinguish them.
+    fn note_battery(&mut self, telemetry: &Telemetry<'_>) {
+        let reported = BatteryReport {
+            health: telemetry.value("battery_soh"),
+            cycles: telemetry.value("battery_cycles"),
+        };
+        // The whole battery block reads zero for a few frames after a reconnect, before the pack has
+        // reported. Taking that as a change would announce a dead pack once per session.
+        if reported.health == Some(0.0) && reported.cycles == Some(0.0) {
+            return;
+        }
+        if reported == self.battery {
+            return;
+        }
+
+        let previous = self.battery;
+        self.battery = reported;
+        // Nothing to announce on the first frame of a session: there is no previous value, and the current
+        // one is already published as a reading.
+        if previous == BatteryReport::default() {
+            return;
+        }
+
+        let spread = telemetry
+            .value("battery_cell_voltage_max")
+            .zip(telemetry.value("battery_cell_voltage_min"))
+            .map(|(high, low)| (high - low) * 1000.0);
+        tracing::info!(
+            health = reported.health,
+            health_was = previous.health,
+            cycles = reported.cycles,
+            cycles_was = previous.cycles,
+            soc = telemetry.value("battery_soc_total"),
+            cell_spread_mv = spread,
+            "the pack re-reported its own condition"
+        );
     }
 
     /// Emit a decoded telemetry frame: a short line at `info`, every field at `trace`.

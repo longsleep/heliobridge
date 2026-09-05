@@ -18,7 +18,8 @@ use serde_json::{Map, Number, Value, json};
 use crate::control::{ConfigView, SettingView, TelemetryView};
 use crate::homeassistant::broker::Publication;
 use crate::homeassistant::entity::Entity;
-use crate::homeassistant::entity::{FIRMWARE_VERSION, LAST_UPDATE};
+use crate::homeassistant::entity::{CELL_SPREAD, FIRMWARE_VERSION, LAST_UPDATE, RESTING_VOLTAGE, SOC_CREDIBLE};
+use crate::homeassistant::rest::Resting;
 use crate::homeassistant::topics::{OFFLINE, ONLINE};
 
 /// Which fields a device publishes.
@@ -53,14 +54,29 @@ pub struct StatePayload(Map<String, Value>);
 
 impl StatePayload {
     /// The readings of one telemetry frame.
-    pub fn telemetry(view: &TelemetryView, fields: &Fields) -> Self {
-        Self(
-            view.readings
-                .iter()
-                .filter(|reading| fields.contains(reading.name))
-                .map(|reading| (reading.name.to_owned(), quantity(&reading.value)))
-                .collect(),
-        )
+    pub fn telemetry(view: &TelemetryView, fields: &Fields, resting: Option<Resting>) -> Self {
+        let mut object: Map<String, Value> = view
+            .readings
+            .iter()
+            .filter(|reading| fields.contains(reading.name))
+            .map(|reading| (reading.name.to_owned(), quantity(&reading.value)))
+            .collect();
+        if let Some(spread) = cell_spread(view).filter(|_| fields.contains(CELL_SPREAD)) {
+            object.insert(CELL_SPREAD.to_owned(), json!(spread));
+        }
+        // Both fields are absent until the pack has rested long enough to measure, which leaves their
+        // entities unavailable rather than showing a live figure that cannot answer the question.
+        if let Some(resting) = resting {
+            if fields.contains(RESTING_VOLTAGE) {
+                object.insert(RESTING_VOLTAGE.to_owned(), json!(resting.millivolts));
+            }
+            // Only where the chemistry supports a verdict. Publishing "no problem" across the plateau
+            // would assert agreement that was never established.
+            if let (Some(credible), true) = (resting.credible, fields.contains(SOC_CREDIBLE)) {
+                object.insert(SOC_CREDIBLE.to_owned(), json!(if credible { "0" } else { "1" }));
+            }
+        }
+        Self(object)
     }
 
     /// The settings a session has read back.
@@ -178,6 +194,34 @@ impl StatePayload {
     }
 }
 
+/// The spread between the highest and lowest cell, in millivolts.
+///
+/// Derived rather than reported: the device sends the two extremes and not the difference. It earns its
+/// place because the difference is the number that says something a percentage cannot — a pack whose cells
+/// diverge at the top of charge terminates early, and an early termination is what makes the BMS's own
+/// health estimate pessimistic. At rest a few millivolts is ordinary; tens of millivolts under charge
+/// current near the top of the knee is also ordinary; tens of millivolts *at rest* is not.
+///
+/// **Taken from the raw registers, not the rendered volts.** Both readings are scaled by a thousandth, so
+/// the raw value already *is* millivolts and the difference is exact integer arithmetic — where subtracting
+/// two rendered floats would need rounding and a cast this crate denies for good reasons.
+///
+/// `None` when either extreme is missing from the frame, so nothing is published rather than a zero that
+/// would read as a perfectly balanced pack.
+fn cell_spread(view: &TelemetryView) -> Option<i64> {
+    let millivolts = |name: &str| {
+        view.readings
+            .iter()
+            .find(|reading| reading.name == name)
+            .map(|reading| i64::from(reading.raw))
+    };
+    let high = millivolts("battery_cell_voltage_max")?;
+    let low = millivolts("battery_cell_voltage_min")?;
+    // Checked, because this crate denies bare arithmetic in a decode path: two 16-bit readings cannot
+    // overflow an i64 difference, and saying so costs one method call.
+    high.checked_sub(low)
+}
+
 /// One config value, fit to be a Home Assistant state.
 ///
 /// Two things the device does that a state cannot carry. Values arrive **NUL-padded** — a fixed-width
@@ -220,7 +264,7 @@ fn quantity(rendered: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{Fields, StatePayload, quantity};
+    use super::{CELL_SPREAD, Fields, StatePayload, cell_spread, quantity};
     use crate::control::{ReadingView, SettingView, TelemetryView};
     use crate::growatt::driver::Growatt;
     use crate::homeassistant::entity::Catalogue;
@@ -235,6 +279,18 @@ mod tests {
             value: value.to_owned(),
             unit: "W",
             confidence: "verified",
+        }
+    }
+
+    /// A cell-voltage reading as a frame carries one: raw millivolts, rendered in volts.
+    fn cell(name: &'static str, millivolts: u16) -> ReadingView {
+        ReadingView {
+            register: 99,
+            name,
+            raw: millivolts,
+            value: format!("{:.3}", f64::from(millivolts) / 1000.0),
+            unit: "V",
+            confidence: "observed",
         }
     }
 
@@ -258,6 +314,47 @@ mod tests {
     }
 
     #[test]
+    fn the_cell_spread_is_derived_in_millivolts() {
+        // The device reports the two extremes in volts and never the difference, so the useful figure only
+        // exists if this computes it — and in millivolts, since 0.002 V hides the resolution being sought.
+        let view = TelemetryView {
+            timestamp: None,
+            readings: vec![
+                cell("battery_cell_voltage_max", 3472),
+                cell("battery_cell_voltage_min", 3428),
+            ],
+        };
+        assert_eq!(cell_spread(&view), Some(44));
+
+        // Exact, because it is integer arithmetic on the raw registers: subtracting the rendered volts
+        // would land on 1.9999999999997 as readily as on 2.
+        let balanced = TelemetryView {
+            timestamp: None,
+            readings: vec![
+                cell("battery_cell_voltage_max", 3316),
+                cell("battery_cell_voltage_min", 3314),
+            ],
+        };
+        assert_eq!(cell_spread(&balanced), Some(2));
+    }
+
+    #[test]
+    fn a_spread_needs_both_extremes_and_publishes_nothing_without_them() {
+        // A missing reading must not become a zero: zero is what a perfectly balanced pack reads, and a
+        // frame that carried only one extreme would otherwise announce one.
+        let half = TelemetryView {
+            timestamp: None,
+            readings: vec![cell("battery_cell_voltage_max", 3472)],
+        };
+        assert_eq!(cell_spread(&half), None);
+        assert!(
+            StatePayload::telemetry(&half, &fields(), None)
+                .get(CELL_SPREAD)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn a_state_object_carries_only_fields_an_entity_reads() {
         // The invariant that keeps the two halves in step: no orphan field, no entity reading nothing.
         let view = TelemetryView {
@@ -268,7 +365,7 @@ mod tests {
                 reading("battery_soc_total", "88"),
             ],
         };
-        let payload = StatePayload::telemetry(&view, &fields());
+        let payload = StatePayload::telemetry(&view, &fields(), None);
         assert_eq!(payload.get("ac_power"), Some(&json!(-100)));
         assert_eq!(payload.get("battery_soc_total"), Some(&json!(88)));
         assert_eq!(payload.get("unknown_81"), None, "nothing can interpret it");
@@ -288,7 +385,7 @@ mod tests {
             timestamp: None,
             readings: vec![reading("battery1_temp", "30.4"), reading("battery2_temp", "-273.1")],
         };
-        let payload = StatePayload::telemetry(&view, &one_pack);
+        let payload = StatePayload::telemetry(&view, &one_pack, None);
         assert_eq!(payload.get("battery1_temp"), Some(&json!(30.4)));
         assert_eq!(payload.get("battery2_temp"), None);
     }
@@ -386,7 +483,7 @@ mod tests {
             timestamp: None,
             readings: vec![reading("ac_power", "-100")],
         };
-        let bytes = StatePayload::telemetry(&view, &fields()).into_bytes();
+        let bytes = StatePayload::telemetry(&view, &fields(), None).into_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(parsed["ac_power"], json!(-100));
     }

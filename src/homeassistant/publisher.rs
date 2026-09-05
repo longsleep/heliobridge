@@ -31,6 +31,7 @@ use crate::homeassistant::broker::{Broker, BrokerConfig, BrokerError, Event, Pub
 use crate::homeassistant::command::{Change, Delivery, Permitted};
 use crate::homeassistant::discovery::{DeviceBlock, Discovery};
 use crate::homeassistant::entity::{Catalogue, Component, Entity, FIRMWARE_VERSION, Gate, LAST_UPDATE, Source};
+use crate::homeassistant::rest::RestWatch;
 use crate::homeassistant::state::{Fields, StatePayload};
 use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
 
@@ -235,6 +236,7 @@ impl<D: Registers + Describes> Publisher<D> {
                     present: false,
                     fields: Fields::default(),
                     gates: HashMap::new(),
+                    rest: RestWatch::default(),
                 }
                 .run(),
             );
@@ -321,6 +323,8 @@ struct Link<D> {
     fields: Fields,
     /// What was last published to each gated entity's availability topic.
     gates: HashMap<&'static str, &'static [u8]>,
+    /// How long the pack has been idle, and the last cell voltage measured while it was.
+    rest: RestWatch,
 }
 
 /// What the discovery messages on the broker describe.
@@ -729,7 +733,8 @@ impl<D: Registers + Describes> Link<D> {
 
     /// Publish one telemetry frame.
     fn publish_telemetry(&mut self, view: &TelemetryView) {
-        let payload = StatePayload::telemetry(view, &self.fields);
+        let resting = self.rest.observe(view, Instant::now());
+        let payload = StatePayload::telemetry(view, &self.fields, resting);
         if payload.is_empty() {
             return;
         }
@@ -955,6 +960,7 @@ mod tests {
     };
     use crate::control::{IdentityView, ReadingView, SessionHandle, SettingView, StatusView, TelemetryView};
     use crate::growatt::driver::Growatt;
+    use crate::homeassistant::rest::RestWatch;
     use std::collections::HashMap;
 
     use crate::growatt::v7::registers::{SMART_SELF_USE, WORK_MODE_LABELS};
@@ -1040,6 +1046,7 @@ mod tests {
                 present: false,
                 fields: Fields::default(),
                 gates: HashMap::new(),
+                rest: RestWatch::default(),
             }
             .run(),
         );

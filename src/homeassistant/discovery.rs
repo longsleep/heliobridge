@@ -549,6 +549,7 @@ mod tests {
                 }],
             },
             &crate::homeassistant::state::Fields::of(&Catalogue::default().entities(&Growatt)),
+            None,
         );
         assert_eq!(payload.get("grid_faults"), Some(&serde_json::json!(1024)));
     }

@@ -168,6 +168,15 @@ const VERSION_PARTS: [&str; 2] = ["inverter_mppt_version", "pd_bms_version"];
 /// When the last telemetry frame arrived, which does not exist until one has.
 pub const LAST_UPDATE: &str = "last_update";
 
+/// The difference between the highest and lowest cell, which the device does not report as such.
+pub const CELL_SPREAD: &str = "battery_cell_spread";
+
+/// The lowest cell's voltage, measured while the pack was doing nothing.
+pub const RESTING_VOLTAGE: &str = "battery_resting_cell_voltage";
+
+/// Whether the reported state of charge is credible against that resting voltage.
+pub const SOC_CREDIBLE: &str = "battery_soc_credible";
+
 /// The reading that says whether the device currently has a meter reporting.
 pub const METER_CONNECTED: &str = "meter_connected";
 
@@ -594,6 +603,81 @@ impl Entity {
         }
     }
 
+    /// How far apart the highest and lowest cell are, in millivolts.
+    ///
+    /// Computed here because the device reports the two extremes and never the difference, and the
+    /// difference is what carries the information: a percentage cannot say whether a pack is balanced, and
+    /// a pack that diverges at the top of charge terminates early — which is what makes the BMS's own
+    /// health estimate read low. Diagnostic rather than a reading: it says something about the hardware's
+    /// condition, not about the energy flowing.
+    pub fn cell_spread() -> Self {
+        Self {
+            key: CELL_SPREAD,
+            name: "Battery cell spread".to_owned(),
+            component: Component::Sensor,
+            device_class: Some("voltage"),
+            unit: Some("mV"),
+            category: Some(Category::Diagnostic),
+            precision: Some(0),
+            shape: Shape::Reading(Some(StateClass::Measurement)),
+            source: Some(Source::Telemetry),
+            presence: Presence::Device,
+            gate: None,
+        }
+    }
+
+    /// The lowest cell's voltage the last time the pack was resting.
+    ///
+    /// Not the live reading, which says as much about internal resistance as about charge: this is
+    /// sampled only after the battery has been neither charging nor discharging long enough for the cells
+    /// to settle. It is the one independent read on state of charge, since everything else about it is a
+    /// coulomb count, and a coulomb count drifts.
+    ///
+    /// Unavailable until the pack has rested that long, which is honest: there is no such measurement
+    /// before then, and a live value in its place would invite exactly the comparison it cannot support.
+    pub fn resting_voltage() -> Self {
+        Self {
+            key: RESTING_VOLTAGE,
+            name: "Battery resting cell voltage".to_owned(),
+            component: Component::Sensor,
+            device_class: Some("voltage"),
+            unit: Some("mV"),
+            category: Some(Category::Diagnostic),
+            precision: Some(0),
+            shape: Shape::Reading(Some(StateClass::Measurement)),
+            source: Some(Source::Telemetry),
+            presence: Presence::Device,
+            gate: None,
+        }
+    }
+
+    /// Whether the reported state of charge agrees with that resting voltage.
+    ///
+    /// A problem sensor rather than a reading, because the useful state is the disagreement: a pack
+    /// resting in the middle of its plateau while reporting single digits has a counter that has drifted,
+    /// and the correction — a snap to full at the next charge — rewrites the pack's health estimate from
+    /// the wrong span. Catching it while it accumulates is the difference between a diagnostic and an
+    /// autopsy.
+    ///
+    /// It reports nothing across most of the range, since lithium iron phosphate rests at almost the same
+    /// voltage from a fifth full to four fifths. The chemistry only speaks at the knees, so that is where
+    /// this speaks.
+    pub fn soc_credible() -> Self {
+        Self {
+            key: SOC_CREDIBLE,
+            name: "State of charge disagrees with cell voltage".to_owned(),
+            component: Component::BinarySensor,
+            device_class: Some("problem"),
+            unit: None,
+            category: Some(Category::Diagnostic),
+            precision: None,
+            shape: Shape::Signal { on: "1", off: "0" },
+            source: Some(Source::Telemetry),
+            presence: Presence::Device,
+            gate: None,
+        }
+    }
+
     /// What accessories the device has been told about, over the network and over its radio.
     ///
     /// Config registers 122 and 102, both carried in the identity report the device sends on every
@@ -762,6 +846,7 @@ impl Catalogue {
                 Entity::accessory_list("accessory_list", "Accessories on the network"),
                 Entity::accessory_list("accessory_list_rf", "Accessories on the radio"),
             ])
+            .chain([Entity::cell_spread(), Entity::resting_voltage(), Entity::soc_credible()])
             // An action has nothing to publish but a control, so refusing writes withdraws it entirely
             // rather than downgrading it to a reading the way a setting does. The meter controls go the
             // same way: both are write-only, so read-only versions of them would be entities that can
