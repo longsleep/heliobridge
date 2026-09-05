@@ -188,7 +188,7 @@ impl<'a> Bridge<'a> {
         let registry = self.registry.take().unwrap_or_default();
         // Started inside the runtime for the same reason as the recorder: it spawns tasks.
         self.runtime
-            .block_on(async { control::listen(path, registry.clone()) })
+            .block_on(async { control::listen(path, registry.clone(), Arc::clone(&self.driver)) })
             .map_err(|error| format!("control API failed to start: {}", chain(&error)))?;
         tracing::info!(
             socket = %path.display(),

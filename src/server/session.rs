@@ -26,13 +26,13 @@ use crate::control::{
 };
 use crate::driver::Driver;
 use crate::driver::arbiter::{CloudCommands, Direction, Intent, Originator, Policy};
+use crate::driver::catalogue::{Catalogue, ConfigField as _, Setting as _};
 use crate::driver::commands::{Command, Outgoing};
 use crate::driver::report::{Sink, Snapshot, Telemetry, WriteAck};
 use crate::driver::upstream::{Message as CloudMessage, Relay as _, Target};
 use crate::driver::wire::Unreadable;
 use crate::growatt::product::Product;
-use crate::growatt::v7::registers::{ConfigRegister, HoldingRegister};
-use crate::model::{Confidence, Hex, Raw, Register, Timestamp, Unit};
+use crate::model::{Hex, Raw, Register, Timestamp};
 use crate::mqtt::{Packet, PacketStream, Publish, QoS, StreamError};
 use crate::record::{Recorder, Stream as RecordStream};
 use crate::server::access::Devices;
@@ -342,8 +342,8 @@ pub struct Session<S, D: Driver> {
     /// and responses identify themselves by register. Two queues would need a scheduler to choose between
     /// them, which is the same thing with more parts. Verification reads go to the front: a startup resync
     /// has up to an hour of slack, a caller holding an HTTP connection has twenty seconds.
-    reads: VecDeque<PendingRead>,
-    awaiting: Option<PendingRead>,
+    reads: VecDeque<PendingRead<D>>,
+    awaiting: Option<PendingRead<D>>,
     /// A read decided on but not yet transmitted.
     ///
     /// The decision is made while handling a packet, which cannot await; the loop sends it immediately
@@ -374,14 +374,14 @@ pub struct Session<S, D: Driver> {
 /// the alternative was a side table keyed by register plus a flag, which is the same information stored
 /// twice and able to disagree with itself.
 #[derive(Debug)]
-struct PendingRead {
-    /// Which register, and how to render what comes back.
-    entry: HoldingRegister,
+struct PendingRead<D: Catalogue> {
+    /// Which register, and how to render what comes back — the driver's own catalogue entry.
+    entry: D::Setting,
     /// Why it is being read.
     purpose: ReadPurpose,
 }
 
-impl PendingRead {
+impl<D: Catalogue> PendingRead<D> {
     /// Whether this read belongs to the startup sequence.
     const fn is_resync(&self) -> bool {
         matches!(self.purpose, ReadPurpose::Resync)
@@ -569,14 +569,14 @@ where
                     // unknown, which is honest, rather than being inferred.
                     if let Some(mut read) = self.awaiting.take() {
                         tracing::warn!(
-                            register = %read.entry.register,
-                            name = read.entry.name,
+                            register = %read.entry.register(),
+                            name = read.entry.name(),
                             timeout_s = READ_REPLY_TIMEOUT.as_secs(),
                             "no answer to a settings read; moving on"
                         );
                         // Anyone waiting on this one is told now, rather than left to time out separately.
                         if let Some(reply) = read.take_reply() {
-                            drop(reply.send(Outcome::timed_out(read.entry.register, read.requested())));
+                            drop(reply.send(Outcome::timed_out(&read.entry, read.requested())));
                         }
                     }
                     self.start_next_read();
@@ -962,7 +962,7 @@ where
     /// settings snapshot, so a server that restarts mid-hour would have nothing to say about them for up to
     /// an hour — or would guess, which is worse.
     fn begin_resync(&mut self) {
-        for entry in HoldingRegister::resync_set(self.slots) {
+        for entry in self.driver.settings(self.slots) {
             self.reads.push_back(PendingRead {
                 entry,
                 purpose: ReadPurpose::Resync,
@@ -989,7 +989,7 @@ where
             return;
         };
 
-        self.pending_read = Some(next.entry.register);
+        self.pending_read = Some(next.entry.register());
         self.awaiting = Some(next);
         self.read_deadline = Instant::now().checked_add(READ_REPLY_TIMEOUT);
     }
@@ -1028,7 +1028,7 @@ where
 
     /// Record a value the device reported, and move the sequence along.
     fn accept_read(&mut self, register: Register, raw: Raw) {
-        let expected = self.awaiting.as_ref().map(|read| read.entry.register);
+        let expected = self.awaiting.as_ref().map(|read| read.entry.register());
         if expected != Some(register) {
             // Not what was asked for. Kept anyway — it is still a fact about the device — but the sequence
             // is not advanced by it, or a stray response would skip whichever register is outstanding.
@@ -1047,7 +1047,7 @@ where
         };
         tracing::debug!(
             register = %register,
-            name = read.entry.name,
+            name = read.entry.name(),
             value = %read.entry.decode(raw),
             raw = raw.get(),
             "read back"
@@ -1152,8 +1152,8 @@ where
     }
 
     /// Finish one read according to why it was issued.
-    fn settle(&self, read: PendingRead, stored: Raw) {
-        let register = read.entry.register;
+    fn settle(&self, read: PendingRead<D>, stored: Raw) {
+        let register = read.entry.register();
         match read.purpose {
             // The startup sequence announces itself only once, when the last of its reads lands. Sharing
             // the queue with verification reads is what makes carrying the purpose necessary: without it,
@@ -1165,13 +1165,13 @@ where
             }
 
             ReadPurpose::Verify { requested, reply } => {
-                let outcome = Outcome::read_back(register, requested, stored);
+                let outcome = Outcome::read_back(&read.entry, requested, stored);
 
                 if let Some(wanted) = requested {
                     if wanted == stored {
                         tracing::info!(
                             register = %register,
-                            name = read.entry.name,
+                            name = read.entry.name(),
                             stored = stored.get(),
                             "write confirmed by read-back"
                         );
@@ -1181,7 +1181,7 @@ where
                         // level.
                         tracing::warn!(
                             register = %register,
-                            name = read.entry.name,
+                            name = read.entry.name(),
                             requested = wanted.get(),
                             stored = stored.get(),
                             "the device did not store what was written"
@@ -1204,15 +1204,15 @@ where
         tracing::info!(known, "settings resynchronised");
 
         for (register, raw) in &self.settings {
-            let Some(entry) = HoldingRegister::lookup(*register) else {
+            let Some(entry) = self.driver.setting(*register) else {
                 continue;
             };
             // Names the direction: a bare "setting" reads as the verb, and this writes nothing.
             tracing::info!(
                 register = %register,
-                name = entry.name,
+                name = entry.name(),
                 value = %entry.decode(*raw),
-                unit = entry.unit.symbol(),
+                unit = entry.unit().symbol(),
                 "setting read"
             );
         }
@@ -1276,7 +1276,7 @@ where
                 if verify.is_empty() {
                     // Nothing to read back — a read or a time push. Answer immediately so the caller is not
                     // left waiting for a confirmation that will never come.
-                    drop(reply.send(Outcome::read_back(Register(0), None, Raw(0))));
+                    drop(reply.send(Outcome::read_back(&self.driver.describe(Register(0)), None, Raw(0))));
                     return Ok(());
                 }
 
@@ -1292,9 +1292,15 @@ where
                 // acknowledgement and the read that would confirm one has never been seen on the wire.
                 // Answering as soon as it is transmitted is the honest maximum.
                 let sent = self.transmit(&command).await;
+                // The catalogue names the field so the answer says `restart` rather than `register 32`.
+                let field = match &command {
+                    Command::WriteConfig { register, .. } => self.driver.config(*register),
+                    Command::ReadConfig { registers } => registers.first().and_then(|r| self.driver.config(*r)),
+                    _ => None,
+                };
                 let outcome = match &sent {
-                    Ok(_) => Outcome::sent(&command),
-                    Err(error) => Outcome::not_sent(&command, &error.to_string()),
+                    Ok(_) => Outcome::sent(&command, field.as_ref()),
+                    Err(error) => Outcome::not_sent(&command, field.as_ref(), &error.to_string()),
                 };
                 drop(reply.send(outcome));
                 sent?;
@@ -1314,18 +1320,9 @@ where
         requested: Option<Raw>,
         reply: Option<oneshot::Sender<Outcome>>,
     ) {
-        let entry = HoldingRegister::lookup(register).unwrap_or_else(|| {
-            // Readable but undocumented. Reading is harmless, and a value is still a fact; it simply has no
-            // name or domain to render it with.
-            HoldingRegister::range(
-                register.number(),
-                "unknown",
-                0,
-                u16::MAX,
-                Unit::None,
-                Confidence::Inferred,
-            )
-        });
+        // Readable but undocumented registers are the driver's problem to describe: reading one is
+        // harmless and a value is still a fact, it simply has no name to render it with.
+        let entry = self.driver.describe(register);
 
         self.reads.push_front(PendingRead {
             entry,
@@ -1408,7 +1405,11 @@ where
         let views: Vec<SettingView> = self
             .settings
             .iter()
-            .filter_map(|(register, raw)| SettingView::new(*register, *raw))
+            .filter_map(|(register, raw)| {
+                self.driver
+                    .setting(*register)
+                    .map(|entry| SettingView::new(&entry, *raw))
+            })
             .collect();
         drop(out.send(views));
     }
@@ -1442,9 +1443,9 @@ where
         }
     }
 
-    fn intent_field(intent: &Intent) -> Option<&'static str> {
+    fn intent_field(&self, intent: &Intent) -> Option<&'static str> {
         match intent {
-            Intent::WriteConfig { register } => ConfigRegister::lookup(*register).map(|entry| entry.name),
+            Intent::WriteConfig { register } => self.driver.config(*register).map(|field| field.name()),
             _ => None,
         }
     }
@@ -1638,7 +1639,7 @@ where
             self.record(RecordStream::Blocked, &message.payload);
             tracing::warn!(
                 %intent,
-                field = Self::intent_field(&intent),
+                field = self.intent_field(&intent),
                 %refusal,
                 topic = %message.topic,
                 count = self.stats.refused_to_device,

@@ -14,7 +14,8 @@
 //! # One capability per trait, one bundle to name them
 //!
 //! The seam is split by capability — [`Wire`] for framing, [`Report`] for what a frame says, [`Arbiter`]
-//! for what it is trying to do, [`Commands`] for asking the device to do something,
+//! for what it is trying to do, [`Catalogue`] for what the device holds, [`Commands`] for asking it to do
+//! something,
 //! [`Firmware`] for update campaigns, [`Upstream`] for the manufacturer's cloud, and more to come — rather than gathered into a single wide trait. A consumer bounds on the capability it uses and
 //! nothing else, which keeps its requirements legible: `server::firmware` needs [`Firmware`], and the fact
 //! that it needs nothing else is worth being able to see.
@@ -41,6 +42,7 @@
 //! says so rather than implying more separation than exists.
 
 pub mod arbiter;
+pub mod catalogue;
 pub mod commands;
 pub mod firmware;
 pub mod report;
@@ -48,20 +50,23 @@ pub mod upstream;
 pub mod wire;
 
 pub use arbiter::{Arbiter, Direction, Intent, Policy};
+pub use catalogue::{Catalogue, ConfigField, Measurement, Setting, Shape};
 pub use commands::{Command, Commands, Outgoing};
 pub use firmware::{AdvertisedFirmware, Firmware};
 pub use report::{Report, Sink};
 pub use upstream::{Endpoint, Message, Relay, Target, Upstream};
 pub use wire::{Unreadable, Wire};
 
+use crate::model::Register;
+
 /// Everything the server asks of a driver.
 ///
 /// A bundle rather than a trait in its own right: it has no methods, and a blanket impl gives it to any
 /// type implementing every capability. Bound on this where a whole driver is meant — a session — and on a
 /// single capability everywhere else.
-pub trait Driver: Wire + Arbiter + Commands + Firmware + Report + Upstream {}
+pub trait Driver: Wire + Arbiter + Catalogue + Commands + Firmware + Report + Upstream {}
 
-impl<T> Driver for T where T: Wire + Arbiter + Commands + Firmware + Report + Upstream {}
+impl<T> Driver for T where T: Wire + Arbiter + Catalogue + Commands + Firmware + Report + Upstream {}
 
 /// A driver that recognises nothing.
 ///
@@ -80,6 +85,56 @@ impl Wire for Unknown {
         Err(Unreadable::Unsupported {
             generation: "none: this driver reads nothing".to_owned(),
         })
+    }
+}
+
+impl Catalogue for Unknown {
+    type Setting = catalogue::Undocumented;
+    type Measurement = catalogue::Undocumented;
+    type ConfigField = catalogue::Undocumented;
+
+    fn settings(&self, _slots: u16) -> Vec<Self::Setting> {
+        Vec::new()
+    }
+
+    fn setting(&self, _register: Register) -> Option<Self::Setting> {
+        None
+    }
+
+    fn setting_named(&self, _name: &str) -> Option<Self::Setting> {
+        None
+    }
+
+    fn describe(&self, register: Register) -> Self::Setting {
+        catalogue::Undocumented(register)
+    }
+
+    fn slot(&self, _slot: u16) -> Option<Vec<Self::Setting>> {
+        None
+    }
+
+    fn slots(&self) -> u16 {
+        0
+    }
+
+    fn measurements(&self) -> Vec<Self::Measurement> {
+        Vec::new()
+    }
+
+    fn config(&self, _register: Register) -> Option<Self::ConfigField> {
+        None
+    }
+
+    fn config_named(&self, _name: &str) -> Option<Self::ConfigField> {
+        None
+    }
+
+    fn config_last(&self) -> Register {
+        Register(0)
+    }
+
+    fn writable_config(&self) -> Vec<Self::ConfigField> {
+        Vec::new()
     }
 }
 

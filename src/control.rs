@@ -92,9 +92,8 @@ use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 
+use crate::driver::catalogue::{Catalogue, ConfigField, Setting as SettingInfo};
 use crate::driver::commands::Command;
-use crate::growatt::v7::encode::WritableConfig;
-use crate::growatt::v7::registers::{CONFIG_REGISTER_LAST, ConfigRegister, HoldingRegister, SLOT_COUNT};
 use crate::model::{Raw, Register};
 
 /// How many commands may queue per device before new ones are refused.
@@ -172,10 +171,10 @@ pub struct Outcome {
 
 impl Outcome {
     /// An outcome for a register the device did not answer about.
-    pub fn timed_out(register: Register, requested: Option<Raw>) -> Self {
+    pub fn timed_out(setting: &impl SettingInfo, requested: Option<Raw>) -> Self {
         Self {
-            name: HoldingRegister::lookup(register).map(|entry| entry.name),
-            register: register.number(),
+            name: Some(setting.name()),
+            register: setting.register().number(),
             requested: requested.map(Raw::get),
             stored: None,
             value: None,
@@ -191,11 +190,8 @@ impl Outcome {
     /// out. It does not claim the device acted on it — `error` carries that caveat rather than leaving the
     /// caller to infer it. A read is answered, but asynchronously, in an uplink frame that lands in the
     /// identity cache rather than here; a write is never answered at all.
-    pub fn sent(command: &Command) -> Self {
-        let caveat = if matches!(
-            command,
-            Command::WriteConfig { .. } | Command::Restart | Command::FactoryReset
-        ) {
+    pub fn sent(command: &Command, field: Option<&impl ConfigField>) -> Self {
+        let caveat = if matches!(command, Command::WriteConfig { .. }) {
             "sent; a config write draws no acknowledgement, so the device's action is unverified"
         } else {
             "sent; the answer arrives as a separate report, so read the register back to see it"
@@ -203,16 +199,16 @@ impl Outcome {
         Self {
             confirmed: true,
             error: Some(caveat.to_owned()),
-            ..Self::for_config(command)
+            ..Self::for_config(command, field)
         }
     }
 
     /// An outcome for a command that could not be transmitted.
-    pub fn not_sent(command: &Command, error: &str) -> Self {
+    pub fn not_sent(command: &Command, field: Option<&impl ConfigField>, error: &str) -> Self {
         Self {
             confirmed: false,
             error: Some(error.to_owned()),
-            ..Self::for_config(command)
+            ..Self::for_config(command, field)
         }
     }
 
@@ -220,25 +216,22 @@ impl Outcome {
     ///
     /// Distinct from [`Self::not_sent`] because the cause is: an unwritable register or a value out of
     /// range is the caller's mistake, and a caller can only tell if it is told.
-    pub fn refused(command: &Command, error: &str) -> Self {
+    pub fn refused(command: &Command, field: Option<&impl ConfigField>, error: &str) -> Self {
         Self {
             refused: true,
-            ..Self::not_sent(command, error)
+            ..Self::not_sent(command, field, error)
         }
     }
 
     /// The register and value fields shared by both config outcomes.
-    fn for_config(command: &Command) -> Self {
-        let (target, value) = match command {
-            Command::WriteConfig { register, value } => (Some(*register), Some(value.clone())),
-            Command::ReadConfig { registers } => (registers.first().copied(), None),
-            Command::Restart => (Some(WritableConfig::Restart.register()), None),
-            Command::FactoryReset => (Some(WritableConfig::FactoryReset.register()), None),
-            _ => (None, None),
+    fn for_config(command: &Command, field: Option<&impl ConfigField>) -> Self {
+        let value = match command {
+            Command::WriteConfig { value, .. } => Some(value.clone()),
+            _ => None,
         };
         Self {
-            name: target.and_then(ConfigRegister::lookup).map(|entry| entry.name),
-            register: target.map_or(0, Register::number),
+            name: field.map(ConfigField::name),
+            register: field.map_or(0, |field| field.register().number()),
             requested: None,
             stored: None,
             value,
@@ -249,14 +242,13 @@ impl Outcome {
     }
 
     /// An outcome from a value read back off the device.
-    pub fn read_back(register: Register, requested: Option<Raw>, stored: Raw) -> Self {
-        let entry = HoldingRegister::lookup(register);
+    pub fn read_back(setting: &impl SettingInfo, requested: Option<Raw>, stored: Raw) -> Self {
         Self {
-            name: entry.map(|entry| entry.name),
-            register: register.number(),
+            name: Some(setting.name()),
+            register: setting.register().number(),
             requested: requested.map(Raw::get),
             stored: Some(stored.get()),
-            value: entry.map(|entry| entry.decode(stored).to_string()),
+            value: Some(setting.decode(stored).to_string()),
             // Nothing requested means nothing to disagree with, so learning the value is success.
             confirmed: requested.is_none_or(|wanted| wanted == stored),
             error: None,
@@ -281,16 +273,15 @@ pub struct SettingView {
 }
 
 impl SettingView {
-    /// Describe one register's stored value, or `None` if it has no documented meaning.
-    pub fn new(register: Register, raw: Raw) -> Option<Self> {
-        let entry = HoldingRegister::lookup(register)?;
-        Some(Self {
-            register: register.number(),
-            name: entry.name,
+    /// Describe one setting's stored value.
+    pub fn new(setting: &impl SettingInfo, raw: Raw) -> Self {
+        Self {
+            register: setting.register().number(),
+            name: setting.name(),
             raw: raw.get(),
-            value: entry.decode(raw).to_string(),
-            unit: entry.unit.symbol(),
-        })
+            value: setting.decode(raw).to_string(),
+            unit: setting.unit().symbol(),
+        }
     }
 }
 
@@ -815,7 +806,7 @@ struct WriteBody {
 /// # Errors
 ///
 /// [`ControlError::Bind`] if the path cannot be bound.
-pub fn listen(path: &Path, registry: Registry) -> Result<(), ControlError> {
+pub fn listen<D: Catalogue>(path: &Path, registry: Registry, driver: Arc<D>) -> Result<(), ControlError> {
     // A leftover socket from a previous run would make binding fail. Removing it is safe: a socket file is
     // not data, and a live one would have gone when its owner exited.
     if path.exists() {
@@ -840,7 +831,7 @@ pub fn listen(path: &Path, registry: Registry) -> Result<(), ControlError> {
             "/devices/{device}/meter-reading",
             put(Api::put_meter_reading).delete(Api::delete_meter_reading),
         )
-        .route("/devices", get(Api::devices))
+        .route("/devices", get(Api::devices::<D>))
         .route("/devices/{device}", get(Api::device))
         .route("/devices/{device}/identity", get(Api::identity))
         .route("/devices/{device}/telemetry", get(Api::telemetry))
@@ -848,15 +839,15 @@ pub fn listen(path: &Path, registry: Registry) -> Result<(), ControlError> {
         .route("/devices/{device}/settings", get(Api::settings))
         .route("/devices/{device}/settings/{key}", get(Api::setting).put(Api::write))
         .route("/devices/{device}/settings/{key}/read", post(Api::refresh))
-        .route("/devices/{device}/actions", get(Api::actions))
-        .route("/devices/{device}/actions/{key}", post(Api::act))
-        .route("/devices/{device}/config/read", post(Api::read_config_set))
+        .route("/devices/{device}/actions", get(Api::actions::<D>))
+        .route("/devices/{device}/actions/{key}", post(Api::act::<D>))
+        .route("/devices/{device}/config/read", post(Api::read_config_set::<D>))
         .route(
             "/devices/{device}/config/{key}",
-            get(Api::config).put(Api::write_config),
+            get(Api::config::<D>).put(Api::write_config::<D>),
         )
-        .route("/devices/{device}/config/{key}/read", post(Api::read_config))
-        .with_state(registry);
+        .route("/devices/{device}/config/{key}/read", post(Api::read_config::<D>))
+        .with_state(ApiState { registry, driver });
 
     let socket = path.to_path_buf();
     tokio::spawn(async move {
@@ -925,25 +916,42 @@ impl DeviceAction {
         }
     }
 
-    /// The config register behind it.
-    const fn config(self) -> WritableConfig {
+    /// The config field behind it, as the catalogue names it.
+    ///
+    /// Not the same word as the route: the route reads `factory-reset` and the field is `factory_reset`,
+    /// and neither should have to change for the other.
+    const fn field(self) -> &'static str {
         match self {
-            Self::Restart => WritableConfig::Restart,
-            Self::FactoryReset => WritableConfig::FactoryReset,
-        }
-    }
-
-    /// The command that performs it.
-    fn command(self) -> Command {
-        match self {
-            Self::Restart => Command::Restart,
-            Self::FactoryReset => Command::FactoryReset,
+            Self::Restart => "restart",
+            Self::FactoryReset => "factory_reset",
         }
     }
 
     /// Find one by name.
     fn lookup(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|action| action.name() == name)
+    }
+}
+
+/// What every handler can reach: the sessions, and the driver that names what they hold.
+///
+/// The driver is here because resolving `"slot1_output_power"` to a register, or saying what a config
+/// field is called, is catalogue knowledge — and a control API that had its own copy of it would be a
+/// second table to disagree with the first.
+struct ApiState<D> {
+    /// The connected sessions.
+    registry: Registry,
+    /// The one driver this program serves.
+    driver: Arc<D>,
+}
+
+// Derived `Clone` would demand `D: Clone`, which a driver has no reason to be.
+impl<D> Clone for ApiState<D> {
+    fn clone(&self) -> Self {
+        Self {
+            registry: self.registry.clone(),
+            driver: Arc::clone(&self.driver),
+        }
     }
 }
 
@@ -986,10 +994,11 @@ struct Session {
     device: String,
 }
 
-impl FromRequestParts<Registry> for Session {
+impl<D: Send + Sync + 'static> FromRequestParts<ApiState<D>> for Session {
     type Rejection = Rejection;
 
-    async fn from_request_parts(parts: &mut Parts, registry: &Registry) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &ApiState<D>) -> Result<Self, Self::Rejection> {
+        let registry = &state.registry;
         let device = path_param(parts, "device").await?;
         let handle = registry.handle(&device).ok_or_else(|| {
             Rejection::new(
@@ -1007,10 +1016,10 @@ impl FromRequestParts<Registry> for Session {
 /// writable register. This carries the segment as sent.
 struct Key(String);
 
-impl FromRequestParts<Registry> for Key {
+impl<D: Send + Sync + 'static> FromRequestParts<ApiState<D>> for Key {
     type Rejection = Rejection;
 
-    async fn from_request_parts(parts: &mut Parts, _registry: &Registry) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, _state: &ApiState<D>) -> Result<Self, Self::Rejection> {
         path_param(parts, "key").await.map(Self)
     }
 }
@@ -1023,13 +1032,13 @@ struct Setting {
     key: String,
 }
 
-impl FromRequestParts<Registry> for Setting {
+impl<D: Catalogue> FromRequestParts<ApiState<D>> for Setting {
     type Rejection = Rejection;
 
-    async fn from_request_parts(parts: &mut Parts, _registry: &Registry) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &ApiState<D>) -> Result<Self, Self::Rejection> {
         let key = path_param(parts, "key").await?;
-        let register =
-            resolve(&key).ok_or_else(|| Rejection::new(StatusCode::NOT_FOUND, format!("unknown setting {key:?}")))?;
+        let register = resolve(state.driver.as_ref(), &key)
+            .ok_or_else(|| Rejection::new(StatusCode::NOT_FOUND, format!("unknown setting {key:?}")))?;
         Ok(Self { register, key })
     }
 }
@@ -1077,8 +1086,8 @@ impl Api {
     }
 
     /// Which devices are connected right now.
-    async fn devices(State(registry): State<Registry>) -> Response {
-        axum::Json(serde_json::json!({ "devices": registry.devices() })).into_response()
+    async fn devices<D: Send + Sync + 'static>(State(state): State<ApiState<D>>) -> Response {
+        axum::Json(serde_json::json!({ "devices": state.registry.devices() })).into_response()
     }
 
     /// What the datalogger says about itself: firmware, model, network, clock, endpoint.
@@ -1204,8 +1213,12 @@ impl Api {
     /// One config register's value, as last reported.
     ///
     /// From the accumulated identity — no device traffic, like every other `GET` here.
-    async fn config(Session { handle, .. }: Session, Key(key): Key) -> Response {
-        let register = match Self::config_register(&key) {
+    async fn config<D: Catalogue>(
+        State(state): State<ApiState<D>>,
+        Session { handle, .. }: Session,
+        Key(key): Key,
+    ) -> Response {
+        let register = match Self::config_register(state.driver.as_ref(), &key) {
             Ok(register) => register,
             Err(rejection) => return rejection.into_response(),
         };
@@ -1238,25 +1251,30 @@ impl Api {
     ///
     /// Filtered to what was asked for: the accumulated identity already holds the volunteered registers, and
     /// none of those is an answer to a request for something else.
-    async fn read_config_set(Session { handle, .. }: Session, Query(params): Query<ReadParams>) -> Response {
+    async fn read_config_set<D: Catalogue>(
+        State(state): State<ApiState<D>>,
+        Session { handle, .. }: Session,
+        Query(params): Query<ReadParams>,
+    ) -> Response {
         let batch = params.batch.unwrap_or(1);
+        let last = state.driver.config_last().number();
         match params.selection() {
             Ok(Selection::All) => {
-                let wanted = (0..=CONFIG_REGISTER_LAST).map(Register).collect();
+                let wanted = (0..=last).map(Register).collect();
                 Self::stream_config(handle, wanted, batch, "the whole config space")
             }
             Ok(Selection::Named(keys)) => {
                 let mut wanted = Vec::new();
                 for key in keys {
-                    match Self::config_register(&key) {
-                        Ok(register) if register.number() <= CONFIG_REGISTER_LAST => wanted.push(register),
+                    match Self::config_register(state.driver.as_ref(), &key) {
+                        Ok(register) if register.number() <= last => wanted.push(register),
                         // Outside the space is worth naming rather than answering nothing: the bound is
                         // known, so a number past it cannot be a typo the device will resolve.
                         Ok(register) => {
                             return problem(
                                 StatusCode::BAD_REQUEST,
                                 &format!(
-                                    "config register {} is outside the space, which ends at {CONFIG_REGISTER_LAST}",
+                                    "config register {} is outside the space, which ends at {last}",
                                     register.number()
                                 ),
                             );
@@ -1330,8 +1348,12 @@ impl Api {
     /// It also cannot answer with the value. The reply arrives asynchronously as an identity report, which is
     /// folded into the accumulated picture — so this reports that the request went out, and the `GET` above is
     /// where the value appears.
-    async fn read_config(Session { handle, .. }: Session, Key(key): Key) -> Response {
-        let register = match Self::config_register(&key) {
+    async fn read_config<D: Catalogue>(
+        State(state): State<ApiState<D>>,
+        Session { handle, .. }: Session,
+        Key(key): Key,
+    ) -> Response {
+        let register = match Self::config_register(state.driver.as_ref(), &key) {
             Ok(register) => register,
             Err(rejection) => return rejection.into_response(),
         };
@@ -1348,18 +1370,16 @@ impl Api {
     ///
     /// Any register, not only the writable ones: reading has no side effect, which is the same reasoning that
     /// leaves the holding-register read unrestricted.
-    fn config_register(key: &str) -> Result<Register, Rejection> {
+    fn config_register<D: Catalogue>(driver: &D, key: &str) -> Result<Register, Rejection> {
         if let Ok(number) = key.parse::<u16>() {
             return Ok(Register(number));
         }
-        ConfigRegister::lookup_name(key)
-            .map(|entry| entry.register)
-            .ok_or_else(|| {
-                Rejection::new(
-                    StatusCode::NOT_FOUND,
-                    format!("unknown config register {key:?}; see /devices/…/identity"),
-                )
-            })
+        driver.config_named(key).map(|entry| entry.register()).ok_or_else(|| {
+            Rejection::new(
+                StatusCode::NOT_FOUND,
+                format!("unknown config register {key:?}; see /devices/…/identity"),
+            )
+        })
     }
 
     /// What actions this device accepts.
@@ -1367,17 +1387,18 @@ impl Api {
     /// Listed rather than documented elsewhere, because the set depends on what has been observed rather than
     /// on what a register map contains: these are config-space commands, and each was captured from the
     /// vendor's own interface before being offered here.
-    async fn actions(_session: Session) -> Response {
+    async fn actions<D: Catalogue>(State(state): State<ApiState<D>>, _session: Session) -> Response {
         let listed: Vec<_> = DeviceAction::ALL
             .iter()
-            .map(|action| {
-                serde_json::json!({
+            .filter_map(|action| {
+                let field = state.driver.config_named(action.field())?;
+                Some(serde_json::json!({
                     "action": action.name(),
-                    "register": action.config().register().number(),
-                    "value": action.config().trigger_value(),
+                    "register": field.register().number(),
+                    "value": field.action(),
                     "effect": action.effect(),
                     "confirmable": false,
-                })
+                }))
             })
             .collect();
         axum::Json(serde_json::json!({ "actions": listed })).into_response()
@@ -1387,7 +1408,11 @@ impl Api {
     ///
     /// `POST`, not `PUT`: these are not idempotent in any useful sense — restarting twice restarts twice —
     /// and there is no resource whose state they set.
-    async fn act(Session { handle, .. }: Session, Key(key): Key) -> Response {
+    async fn act<D: Catalogue>(
+        State(state): State<ApiState<D>>,
+        Session { handle, .. }: Session,
+        Key(key): Key,
+    ) -> Response {
         let Some(action) = DeviceAction::lookup(&key) else {
             let known: Vec<&str> = DeviceAction::ALL.iter().map(|action| action.name()).collect();
             return problem(
@@ -1395,7 +1420,19 @@ impl Api {
                 &format!("unknown action {key:?}; this device accepts {}", known.join(", ")),
             );
         };
-        dispatch(&handle, Action::Send(action.command())).await
+        // Both halves come from the catalogue: which register the field is, and what value carries it out.
+        // A driver whose device has no such field simply does not offer the action.
+        let Some((register, value)) = state
+            .driver
+            .config_named(action.field())
+            .and_then(|field| Some((field.register(), field.action()?.to_owned())))
+        else {
+            return problem(
+                StatusCode::NOT_IMPLEMENTED,
+                &format!("this driver has no {:?} action", action.name()),
+            );
+        };
+        dispatch(&handle, Action::Send(Command::WriteConfig { register, value })).await
     }
 
     /// What the simulated meter is reporting.
@@ -1473,7 +1510,8 @@ impl Api {
     ///
     /// No read-back: the config space acknowledges nothing and answers no read for these, so the honest
     /// answer is that it was sent. Confirm with a read of the register afterwards.
-    async fn write_config(
+    async fn write_config<D: Catalogue>(
+        State(state): State<ApiState<D>>,
         Session { handle, .. }: Session,
         Key(key): Key,
         body: Result<axum::Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
@@ -1484,11 +1522,12 @@ impl Api {
         let Some(value) = body.get("value").and_then(|value| value.as_str()) else {
             return problem(StatusCode::BAD_REQUEST, r#"expected a body like {"value":"ADD:1-1-…"}"#);
         };
-        let Some(register) = WritableConfig::lookup(&key) else {
-            let writable: Vec<&str> = WritableConfig::ALL
+        let writable_config = state.driver.writable_config();
+        let Some(field) = writable_config.iter().find(|field| field.name() == key) else {
+            let writable: Vec<&str> = writable_config
                 .iter()
-                .filter(|entry| !entry.is_retarget() && !entry.is_action())
-                .map(|entry| entry.name())
+                .filter(|field| !field.is_retarget() && field.action().is_none())
+                .map(ConfigField::name)
                 .collect();
             return problem(
                 StatusCode::NOT_FOUND,
@@ -1498,7 +1537,7 @@ impl Api {
                 ),
             );
         };
-        if register.is_retarget() {
+        if field.is_retarget() {
             return problem(
                 StatusCode::FORBIDDEN,
                 &format!(
@@ -1507,7 +1546,7 @@ impl Api {
                 ),
             );
         }
-        if register.is_action() {
+        if field.action().is_some() {
             return problem(
                 StatusCode::FORBIDDEN,
                 &format!("{key:?} is an action; POST it to the actions endpoint instead"),
@@ -1517,7 +1556,7 @@ impl Api {
         dispatch(
             &handle,
             Action::Send(Command::WriteConfig {
-                register: register.register(),
+                register: field.register(),
                 value: value.to_owned(),
             }),
         )
@@ -1616,14 +1655,11 @@ async fn dispatch(handle: &SessionHandle, action: Action) -> Response {
 ///
 /// Names are what the specification uses and what a person will type; numbers are what the protocol uses
 /// and what a script may already hold.
-fn resolve(key: &str) -> Option<Register> {
+fn resolve<D: Catalogue>(driver: &D, key: &str) -> Option<Register> {
     if let Ok(number) = key.parse::<u16>() {
         return Some(Register(number));
     }
-    HoldingRegister::resync_set(SLOT_COUNT)
-        .into_iter()
-        .find(|entry| entry.name == key)
-        .map(|entry| entry.register)
+    driver.setting_named(key).map(|entry| entry.register())
 }
 
 /// A JSON error body, so a script does not have to parse prose.
@@ -1647,6 +1683,8 @@ fn problem(code: StatusCode, detail: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{Outcome, Registry, SessionHandle, SettingView, StatusView, resolve};
+    use crate::driver::catalogue::Catalogue as _;
+    use crate::growatt::driver::Growatt;
     use crate::model::{Raw, Register};
 
     /// A handle plus the ends a session would keep, so nothing is dropped mid-test.
@@ -1675,15 +1713,16 @@ mod tests {
 
     #[test]
     fn settings_resolve_by_name_or_number() {
-        assert_eq!(resolve("slot1_output_power"), Some(Register(257)));
-        assert_eq!(resolve("grid_power_allowed"), Some(Register(326)));
-        assert_eq!(resolve("326"), Some(Register(326)));
+        // Against the real catalogue: the point of the test is that names resolve, not that a stub does.
+        assert_eq!(resolve(&Growatt, "slot1_output_power"), Some(Register(257)));
+        assert_eq!(resolve(&Growatt, "grid_power_allowed"), Some(Register(326)));
+        assert_eq!(resolve(&Growatt, "326"), Some(Register(326)));
         // A number is taken at face value even if undocumented; the encoder decides whether it may be
         // written, and reading anything is harmless.
-        assert_eq!(resolve("321"), Some(Register(321)));
-        assert_eq!(resolve("nonsense"), None);
+        assert_eq!(resolve(&Growatt, "321"), Some(Register(321)));
+        assert_eq!(resolve(&Growatt, "nonsense"), None);
         // Slots beyond the first resolve too, so a nine-slot install is addressable.
-        assert_eq!(resolve("slot9_output_power"), Some(Register(297)));
+        assert_eq!(resolve(&Growatt, "slot9_output_power"), Some(Register(297)));
     }
 
     #[test]
@@ -1792,7 +1831,7 @@ mod tests {
 
     #[test]
     fn a_matching_read_back_confirms() {
-        let outcome = Outcome::read_back(Register(257), Some(Raw(100)), Raw(100));
+        let outcome = Outcome::read_back(&Growatt.describe(Register(257)), Some(Raw(100)), Raw(100));
         assert!(outcome.confirmed);
         assert_eq!(outcome.requested, Some(100));
         assert_eq!(outcome.stored, Some(100));
@@ -1804,7 +1843,7 @@ mod tests {
     #[test]
     fn a_clamped_write_is_reported_not_hidden() {
         // The case this whole read-back exists for: 1000 W stored as 800 because power_plus is clear.
-        let outcome = Outcome::read_back(Register(322), Some(Raw(1000)), Raw(800));
+        let outcome = Outcome::read_back(&Growatt.describe(Register(322)), Some(Raw(1000)), Raw(800));
         assert!(!outcome.confirmed);
         assert_eq!(outcome.requested, Some(1000));
         assert_eq!(outcome.stored, Some(800));
@@ -1813,7 +1852,7 @@ mod tests {
     #[test]
     fn learning_a_value_nobody_requested_counts_as_success() {
         // Reading 322 after toggling power_plus: no expected value, only a stale one to replace.
-        let outcome = Outcome::read_back(Register(322), None, Raw(800));
+        let outcome = Outcome::read_back(&Growatt.describe(Register(322)), None, Raw(800));
         assert!(outcome.confirmed);
         assert_eq!(outcome.requested, None);
         assert_eq!(outcome.stored, Some(800));
@@ -1821,7 +1860,7 @@ mod tests {
 
     #[test]
     fn an_unanswered_read_back_is_an_error_not_a_confirmation() {
-        let outcome = Outcome::timed_out(Register(257), Some(Raw(100)));
+        let outcome = Outcome::timed_out(&Growatt.describe(Register(257)), Some(Raw(100)));
         assert!(!outcome.confirmed);
         assert!(outcome.stored.is_none());
         assert!(outcome.error.is_some());
@@ -1829,29 +1868,50 @@ mod tests {
 
     #[test]
     fn a_setting_view_renders_by_domain() {
-        let flag = SettingView::new(Register(326), Raw(1)).expect("documented");
+        let flag = Growatt
+            .setting(Register(326))
+            .map(|entry| SettingView::new(&entry, Raw(1)))
+            .expect("documented");
         assert_eq!(flag.name, "grid_power_allowed");
         assert_eq!(flag.value, "1");
 
-        let time = SettingView::new(Register(254), Raw(0x173B)).expect("documented");
+        let time = Growatt
+            .setting(Register(254))
+            .map(|entry| SettingView::new(&entry, Raw(0x173B)))
+            .expect("documented");
         assert_eq!(time.value, "23:59");
 
-        let mode = SettingView::new(Register(256), Raw(2)).expect("documented");
+        let mode = Growatt
+            .setting(Register(256))
+            .map(|entry| SettingView::new(&entry, Raw(2)))
+            .expect("documented");
         assert_eq!(mode.value, "smart_self_use");
 
         assert_eq!(
-            SettingView::new(Register(257), Raw(100)).map(|view| view.unit),
+            Growatt
+                .setting(Register(257))
+                .map(|entry| SettingView::new(&entry, Raw(100)))
+                .map(|view| view.unit),
             Some("W")
         );
 
         // Undocumented registers have nothing to show.
-        assert!(SettingView::new(Register(321), Raw(0)).is_none());
+        assert!(
+            Growatt
+                .setting(Register(321))
+                .map(|entry| SettingView::new(&entry, Raw(0)))
+                .is_none()
+        );
     }
 
     #[test]
     fn outcomes_serialise_for_a_script_to_read() {
-        let json =
-            serde_json::to_string(&Outcome::read_back(Register(257), Some(Raw(100)), Raw(100))).expect("serialise");
+        let json = serde_json::to_string(&Outcome::read_back(
+            &Growatt.describe(Register(257)),
+            Some(Raw(100)),
+            Raw(100),
+        ))
+        .expect("serialise");
         assert!(json.contains(r#""confirmed":true"#), "{json}");
         assert!(json.contains(r#""name":"slot1_output_power""#), "{json}");
         assert!(json.contains(r#""stored":100"#), "{json}");

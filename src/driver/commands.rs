@@ -46,6 +46,10 @@ pub enum Command {
     },
 
     /// Write one field of the device's own configuration.
+    ///
+    /// Also how an action is asked for: a field the catalogue says is an action is carried out by writing
+    /// the trigger value it names. There is no separate variant for restarting, because whether a device
+    /// has such a field — and what writing it takes — is exactly what a catalogue is for.
     WriteConfig {
         /// The field.
         register: Register,
@@ -66,12 +70,6 @@ pub enum Command {
         /// Whether the reading is to be believed.
         valid: bool,
     },
-
-    /// Restart the datalogger.
-    Restart,
-
-    /// Return the datalogger to its factory settings.
-    FactoryReset,
 }
 
 /// A command, ready to send.

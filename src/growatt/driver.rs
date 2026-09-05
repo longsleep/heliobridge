@@ -10,6 +10,7 @@
 //! would change.
 
 use crate::driver::arbiter::{Arbiter, Direction, Intent};
+use crate::driver::catalogue::Catalogue;
 use crate::driver::commands::{Command, Commands, Outgoing};
 use crate::driver::report::{Report, Sink};
 use crate::driver::upstream::{Endpoint, Target, Upstream};
@@ -17,8 +18,10 @@ use crate::driver::{AdvertisedFirmware, Firmware, Unreadable, Wire};
 use crate::growatt::cloud::{self, Relay, RelayError};
 use crate::growatt::v7::encode::EncodeError;
 use crate::growatt::v7::frame::Frame;
+use crate::growatt::v7::registers::{CONFIG_REGISTER_LAST, HoldingRegister, InputRegister, SLOT_COUNT};
 use crate::growatt::{Codec, peek_version};
-use crate::growatt::{commands, firmware, report};
+use crate::growatt::{catalogue, commands, firmware, report};
+use crate::model::Register;
 
 /// Growatt's generation-7 protocol.
 #[derive(Debug, Clone, Copy, Default)]
@@ -43,6 +46,58 @@ impl Wire for Growatt {
         Frame::parse(payload).map_err(|error| Unreadable::Malformed {
             reason: error.to_string(),
         })
+    }
+}
+
+impl Catalogue for Growatt {
+    type Setting = HoldingRegister;
+    type Measurement = &'static InputRegister;
+    type ConfigField = catalogue::ConfigField;
+
+    fn settings(&self, slots: u16) -> Vec<Self::Setting> {
+        HoldingRegister::resync_set(slots.min(SLOT_COUNT))
+    }
+
+    fn setting(&self, register: Register) -> Option<Self::Setting> {
+        HoldingRegister::lookup(register)
+    }
+
+    fn setting_named(&self, name: &str) -> Option<Self::Setting> {
+        HoldingRegister::resync_set(SLOT_COUNT)
+            .into_iter()
+            .find(|entry| entry.name == name)
+    }
+
+    fn describe(&self, register: Register) -> Self::Setting {
+        HoldingRegister::lookup(register).unwrap_or_else(|| catalogue::placeholder(register))
+    }
+
+    fn slot(&self, slot: u16) -> Option<Vec<Self::Setting>> {
+        HoldingRegister::slot(slot).map(Vec::from)
+    }
+
+    fn slots(&self) -> u16 {
+        SLOT_COUNT
+    }
+
+    fn measurements(&self) -> Vec<Self::Measurement> {
+        catalogue::measurements()
+    }
+
+    fn config(&self, register: Register) -> Option<Self::ConfigField> {
+        catalogue::ConfigField::lookup(register)
+    }
+
+    fn config_named(&self, name: &str) -> Option<Self::ConfigField> {
+        catalogue::ConfigField::lookup_name(name)
+    }
+
+    fn config_last(&self) -> Register {
+        Register(CONFIG_REGISTER_LAST)
+    }
+
+    fn writable_config(&self) -> Vec<Self::ConfigField> {
+        catalogue::ConfigField::writable()
     }
 }
 

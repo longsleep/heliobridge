@@ -40,6 +40,7 @@
 //! implementor is a guess about the second one. [`Codec`] exists only because version dispatch is a
 //! real, observed requirement.
 
+pub mod catalogue;
 pub mod cloud;
 pub mod commands;
 pub mod driver;

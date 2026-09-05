@@ -57,7 +57,5 @@ fn translate(asked: &Asked) -> Result<Command, EncodeError> {
         }
         Asked::PushTime(time) => Command::time_push(*time),
         Asked::MeterReading { watts, valid } => meter::command(*watts, *valid),
-        Asked::Restart => Ok(Command::restart_datalogger()),
-        Asked::FactoryReset => Ok(Command::factory_reset()),
     }
 }
