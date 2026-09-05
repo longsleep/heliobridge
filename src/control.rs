@@ -319,7 +319,7 @@ pub struct IdentityView {
 /// Which config registers a read is for.
 #[derive(Debug, PartialEq, Eq)]
 enum Selection {
-    /// The whole space, `0..=CONFIG_REGISTER_LAST`.
+    /// The whole space, from zero to the last register the driver's catalogue names.
     All,
     /// The keys named, each a field name or a register number.
     Named(Vec<String>),
@@ -366,7 +366,7 @@ impl ReadParams {
 /// What a complete read of the configuration space found.
 ///
 /// The space is bounded, so this is a terminating operation with a fixed cost rather than a probe: every
-/// register from 0 to [`CONFIG_REGISTER_LAST`] is asked for exactly once.
+/// register from zero to the catalogue's last is asked for exactly once.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReadAllView {
     /// How many registers were asked for. Constant unless the session went away part-way through.

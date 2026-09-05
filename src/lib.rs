@@ -14,6 +14,8 @@
 //! # Layout
 //!
 //! - [`model`] — vendor-neutral data model: register and value newtypes, units, scaling, readings.
+//! - [`driver`] — the seam: what this server asks of a manufacturer's implementation, one trait per
+//!   capability. Everything below reaches Growatt through it, and only the binary names Growatt itself.
 //! - [`growatt`] — the Growatt protocol family, with a module per protocol generation. Pure
 //!   `bytes → values`, no I/O and no MQTT types.
 //! - [`mqtt`] — MQTT 3.1.1 packet codec. Transport, and direction-agnostic: the device-facing server
@@ -59,6 +61,61 @@ mod tests {
     #[test]
     fn version_is_populated() {
         assert!(!VERSION.is_empty());
+    }
+
+    /// The seam holds, or it is not a seam.
+    ///
+    /// Two modules may name Growatt: the implementation itself, and the binary, which is where a driver is
+    /// chosen. Everywhere else reaches it through [`crate::driver`], and the whole value of that is that it
+    /// cannot be quietly worked around — an `use crate::growatt::…` added to a handler compiles perfectly
+    /// well and undoes the abstraction, so the check has to be mechanical rather than a convention.
+    ///
+    /// Test modules are exempt and scanning stops at the first `#[cfg(test)]`: a test may well name the
+    /// driver it is testing, and this crate keeps its test modules at the foot of the file.
+    #[test]
+    fn only_the_binary_and_the_implementation_name_a_manufacturer() {
+        fn scan(directory: &std::path::Path, offenders: &mut Vec<String>) {
+            let entries = std::fs::read_dir(directory).expect("the source tree is readable");
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+                // The implementation, and the one place that chooses it.
+                if name.starts_with("growatt") || name == "bin" {
+                    continue;
+                }
+                if path.is_dir() {
+                    scan(&path, offenders);
+                    continue;
+                }
+                if path.extension().is_none_or(|extension| extension != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("a source file is readable");
+                for (number, line) in text.lines().enumerate() {
+                    if line.contains("#[cfg(test)]") {
+                        break;
+                    }
+                    let code = line.trim_start();
+                    if code.starts_with("//") {
+                        continue;
+                    }
+                    if code.contains("crate::growatt") || code.contains("growatt::") {
+                        offenders.push(format!("{}:{}: {}", path.display(), number + 1, code.trim()));
+                    }
+                }
+            }
+        }
+
+        let mut offenders = Vec::new();
+        scan(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut offenders,
+        );
+        assert!(
+            offenders.is_empty(),
+            "these reach past the driver seam; ask the driver instead:\n{}",
+            offenders.join("\n")
+        );
     }
 
     #[test]

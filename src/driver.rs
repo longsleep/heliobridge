@@ -36,10 +36,16 @@
 //!
 //! # Scope, honestly stated
 //!
-//! Framing, firmware and the cloud relay exist so far. Telemetry, settings, the register maps and the
-//! policy for cloud writes still reach the server as Growatt types directly. This module is the
-//! direction of travel and the place the next capability goes, not a finished abstraction layer, and it
-//! says so rather than implying more separation than exists.
+//! Every capability the server uses is here, and no module outside [`crate::growatt`] and the binary names
+//! a Growatt type — a test in the crate root fails if one does. What that does *not* claim is that a
+//! second driver would fit without changes: one implementation is one data point, and the places most
+//! likely to need widening are known. [`firmware::Firmware`] assumes HTTP. [`catalogue::Shape`] enumerates
+//! the controls this program publishes, so a device with a kind of setting nobody here has seen would need
+//! an arm added. [`upstream::Message`] assumes the relay's transport is publish/subscribe, which is true of
+//! both ends here and need not be elsewhere.
+//!
+//! Each of those is a seam that can be widened when a second driver arrives, by someone who can then see
+//! what it actually needs rather than guessing now.
 
 pub mod arbiter;
 pub mod catalogue;
