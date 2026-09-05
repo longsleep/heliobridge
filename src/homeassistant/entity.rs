@@ -13,7 +13,7 @@
 use core::fmt;
 use std::collections::HashSet;
 
-use crate::growatt::v7::registers::{Domain, HoldingRegister, INPUT_REGISTERS, InputRegister, Kind, SLOT_COUNT};
+use crate::driver::catalogue::{Catalogue as Registers, Measurement, Setting as SettingInfo, Shape as Control};
 use crate::homeassistant::command::Permitted;
 use crate::model::{Scaling, Unit};
 
@@ -259,26 +259,26 @@ impl Entity {
     ///
     /// The component follows from the domain, which is the same thing the encoder validates against — so
     /// an entity can never offer a value the device would refuse.
-    pub fn for_setting(register: &HoldingRegister) -> Self {
-        let (component, shape) = match register.domain {
-            Domain::Range { min, max } => (
+    pub fn for_setting(setting: &impl SettingInfo) -> Self {
+        let (component, shape) = match setting.shape() {
+            Control::Number { min, max } => (
                 Component::Number,
                 Shape::Numeric(Bounds {
                     min: i32::from(min),
                     max: i32::from(max),
                 }),
             ),
-            Domain::Flag => (Component::Switch, Shape::Toggle),
-            Domain::TimeOfDay => (Component::Text, Shape::TimeOfDay),
-            Domain::Enum(labels) => (Component::Select, Shape::Choice(labels)),
+            Control::Switch => (Component::Switch, Shape::Toggle),
+            Control::TimeOfDay | Control::Text => (Component::Text, Shape::TimeOfDay),
+            Control::Choice { labels } => (Component::Select, Shape::Choice(labels)),
         };
 
         Self {
-            key: register.name,
-            name: label(register.name),
+            key: setting.name(),
+            name: label(setting.name()),
             component,
             device_class: None,
-            unit: symbol(register.unit),
+            unit: symbol(setting.unit()),
             // Every setting is configuration, so none of them clutter the dashboard.
             category: Some(Category::Config),
             // A setting is a whole number of watts, percent or minutes; its step carries the resolution.
@@ -286,10 +286,9 @@ impl Entity {
             shape,
             source: Some(Source::Settings),
             presence: Presence::Device,
-            gate: register.superseded_by.map(|by| Gate::SettingIsNot {
-                setting: by.setting,
-                value: by.when,
-            }),
+            gate: setting
+                .superseded_by()
+                .map(|(setting, value)| Gate::SettingIsNot { setting, value }),
         }
     }
 
@@ -297,42 +296,42 @@ impl Entity {
     ///
     /// A register whose meaning is not established is not published: a value nobody can interpret is
     /// noise on a dashboard, and it stays available through the control API for investigation.
-    pub fn for_reading(register: &InputRegister) -> Option<Self> {
-        if register.name.starts_with("unknown_") {
+    pub fn for_reading(reading: &impl Measurement) -> Option<Self> {
+        if reading.is_unknown() {
             return None;
         }
         // Published as the assembled version instead.
-        if VERSION_PARTS.contains(&register.name) {
+        if VERSION_PARTS.contains(&reading.name()) {
             return None;
         }
         // Text registers are the serial, split across four of them. The device already carries its serial
         // as its identity, so publishing the pieces would add four entities saying what one already says.
-        if matches!(register.kind, Kind::Text { .. }) {
+        if matches!(reading.shape(), Control::Text) {
             return None;
         }
 
         // A flags word and a label share this much: neither is a quantity, so neither may carry a unit, a
         // device class or a state class. `0` faults is not a measurement of nothing.
-        let flags = is_flags(register.name);
-        let signal = is_signal(register.name);
-        let numeric = !flags && !signal && matches!(register.kind, Kind::Int | Kind::Float | Kind::Float32);
+        let flags = is_flags(reading.name());
+        let signal = is_signal(reading.name());
+        let numeric = !flags && !signal && matches!(reading.shape(), Control::Number { .. });
         let device_class = numeric
-            .then(|| device_class(register.name, register.unit))
+            .then(|| device_class(reading.name(), reading.unit()))
             .flatten()
-            .or_else(|| matches!(register.kind, Kind::Enum(_)).then_some("enum"));
+            .or_else(|| matches!(reading.shape(), Control::Choice { .. }).then_some("enum"));
 
         Some(Self {
-            key: register.name,
-            name: label(register.name),
+            key: reading.name(),
+            name: label(reading.name()),
             component: if signal {
                 Component::BinarySensor
             } else {
                 Component::Sensor
             },
             device_class: if signal { Some("connectivity") } else { device_class },
-            unit: numeric.then(|| symbol(register.unit)).flatten(),
-            category: diagnostic(register.name),
-            precision: numeric.then(|| precision(register.scaling)),
+            unit: numeric.then(|| symbol(reading.unit())).flatten(),
+            category: diagnostic(reading.name()),
+            precision: numeric.then(|| precision(reading.scaling())),
             shape: if flags {
                 Shape::Flags
             } else if signal {
@@ -342,7 +341,7 @@ impl Entity {
             },
             source: Some(Source::Telemetry),
             presence: Presence::Device,
-            gate: register.gated_by.map(|reading| Gate::ReadingIsSet { reading }),
+            gate: reading.gated_by().map(|reading| Gate::ReadingIsSet { reading }),
         })
     }
 
@@ -695,10 +694,12 @@ impl Catalogue {
     ///
     /// The settings are exactly the resync set — the same registers the session reads back on connect — so
     /// every published setting entity has a value behind it rather than sitting unavailable forever.
-    pub fn entities(self) -> Vec<Entity> {
-        let reported: HashSet<&'static str> = INPUT_REGISTERS.iter().map(|register| register.name).collect();
+    pub fn entities<D: Registers>(self, driver: &D) -> Vec<Entity> {
+        let measurements = driver.measurements();
+        let reported: HashSet<&'static str> = measurements.iter().map(Measurement::name).collect();
 
-        let settings: Vec<Entity> = HoldingRegister::resync_set(self.slots.min(SLOT_COUNT))
+        let settings: Vec<Entity> = driver
+            .settings(self.slots)
             .into_iter()
             .map(|register| {
                 let mut entity = Entity::for_setting(&register);
@@ -707,10 +708,10 @@ impl Catalogue {
                 // then — a duplicate key is an entity Home Assistant drops without saying so — and it
                 // reads from telemetry, which is fresher by up to an hour: the settings cache learns of a
                 // change made in the vendor app from the hourly snapshot, and from nothing sooner.
-                if reported.contains(register.name) {
+                if reported.contains(register.name()) {
                     entity.source = Some(Source::Telemetry);
                 }
-                if self.permitted.allows(register.name) {
+                if self.permitted.allows(register.name()) {
                     entity
                 } else {
                     entity.into_read_only()
@@ -719,7 +720,7 @@ impl Catalogue {
             .collect();
 
         let claimed: HashSet<&'static str> = settings.iter().map(|entity| entity.key).collect();
-        let readings = INPUT_REGISTERS
+        let readings = measurements
             .iter()
             .filter_map(Entity::for_reading)
             .filter(|entity| self.includes(entity))
@@ -772,15 +773,15 @@ impl Catalogue {
     /// differently. Both forms of every setting are included: refusing writes changes an entity's
     /// *component*, and therefore its discovery topic, so a `switch` that became a `sensor` leaves a
     /// retained message behind under its old name.
-    pub fn everything() -> Vec<Entity> {
+    pub fn everything<D: Registers>(driver: &D) -> Vec<Entity> {
         let widest = Self {
-            slots: SLOT_COUNT,
+            slots: driver.slots(),
             permitted: Permitted::default(),
             packs: BATTERY_PACKS,
         };
         // Two passes cover every component a setting can be published as: with writes refused, each control
         // becomes a sensor, and that includes the one setting whose reachability is configurable on its own.
-        let mut all = widest.entities();
+        let mut all = widest.entities(driver);
         all.extend(
             Self {
                 permitted: Permitted {
@@ -789,7 +790,7 @@ impl Catalogue {
                 },
                 ..widest
             }
-            .entities(),
+            .entities(driver),
         );
         all
     }
@@ -1014,6 +1015,7 @@ mod tests {
     use super::{
         Catalogue, Category, Component, Entity, Gate, METER_CONNECTED, Shape, Source, StateClass, VERSION_PARTS,
     };
+    use crate::growatt::driver::Growatt;
     use crate::growatt::v7::registers::{
         Availability, ConfigRegister, HOLDING_REGISTERS, HoldingRegister, INPUT_REGISTERS, InputRegister, Kind,
     };
@@ -1029,7 +1031,7 @@ mod tests {
     fn every_config_entity_reads_a_register_the_device_reports() {
         // Actions are excluded because they carry no state at all: a button has no state topic, so there
         // is nothing for the device to report and no register to require in the identity report.
-        let published: Vec<_> = Catalogue::everything()
+        let published: Vec<_> = Catalogue::everything(&Growatt)
             .into_iter()
             .filter(|entity| entity.source == Some(Source::Config) && entity.shape != Shape::Action)
             .collect();
@@ -1182,7 +1184,7 @@ mod tests {
         // entities would share a unique_id, which Home Assistant resolves by dropping one without saying
         // so — and the telemetry copy is the fresher source, since the settings cache learns of a change
         // made elsewhere only when the next hourly snapshot arrives.
-        let entities = Catalogue::default().entities();
+        let entities = Catalogue::default().entities(&Growatt);
         for key in ["charge_limit_upper", "charge_limit_lower"] {
             let matching: Vec<&Entity> = entities.iter().filter(|entity| entity.key == key).collect();
             assert_eq!(matching.len(), 1, "{key} appears {} times", matching.len());
@@ -1205,7 +1207,7 @@ mod tests {
                 slots,
                 ..Catalogue::default()
             }
-            .entities();
+            .entities(&Growatt);
             let mut keys: Vec<&str> = entities.iter().map(|entity| entity.key).collect();
             let total = keys.len();
             keys.sort_unstable();
@@ -1216,7 +1218,7 @@ mod tests {
 
     #[test]
     fn a_settings_entity_reads_the_settings_topic_unless_telemetry_carries_it() {
-        let entities = Catalogue::default().entities();
+        let entities = Catalogue::default().entities(&Growatt);
         let source = |key: &str| {
             entities
                 .iter()

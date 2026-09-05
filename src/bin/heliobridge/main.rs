@@ -251,7 +251,7 @@ impl<'a> Bridge<'a> {
         let registry = self.registry.take().unwrap_or_default();
         let publisher = self
             .runtime
-            .block_on(async { Publisher::start(broker, topics, registry.clone(), options) })
+            .block_on(async { Publisher::start(broker, topics, registry.clone(), options, Arc::clone(&self.driver)) })
             .map_err(|error| format!("broker: {}", chain(&error)))?;
         self.runtime.spawn(publisher.run());
 

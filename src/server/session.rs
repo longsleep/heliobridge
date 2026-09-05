@@ -31,7 +31,6 @@ use crate::driver::commands::{Command, Outgoing};
 use crate::driver::report::{Sink, Snapshot, Telemetry, WriteAck};
 use crate::driver::upstream::{Message as CloudMessage, Relay as _, Target};
 use crate::driver::wire::Unreadable;
-use crate::growatt::product::Product;
 use crate::model::{Hex, Raw, Register, Timestamp};
 use crate::mqtt::{Packet, PacketStream, Publish, QoS, StreamError};
 use crate::record::{Recorder, Stream as RecordStream};
@@ -332,7 +331,7 @@ pub struct Session<S, D: Driver> {
     identity: Option<Described>,
     /// The product, as last identified from an identity report. Held so a change is noticed and the
     /// caution about telemetry labels is said once rather than per report.
-    product: Product,
+    product: Option<&'static str>,
     recorder: Option<Recorder>,
     firmware: Option<FirmwareStore<D>>,
     slots: u16,
@@ -449,7 +448,7 @@ where
             policy: Policy::default(),
             cloud_commands: CloudCommands::default(),
             identity: None,
-            product: Product::Unrecognised,
+            product: None,
             recorder: None,
             firmware: None,
             slots: 1,
@@ -1132,20 +1131,24 @@ where
     /// second or so into the session, after the CONNECT that carried only a serial. Said again if the
     /// answer ever changes, which would mean the device was reprovisioned under this session.
     fn note_product(&mut self) {
-        let product = Product::reported(self.identity.as_ref().and_then(|held| held.get("device_type")));
+        let device_type = self
+            .identity
+            .as_ref()
+            .and_then(|held| held.get("device_type"))
+            .map(str::to_owned);
+        let product = self.driver.product_name(device_type.as_deref());
         if product == self.product {
             return;
         }
         self.product = product;
-        tracing::info!(%product, "identified the product");
+        tracing::info!(product = product.unwrap_or("unrecognised"), "identified the product");
 
-        // The settings registers agree across the product family and most telemetry registers carry the
-        // same quantity, so this is a caution about individual labels rather than a warning that nothing
-        // works.
-        if !product.telemetry_map_matches() {
+        // The settings registers agree across a product family and most telemetry registers carry the same
+        // quantity, so this is a caution about individual labels rather than a warning that nothing works.
+        if !self.driver.telemetry_matches(device_type.as_deref()) {
             tracing::warn!(
-                %product,
-                "serving a device this build's telemetry map was not written for; settings are \
+                product = product.unwrap_or("unrecognised"),
+                "serving a device this driver's telemetry map was not written for; settings are \
                  shared across the family, but individual readings may be mislabelled"
             );
         }

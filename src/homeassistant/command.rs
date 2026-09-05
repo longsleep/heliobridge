@@ -20,10 +20,8 @@
 use serde_json::Value;
 use snafu::Snafu;
 
+use crate::driver::catalogue::{Catalogue, ConfigField, Setting, Shape};
 use crate::driver::commands::Command;
-use crate::growatt::v7::encode::WritableConfig;
-use crate::growatt::v7::meter;
-use crate::growatt::v7::registers::{Domain, HoldingRegister, SLOT_COUNT};
 use crate::homeassistant::entity::{METER_READING, WITHDRAW_METER_READING};
 use crate::model::Register;
 
@@ -126,8 +124,11 @@ pub enum Delivery {
 pub struct Change {
     /// The field name, for logging and for the read-back that follows.
     pub key: String,
-    /// The register it addresses.
-    pub register: Register,
+    /// The register it addresses, where the catalogue names one.
+    ///
+    /// A supplied meter reading has none worth naming: it is a data channel the driver writes wherever its
+    /// protocol keeps one, and nothing here reads it back.
+    pub register: Option<Register>,
     /// The command that carries it out.
     pub command: Command,
     /// How to deliver it.
@@ -149,7 +150,11 @@ impl Change {
     /// # Errors
     ///
     /// [`CommandError`] naming the field and what was wrong with it.
-    pub fn from_payload(payload: &[u8], permitted: Permitted) -> Result<Vec<Self>, CommandError> {
+    pub fn from_payload<D: Catalogue>(
+        payload: &[u8],
+        permitted: Permitted,
+        driver: &D,
+    ) -> Result<Vec<Self>, CommandError> {
         let value: Value = serde_json::from_slice(payload).map_err(|_ignored| CommandError::Malformed)?;
         let object = value.as_object().ok_or(CommandError::Malformed)?;
         if object.is_empty() {
@@ -158,50 +163,49 @@ impl Change {
 
         object
             .iter()
-            .map(|(key, value)| Self::one(key, value, permitted))
+            .map(|(key, value)| Self::one(key, value, permitted, driver))
             .collect()
     }
 
     /// One field of a command payload.
-    fn one(key: &str, value: &Value, permitted: Permitted) -> Result<Self, CommandError> {
-        if let Some(action) = Self::action(key, permitted) {
+    fn one<D: Catalogue>(key: &str, value: &Value, permitted: Permitted, driver: &D) -> Result<Self, CommandError> {
+        if let Some(action) = Self::action(key, permitted, driver) {
             return action;
         }
         if let Some(reading) = Self::meter_reading(key, value, permitted) {
             return reading;
         }
 
-        let register = HoldingRegister::resync_set(SLOT_COUNT)
-            .into_iter()
-            .find(|entry| entry.name == key)
+        let setting = driver
+            .setting_named(key)
             .ok_or_else(|| CommandError::Unknown { key: key.to_owned() })?;
 
         if !permitted.allows(key) {
             return Err(CommandError::Refused { key: key.to_owned() });
         }
 
-        let raw = raw_value(&register, value).ok_or_else(|| CommandError::Shape {
+        let raw = raw_value(&setting, value).ok_or_else(|| CommandError::Shape {
             key: key.to_owned(),
-            expected: describe(register.domain),
+            expected: describe(setting.shape()),
             got: rendered(value),
         })?;
 
         // Checked here as well as by the driver, which refuses the same value again before there are any
         // octets: a control that answers "42 is not a work mode" is more use than one that reports a
         // command it could not send. Either way the device never gets a chance to clamp it silently.
-        if !register.domain.accepts(raw) {
+        if !setting.accepts(raw) {
             return Err(CommandError::Domain {
                 key: key.to_owned(),
-                accepted: register.domain.describe(),
+                accepted: setting.accepted(),
                 value: raw,
             });
         }
 
         Ok(Self {
             key: key.to_owned(),
-            register: register.register,
+            register: Some(setting.register()),
             command: Command::Set {
-                register: register.register,
+                register: setting.register(),
                 value: raw,
             },
             delivery: Delivery::Confirmed,
@@ -247,7 +251,7 @@ impl Change {
 
         Some(Ok(Self {
             key: key.to_owned(),
-            register: meter::FIRST_REGISTER,
+            register: None,
             command: Command::MeterReading {
                 watts,
                 valid: !withdrawing,
@@ -267,10 +271,11 @@ impl Change {
     /// the encoder already says it means. A destructive action is refused rather than left unmatched: it is
     /// not published as an entity, and a command naming it — retained on the broker, or hand-published —
     /// must not get through a control that was never offered.
-    fn action(key: &str, permitted: Permitted) -> Option<Result<Self, CommandError>> {
-        let action = WritableConfig::ALL
+    fn action<D: Catalogue>(key: &str, permitted: Permitted, driver: &D) -> Option<Result<Self, CommandError>> {
+        let action = driver
+            .writable_config()
             .into_iter()
-            .find(|config| config.is_action() && config.name() == key)?;
+            .find(|field| field.action().is_some() && field.name() == key)?;
 
         // Both refusals produce the same answer, because both mean the same thing to a caller: this
         // name is not a control that may be operated. Destructive actions are never offered, and refusing
@@ -278,11 +283,11 @@ impl Change {
         if action.is_destructive() || !permitted.allows(key) {
             return Some(Err(CommandError::Refused { key: key.to_owned() }));
         }
-        let value = action.trigger_value()?.to_owned();
+        let value = action.action()?.to_owned();
 
         Some(Ok(Self {
             key: key.to_owned(),
-            register: action.register(),
+            register: Some(action.register()),
             command: Command::WriteConfig {
                 register: action.register(),
                 value,
@@ -302,21 +307,22 @@ impl Change {
 }
 
 /// The raw register value a JSON value means for this setting, or `None` if it is the wrong shape.
-fn raw_value(register: &HoldingRegister, value: &Value) -> Option<u16> {
-    match register.domain {
+fn raw_value(setting: &impl Setting, value: &Value) -> Option<u16> {
+    match setting.shape() {
         // A switch's payloads are written out in its discovery message as `{"key": 1}` and `{"key": 0}`. A
         // JSON boolean is accepted too, since a hand-written command is the obvious place for one.
-        Domain::Flag => match value {
+        Shape::Switch => match value {
             Value::Bool(flag) => Some(u16::from(*flag)),
             _ => number(value).filter(|raw| *raw <= 1),
         },
-        Domain::Range { .. } => number(value),
-        Domain::Enum(labels) => {
+        Shape::Number { .. } => number(value),
+        Shape::Choice { labels } => {
             let label = value.as_str()?;
             let index = labels.iter().position(|known| *known == label)?;
             u16::try_from(index).ok()
         }
-        Domain::TimeOfDay => {
+        Shape::Text => value.as_str().and_then(|text| text.parse().ok()),
+        Shape::TimeOfDay => {
             let (hours, minutes) = value.as_str()?.split_once(':')?;
             let hour: u16 = hours.parse().ok()?;
             let minute: u16 = minutes.parse().ok()?;
@@ -335,12 +341,13 @@ fn number(value: &Value) -> Option<u16> {
 }
 
 /// What a setting accepts, for an error message.
-fn describe(domain: Domain) -> String {
-    match domain {
-        Domain::Flag => "0 or 1".to_owned(),
-        Domain::Range { min, max } => format!("a whole number {min}..={max}"),
-        Domain::Enum(labels) => format!("one of {}", labels.join(", ")),
-        Domain::TimeOfDay => "a time as \"HH:MM\"".to_owned(),
+fn describe(shape: Shape) -> String {
+    match shape {
+        Shape::Switch => "0 or 1".to_owned(),
+        Shape::Number { min, max } => format!("a whole number {min}..={max}"),
+        Shape::Choice { labels } => format!("one of {}", labels.join(", ")),
+        Shape::TimeOfDay => "a time as \"HH:MM\"".to_owned(),
+        Shape::Text => "text".to_owned(),
     }
 }
 
@@ -358,11 +365,13 @@ fn rendered(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Change, CommandError, Delivery, POWER_PLUS, Permitted, WritableConfig};
+    use super::{Change, CommandError, Delivery, POWER_PLUS, Permitted};
+    use crate::driver::catalogue::{Catalogue as _, ConfigField as _, Setting as _};
+    use crate::growatt::driver::Growatt;
     use crate::model::Register;
 
     fn parse(payload: &str) -> Result<Vec<Change>, CommandError> {
-        Change::from_payload(payload.as_bytes(), Permitted::default())
+        Change::from_payload(payload.as_bytes(), Permitted::default(), &Growatt)
     }
 
     /// The one change a payload asks for.
@@ -376,10 +385,13 @@ mod tests {
     fn each_component_sends_its_value_the_way_discovery_said_it_would() {
         // The other half of the discovery message. A number for a number, 1 or 0 for a switch, the chosen
         // label for a select, HH:MM for the text entities standing in for a missing time component.
-        assert_eq!(only(r#"{"slot1_output_power": 100}"#).register, Register(257));
-        assert_eq!(only(r#"{"grid_power_allowed": 1}"#).register, Register(326));
-        assert_eq!(only(r#"{"slot1_work_mode": "smart_self_use"}"#).register, Register(256));
-        assert_eq!(only(r#"{"slot1_start_time": "23:59"}"#).register, Register(254));
+        assert_eq!(only(r#"{"slot1_output_power": 100}"#).register, Some(Register(257)));
+        assert_eq!(only(r#"{"grid_power_allowed": 1}"#).register, Some(Register(326)));
+        assert_eq!(
+            only(r#"{"slot1_work_mode": "smart_self_use"}"#).register,
+            Some(Register(256))
+        );
+        assert_eq!(only(r#"{"slot1_start_time": "23:59"}"#).register, Some(Register(254)));
     }
 
     #[test]
@@ -387,7 +399,7 @@ mod tests {
         // Home Assistant sends the payloads discovery gave it, which are numbers. A hand-written command is
         // the obvious place for a boolean.
         for payload in [r#"{"always_on": 1}"#, r#"{"always_on": true}"#] {
-            assert_eq!(only(payload).register, Register(304), "{payload}");
+            assert_eq!(only(payload).register, Some(Register(304)), "{payload}");
         }
     }
 
@@ -395,7 +407,7 @@ mod tests {
     fn a_time_of_day_is_encoded_as_the_device_stores_it() {
         // HH << 8 | MM, which is what the register holds and what the decoder renders back.
         let change = only(r#"{"slot1_end_time": "23:59"}"#);
-        assert_eq!(change.register, Register(255));
+        assert_eq!(change.register, Some(Register(255)));
         // 23 << 8 | 59
         assert!(format!("{:?}", change.command).contains("5947"), "{:?}", change.command);
     }
@@ -461,7 +473,7 @@ mod tests {
             ..Permitted::default()
         };
         for payload in [r#"{"always_on": 1}"#, r#"{"slot1_output_power": 100}"#] {
-            let error = Change::from_payload(payload.as_bytes(), permitted).expect_err(payload);
+            let error = Change::from_payload(payload.as_bytes(), permitted, &Growatt).expect_err(payload);
             assert!(matches!(error, CommandError::Refused { .. }), "{error:?}");
         }
     }
@@ -474,18 +486,18 @@ mod tests {
             power_plus: false,
             ..Permitted::default()
         };
-        let error = Change::from_payload(br#"{"power_plus": 1}"#, permitted).expect_err("refused");
+        let error = Change::from_payload(br#"{"power_plus": 1}"#, permitted, &Growatt).expect_err("refused");
         assert!(matches!(error, CommandError::Refused { .. }), "{error:?}");
         // Turning it *off* is refused too: the register is unreachable, not one-directional, so the device
         // keeps whatever it was set to elsewhere.
         assert!(
-            Change::from_payload(br#"{"power_plus": 0}"#, permitted).is_err(),
+            Change::from_payload(br#"{"power_plus": 0}"#, permitted, &Growatt).is_err(),
             "the register is unreachable, in either direction"
         );
 
         // Everything else still works, and Power+ still works when it is allowed.
-        assert!(Change::from_payload(br#"{"always_on": 1}"#, permitted).is_ok());
-        assert!(Change::from_payload(br#"{"power_plus": 1}"#, Permitted::default()).is_ok());
+        assert!(Change::from_payload(br#"{"always_on": 1}"#, permitted, &Growatt).is_ok());
+        assert!(Change::from_payload(br#"{"power_plus": 1}"#, Permitted::default(), &Growatt).is_ok());
     }
 
     #[test]
@@ -499,10 +511,10 @@ mod tests {
 
     #[test]
     fn a_restart_is_accepted_and_sent_without_a_read_back() {
-        let changes = Change::from_payload(br#"{"restart": 1}"#, Permitted::default()).expect("accepted");
+        let changes = Change::from_payload(br#"{"restart": 1}"#, Permitted::default(), &Growatt).expect("accepted");
         let change = changes.first().expect("one change");
         assert_eq!(change.key, "restart");
-        assert_eq!(change.register.number(), 32);
+        assert_eq!(change.register.map(Register::number), Some(32));
         // Fire-and-forget: the config space acknowledges nothing, so waiting for a read-back would report a
         // working restart as a failure to confirm.
         assert_eq!(change.delivery, Delivery::FireAndForget);
@@ -513,7 +525,7 @@ mod tests {
         // It is not published as an entity, so nothing in Home Assistant offers it — but a retained command
         // on the broker, a hand-published one, or a later catalogue change must not get through. What it
         // costs is a device off the network until somebody re-provisions it over Bluetooth, in person.
-        let refused = Change::from_payload(br#"{"factory_reset": 1}"#, Permitted::default());
+        let refused = Change::from_payload(br#"{"factory_reset": 1}"#, Permitted::default(), &Growatt);
         assert_eq!(
             refused,
             Err(CommandError::Refused {
@@ -530,6 +542,7 @@ mod tests {
                 writes: false,
                 ..Permitted::default()
             },
+            &Growatt,
         );
         assert!(refused.is_err(), "a restart got through with writes refused");
     }
@@ -538,23 +551,24 @@ mod tests {
     fn a_supplied_reading_carries_its_value_for_the_log() {
         // These registers answer no read-back, so the log line is the only record of what the device was
         // told. Without this the log says a reading was sent and not which one.
-        let changes =
-            Change::from_payload(br#"{"supplied_meter_reading": 250}"#, Permitted::default()).expect("accepted");
+        let changes = Change::from_payload(br#"{"supplied_meter_reading": 250}"#, Permitted::default(), &Growatt)
+            .expect("accepted");
         assert_eq!(changes[0].requested.as_deref(), Some("250 W"));
         assert_eq!(changes[0].delivery, Delivery::FireAndForget);
 
-        let export =
-            Change::from_payload(br#"{"supplied_meter_reading": -400}"#, Permitted::default()).expect("accepted");
+        let export = Change::from_payload(br#"{"supplied_meter_reading": -400}"#, Permitted::default(), &Growatt)
+            .expect("accepted");
         assert_eq!(export[0].requested.as_deref(), Some("-400 W"));
 
-        let withdraw =
-            Change::from_payload(br#"{"withdraw_meter_reading": 1}"#, Permitted::default()).expect("accepted");
+        let withdraw = Change::from_payload(br#"{"withdraw_meter_reading": 1}"#, Permitted::default(), &Growatt)
+            .expect("accepted");
         assert_eq!(withdraw[0].requested.as_deref(), Some("withdrawn"));
     }
 
     #[test]
     fn a_setting_needs_no_remembered_value_because_the_read_back_carries_it() {
-        let changes = Change::from_payload(br#"{"slot1_output_power": 300}"#, Permitted::default()).expect("accepted");
+        let changes =
+            Change::from_payload(br#"{"slot1_output_power": 300}"#, Permitted::default(), &Growatt).expect("accepted");
         assert_eq!(changes[0].requested, None);
         assert_eq!(changes[0].delivery, Delivery::Confirmed);
     }
@@ -567,15 +581,18 @@ mod tests {
             slots: 9,
             ..crate::homeassistant::entity::Catalogue::default()
         };
-        for entity in catalogue.entities().iter().filter(|entity| entity.is_writable()) {
+        for entity in catalogue
+            .entities(&Growatt)
+            .iter()
+            .filter(|entity| entity.is_writable())
+        {
             // Either kind: a holding-register setting, or a config-space action. Both are commandable and
             // they resolve by different routes, so checking only the first would fail a published button.
-            let setting = crate::growatt::v7::registers::HoldingRegister::resync_set(9)
+            let setting = Growatt.settings(9).into_iter().any(|entry| entry.name() == entity.key);
+            let action = Growatt
+                .writable_config()
                 .into_iter()
-                .any(|entry| entry.name == entity.key);
-            let action = WritableConfig::ALL
-                .into_iter()
-                .any(|config| config.is_action() && !config.is_destructive() && config.name() == entity.key);
+                .any(|field| field.action().is_some() && !field.is_destructive() && field.name() == entity.key);
             // And the supplied meter reading, which is neither: a data channel with no read-back.
             let reading = entity.key == crate::homeassistant::entity::METER_READING
                 || entity.key == crate::homeassistant::entity::WITHDRAW_METER_READING;

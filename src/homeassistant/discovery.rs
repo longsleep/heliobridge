@@ -21,7 +21,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::control::IdentityView;
-use crate::growatt::product::Product;
+use crate::driver::describes::Describes;
 use crate::homeassistant::broker::Publication;
 use crate::homeassistant::entity::{Bounds, Component, Entity, Shape};
 use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
@@ -40,7 +40,8 @@ pub struct DeviceBlock {
     /// The serial, which is the identifier Home Assistant keys the device on.
     pub serial: String,
     /// The product, from the type code the report carries.
-    pub product: Product,
+    /// What the driver calls this product, or `None` when it does not recognise the code.
+    pub product: Option<&'static str>,
     /// Model as the datalogger reports it.
     pub model: Option<String>,
     /// Firmware version.
@@ -51,7 +52,7 @@ pub struct DeviceBlock {
 
 impl DeviceBlock {
     /// Describe a device from its identity report, if one has arrived yet.
-    pub fn new(serial: &str, identity: Option<&IdentityView>) -> Self {
+    pub fn new(serial: &str, identity: Option<&IdentityView>, driver: &impl Describes) -> Self {
         let field = |name: &str| {
             identity.and_then(|report| {
                 report
@@ -63,7 +64,7 @@ impl DeviceBlock {
         };
         Self {
             serial: serial.to_owned(),
-            product: Product::reported(field("device_type").as_deref()),
+            product: driver.product_name(field("device_type").as_deref()),
             model: field("model_id"),
             firmware: field("sw_version"),
             hardware: field("hw_version"),
@@ -76,7 +77,7 @@ impl DeviceBlock {
         device.insert("identifiers".to_owned(), json!([self.serial]));
         // Named for the product where one is known, and for the vendor where it is not — a device page
         // should not claim to be a product it is not.
-        let name = match self.product.name() {
+        let name = match self.product {
             Some(product) => format!("{product} {}", self.serial),
             None => format!("Growatt {}", self.serial),
         };
@@ -88,7 +89,7 @@ impl DeviceBlock {
         // reports its own model as a code — `GTSW0000` — which Home Assistant would otherwise render as
         // the whole identity of the thing, "GTSW0000 by Growatt". Both are kept: the product names what
         // the device is, and the code stays available as the manufacturer wrote it.
-        if let Some(product) = self.product.name() {
+        if let Some(product) = self.product {
             device.insert("model".to_owned(), json!(product));
             if let Some(code) = self.model.as_ref() {
                 device.insert("model_id".to_owned(), json!(code));
@@ -338,8 +339,9 @@ pub const fn is_control(component: Component) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceBlock, Discovery, Product, TIME_PATTERN, is_control};
+    use super::{DeviceBlock, Discovery, TIME_PATTERN, is_control};
     use crate::control::{ConfigView, IdentityView};
+    use crate::growatt::driver::Growatt;
     use crate::homeassistant::command::Permitted;
     use crate::homeassistant::entity::{Catalogue, Component, Entity, Presence};
     use crate::homeassistant::topics::Topics;
@@ -347,7 +349,7 @@ mod tests {
 
     /// The device as it looks before its identity report has arrived.
     fn bare() -> DeviceBlock {
-        DeviceBlock::new("0EXAMPLE00000001", None)
+        DeviceBlock::new("0EXAMPLE00000001", None, &Growatt)
     }
 
     /// An identity report carrying the fields named, as the device sends them: numbers as text.
@@ -371,7 +373,7 @@ mod tests {
     /// The `name` of a device block for a device reporting this type code.
     fn device_name(device_type: &str) -> String {
         let report = report(&[("device_type", device_type)]);
-        let json = DeviceBlock::new("0EXAMPLE00000001", Some(&report)).json();
+        let json = DeviceBlock::new("0EXAMPLE00000001", Some(&report), &Growatt).json();
         json.get("name")
             .and_then(Value::as_str)
             .expect("a device block always names the device")
@@ -382,8 +384,8 @@ mod tests {
     fn the_product_comes_from_the_reported_device_type() {
         // The device names its own product in config key 13, so nothing here depends on the serial.
         let report = report(&[("device_type", "72"), ("model_id", "GTSW0000")]);
-        let block = DeviceBlock::new("0EXAMPLE00000001", Some(&report));
-        assert_eq!(block.product, Product::Nexa2000);
+        let block = DeviceBlock::new("0EXAMPLE00000001", Some(&report), &Growatt);
+        assert_eq!(block.product, Some("NEXA 2000"));
     }
 
     #[test]
@@ -392,7 +394,7 @@ mod tests {
         // in `model` shows the page as "GTSW0000 by Growatt" — true, and useless to read. The code keeps
         // its own field, which is what `model_id` is for.
         let report = report(&[("device_type", "72"), ("model_id", "GTSW0000")]);
-        let json = DeviceBlock::new("0EXAMPLE00000001", Some(&report)).json();
+        let json = DeviceBlock::new("0EXAMPLE00000001", Some(&report), &Growatt).json();
         assert_eq!(json["model"], "NEXA 2000");
         assert_eq!(json["model_id"], "GTSW0000");
     }
@@ -402,7 +404,7 @@ mod tests {
         // Nothing better to say. The code at least distinguishes two unrecognised products from each
         // other, where an absent model says only that this program has not been taught the type code.
         let report = report(&[("device_type", "99"), ("model_id", "GTSW0000")]);
-        let json = DeviceBlock::new("0EXAMPLE00000001", Some(&report)).json();
+        let json = DeviceBlock::new("0EXAMPLE00000001", Some(&report), &Growatt).json();
         assert_eq!(json["model"], "GTSW0000");
         assert!(json.get("model_id").is_none(), "the code is not repeated");
     }
@@ -412,7 +414,7 @@ mod tests {
         // The type code arrives with the report, about five seconds into a session. Until then the page is
         // announced under the vendor name and re-announced when the product is known — rather than
         // guessing a product from the serial, which no vendor source maps.
-        let json = DeviceBlock::new("0EXAMPLE00000001", None).json();
+        let json = DeviceBlock::new("0EXAMPLE00000001", None, &Growatt).json();
         assert_eq!(json["name"], "Growatt 0EXAMPLE00000001");
         assert!(json.get("model").is_none());
         assert!(json.get("model_id").is_none());
@@ -449,7 +451,7 @@ mod tests {
     /// One entity from the default catalogue, by key.
     fn entity(key: &str) -> Entity {
         Catalogue::default()
-            .entities()
+            .entities(&Growatt)
             .into_iter()
             .find(|entity| entity.key == key)
             .unwrap_or_else(|| panic!("no entity {key}"))
@@ -546,7 +548,7 @@ mod tests {
                     confidence: "observed",
                 }],
             },
-            &crate::homeassistant::state::Fields::of(&Catalogue::default().entities()),
+            &crate::homeassistant::state::Fields::of(&Catalogue::default().entities(&Growatt)),
         );
         assert_eq!(payload.get("grid_faults"), Some(&serde_json::json!(1024)));
     }
@@ -651,7 +653,7 @@ mod tests {
         // Everything else reads a field out of the shared settings object and tolerates one that has not
         // arrived. A `text` entity validates its value instead of ignoring an empty one, so it must not be
         // pointed at an object that is partial while a resync runs.
-        let catalogue = Catalogue::default().entities();
+        let catalogue = Catalogue::default().entities(&Growatt);
         let slot_time = catalogue
             .iter()
             .find(|entity| entity.key == "slot1_start_time")
@@ -677,7 +679,7 @@ mod tests {
     fn every_entity_produces_a_message_home_assistant_can_read() {
         // The whole catalogue, so a register added to the map cannot produce an entity that fails to
         // announce itself.
-        for entity in Catalogue::default().entities() {
+        for entity in Catalogue::default().entities(&Growatt) {
             let config = payload(&entity);
             let object = config.as_object().expect("an object");
             assert!(object.contains_key("unique_id"), "{}", entity.key);
@@ -716,7 +718,7 @@ mod tests {
             slots: 9,
             ..Catalogue::default()
         }
-        .entities();
+        .entities(&Growatt);
         let mut seen: Vec<&str> = entities.iter().map(|entity| entity.key).collect();
         let total = seen.len();
         seen.sort_unstable();
@@ -735,7 +737,7 @@ mod tests {
             },
             ..Catalogue::default()
         })
-        .entities()
+        .entities(&Growatt)
         {
             let config = payload(&entity);
             assert!(
@@ -758,7 +760,7 @@ mod tests {
             },
             ..Catalogue::default()
         };
-        let entities = catalogue.entities();
+        let entities = catalogue.entities(&Growatt);
 
         let power_plus = entities
             .iter()

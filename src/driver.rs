@@ -15,7 +15,7 @@
 //!
 //! The seam is split by capability — [`Wire`] for framing, [`Report`] for what a frame says, [`Arbiter`]
 //! for what it is trying to do, [`Catalogue`] for what the device holds, [`Commands`] for asking it to do
-//! something,
+//! something, [`Describes`] for what product it is,
 //! [`Firmware`] for update campaigns, [`Upstream`] for the manufacturer's cloud, and more to come — rather than gathered into a single wide trait. A consumer bounds on the capability it uses and
 //! nothing else, which keeps its requirements legible: `server::firmware` needs [`Firmware`], and the fact
 //! that it needs nothing else is worth being able to see.
@@ -44,6 +44,7 @@
 pub mod arbiter;
 pub mod catalogue;
 pub mod commands;
+pub mod describes;
 pub mod firmware;
 pub mod report;
 pub mod upstream;
@@ -52,6 +53,7 @@ pub mod wire;
 pub use arbiter::{Arbiter, Direction, Intent, Policy};
 pub use catalogue::{Catalogue, ConfigField, Measurement, Setting, Shape};
 pub use commands::{Command, Commands, Outgoing};
+pub use describes::Describes;
 pub use firmware::{AdvertisedFirmware, Firmware};
 pub use report::{Report, Sink};
 pub use upstream::{Endpoint, Message, Relay, Target, Upstream};
@@ -64,9 +66,9 @@ use crate::model::Register;
 /// A bundle rather than a trait in its own right: it has no methods, and a blanket impl gives it to any
 /// type implementing every capability. Bound on this where a whole driver is meant — a session — and on a
 /// single capability everywhere else.
-pub trait Driver: Wire + Arbiter + Catalogue + Commands + Firmware + Report + Upstream {}
+pub trait Driver: Wire + Arbiter + Catalogue + Commands + Describes + Firmware + Report + Upstream {}
 
-impl<T> Driver for T where T: Wire + Arbiter + Catalogue + Commands + Firmware + Report + Upstream {}
+impl<T> Driver for T where T: Wire + Arbiter + Catalogue + Commands + Describes + Firmware + Report + Upstream {}
 
 /// A driver that recognises nothing.
 ///
@@ -177,6 +179,21 @@ impl Upstream for Unknown {
 
     fn relay(&self, _device_id: &str, _target: Target) -> Result<Self::Relay, Self::Error> {
         Err(upstream::NoUpstream)
+    }
+}
+
+impl Describes for Unknown {
+    fn product_name(&self, _device_type: Option<&str>) -> Option<&'static str> {
+        None
+    }
+
+    /// Vacuously: a driver with no readings has none that could be wrong.
+    fn telemetry_matches(&self, _device_type: Option<&str>) -> bool {
+        true
+    }
+
+    fn firmware_version(&self, _reported: &describes::Reported<'_>) -> Option<String> {
+        None
     }
 }
 

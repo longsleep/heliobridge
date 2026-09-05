@@ -25,14 +25,14 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::control::{Action as ControlAction, Connected, Registry, SessionHandle, TelemetryView};
-use crate::growatt::v7::version::FirmwareVersion;
+use crate::driver::catalogue::Catalogue as Registers;
+use crate::driver::describes::Describes;
 use crate::homeassistant::broker::{Broker, BrokerConfig, BrokerError, Event, Publication, Publications};
 use crate::homeassistant::command::{Change, Delivery, Permitted};
 use crate::homeassistant::discovery::{DeviceBlock, Discovery};
 use crate::homeassistant::entity::{Catalogue, Component, Entity, FIRMWARE_VERSION, Gate, LAST_UPDATE, Source};
 use crate::homeassistant::state::{Fields, StatePayload};
 use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
-use crate::model::Raw;
 
 /// How long without a telemetry frame before the device is reported absent.
 ///
@@ -95,7 +95,9 @@ impl Generation {
 
 /// Publishes device state to Home Assistant, and accepts commands back.
 #[derive(Debug)]
-pub struct Publisher {
+pub struct Publisher<D> {
+    /// The driver whose catalogue says what to publish, and what the device is.
+    driver: Arc<D>,
     broker: Broker,
     topics: Arc<Topics>,
     registry: Registry,
@@ -111,7 +113,7 @@ pub struct Publisher {
     ended: mpsc::Receiver<String>,
 }
 
-impl Publisher {
+impl<D: Registers + Describes> Publisher<D> {
     /// Connect to the broker and start publishing.
     ///
     /// # Errors
@@ -123,6 +125,7 @@ impl Publisher {
         topics: Topics,
         registry: Registry,
         options: PublisherOptions,
+        driver: Arc<D>,
     ) -> Result<Self, BrokerError> {
         config.will = Some(topics.will());
         config.subscriptions = vec![topics.command_filter()];
@@ -130,6 +133,7 @@ impl Publisher {
         let devices = registry.watch();
         let (farewell, ended) = mpsc::channel(FAREWELL_DEPTH);
         Ok(Self {
+            driver,
             broker: Broker::connect(config)?,
             topics: Arc::new(topics),
             registry,
@@ -216,6 +220,7 @@ impl Publisher {
             self.linked.insert(device.clone());
             tokio::spawn(
                 Link {
+                    driver: Arc::clone(&self.driver),
                     device: device.clone(),
                     session: handle,
                     publications: self.broker.publications(),
@@ -265,7 +270,7 @@ impl Publisher {
             return;
         };
 
-        let changes = match Change::from_payload(payload, self.options.permitted) {
+        let changes = match Change::from_payload(payload, self.options.permitted, self.driver.as_ref()) {
             Ok(changes) => changes,
             Err(error) => {
                 tracing::warn!(%device, %error, "refusing a command");
@@ -293,7 +298,8 @@ impl Publisher {
 /// as a difference rather than as a repetition: discovery goes out again only when the device's own
 /// description changes, and availability only when presence does.
 #[derive(Debug)]
-struct Link {
+struct Link<D> {
+    driver: Arc<D>,
     device: String,
     session: SessionHandle,
     publications: Publications,
@@ -374,7 +380,7 @@ impl Announcement {
     }
 }
 
-impl Link {
+impl<D: Registers + Describes> Link<D> {
     /// Publish for this device until its session ends.
     async fn run(mut self) {
         // Marked seen without being published: a frame that was already in the channel arrived at an
@@ -533,7 +539,11 @@ impl Link {
         if self.published_for.is_none() {
             return;
         }
-        let device = DeviceBlock::new(&self.device, self.session.identity.borrow().as_ref());
+        let device = DeviceBlock::new(
+            &self.device,
+            self.session.identity.borrow().as_ref(),
+            self.driver.as_ref(),
+        );
         let catalogue = Catalogue {
             slots: self.options.slots,
             permitted: self.options.permitted,
@@ -547,7 +557,7 @@ impl Link {
             return;
         }
 
-        let entities = catalogue.entities();
+        let entities = catalogue.entities(self.driver.as_ref());
         let withdrawn = self.withdraw(&entities);
         tracing::info!(
             device = %self.device,
@@ -591,7 +601,7 @@ impl Link {
         let first = self.announced.is_none();
         let previous = match self.announced.take() {
             Some(announced) => announced.entities,
-            None => Catalogue::everything(),
+            None => Catalogue::everything(self.driver.as_ref()),
         };
 
         let retired = if first { Catalogue::RETIRED } else { &[] };
@@ -679,24 +689,29 @@ impl Link {
     /// decoded in either. `None` until a frame and a report have each been seen, which is why it goes on a
     /// topic of its own.
     fn firmware_version(&self) -> Option<String> {
-        let datalogger = self
-            .session
-            .identity
-            .borrow()
-            .as_ref()?
-            .entries
-            .iter()
-            .find(|entry| entry.name.as_deref() == Some("sw_version"))
-            .map(|entry| entry.value.clone())?;
-
-        // Read off the borrow rather than binding it, so the guard lives for the statement and no longer.
-        let (inverter_mppt, pd_bms) = self.session.telemetry.borrow().as_ref().and_then(|view| {
-            Some((
-                Raw(reading(view, "inverter_mppt_version")?),
-                Raw(reading(view, "pd_bms_version")?),
-            ))
-        })?;
-        Some(FirmwareVersion::assemble(inverter_mppt, pd_bms, &datalogger)?.to_string())
+        // The driver asks for the fields it needs by name; both places it might find them are here, and
+        // which register carries which part of a version is not this side's business.
+        self.driver.firmware_version(&|name: &str| {
+            // Bound rather than matched on: the borrow guard would otherwise live for the whole `if let`,
+            // and the telemetry borrow below overlaps it.
+            let reported = self
+                .session
+                .identity
+                .borrow()
+                .as_ref()
+                .and_then(|report| report.entries.iter().find(|entry| entry.name.as_deref() == Some(name)))
+                .map(|entry| entry.value.clone());
+            if let Some(value) = reported {
+                return Some(value);
+            }
+            // Read off the borrow rather than binding it, so the guard lives for the statement and no longer.
+            self.session
+                .telemetry
+                .borrow()
+                .as_ref()
+                .and_then(|view| reading(view, name))
+                .map(|raw| raw.to_string())
+        })
     }
 
     /// Publish the datalogger configuration worth showing.
@@ -939,6 +954,7 @@ mod tests {
         Catalogue, Component, FAREWELL_DEPTH, Fields, Generation, Link, OFFLINE_AFTER, PublisherOptions, reading,
     };
     use crate::control::{IdentityView, ReadingView, SessionHandle, SettingView, StatusView, TelemetryView};
+    use crate::growatt::driver::Growatt;
     use std::collections::HashMap;
 
     use crate::growatt::v7::registers::{SMART_SELF_USE, WORK_MODE_LABELS};
@@ -1000,6 +1016,7 @@ mod tests {
 
         tokio::spawn(
             Link {
+                driver: Arc::new(Growatt),
                 device: DEVICE.to_owned(),
                 session: SessionHandle {
                     requests,
@@ -1595,10 +1612,10 @@ mod tests {
         // The case the retired list exists for: an entity deleted from the code, so it appears in neither
         // what is being kept nor what the catalogue can describe. Without the list nothing would ever
         // retract its retained discovery message.
-        let keeping = Catalogue::everything();
+        let keeping = Catalogue::everything(&Growatt);
         let retired = [(Component::Sensor, "a_deleted_sensor")];
 
-        let gone = Link::retractions(&[], &keeping, &retired);
+        let gone = Link::<Growatt>::retractions(&[], &keeping, &retired);
         assert!(
             gone.contains(&(Component::Sensor, "a_deleted_sensor")),
             "a retired entity must be retracted: {gone:?}"
@@ -1608,13 +1625,13 @@ mod tests {
     #[test]
     fn a_retired_key_that_came_back_is_not_withdrawn() {
         // Reusing a key would otherwise retract the live entity moments after announcing it.
-        let revived = Catalogue::everything()
+        let revived = Catalogue::everything(&Growatt)
             .into_iter()
             .find(|entity| entity.component == Component::Sensor)
             .expect("a sensor exists");
         let retired = [(revived.component, revived.key)];
 
-        let gone = Link::retractions(&[], core::slice::from_ref(&revived), &retired);
+        let gone = Link::<Growatt>::retractions(&[], core::slice::from_ref(&revived), &retired);
         assert!(
             !gone.contains(&(revived.component, revived.key)),
             "a key in use must not be retracted: {gone:?}"
@@ -1625,7 +1642,7 @@ mod tests {
     fn the_shipped_retired_list_names_nothing_still_published() {
         // A guard for the future rather than for today, since the list is empty: an entry left in place
         // after its key was reintroduced would silently retract a live entity on every reconnect.
-        let live = Catalogue::everything();
+        let live = Catalogue::everything(&Growatt);
         for (component, key) in Catalogue::RETIRED {
             assert!(
                 !live

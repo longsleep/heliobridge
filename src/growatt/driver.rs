@@ -12,15 +12,19 @@
 use crate::driver::arbiter::{Arbiter, Direction, Intent};
 use crate::driver::catalogue::Catalogue;
 use crate::driver::commands::{Command, Commands, Outgoing};
+use crate::driver::describes::{Describes, Reported};
 use crate::driver::report::{Report, Sink};
 use crate::driver::upstream::{Endpoint, Target, Upstream};
 use crate::driver::{AdvertisedFirmware, Firmware, Unreadable, Wire};
 use crate::growatt::cloud::{self, Relay, RelayError};
+use crate::growatt::product::Product;
 use crate::growatt::v7::encode::EncodeError;
 use crate::growatt::v7::frame::Frame;
 use crate::growatt::v7::registers::{CONFIG_REGISTER_LAST, HoldingRegister, InputRegister, SLOT_COUNT};
+use crate::growatt::v7::version::FirmwareVersion;
 use crate::growatt::{Codec, peek_version};
 use crate::growatt::{catalogue, commands, firmware, report};
+use crate::model::Raw;
 use crate::model::Register;
 
 /// Growatt's generation-7 protocol.
@@ -51,7 +55,7 @@ impl Wire for Growatt {
 
 impl Catalogue for Growatt {
     type Setting = HoldingRegister;
-    type Measurement = &'static InputRegister;
+    type Measurement = InputRegister;
     type ConfigField = catalogue::ConfigField;
 
     fn settings(&self, slots: u16) -> Vec<Self::Setting> {
@@ -98,6 +102,25 @@ impl Catalogue for Growatt {
 
     fn writable_config(&self) -> Vec<Self::ConfigField> {
         catalogue::ConfigField::writable()
+    }
+}
+
+impl Describes for Growatt {
+    fn product_name(&self, device_type: Option<&str>) -> Option<&'static str> {
+        Product::reported(device_type).name()
+    }
+
+    fn telemetry_matches(&self, device_type: Option<&str>) -> bool {
+        Product::reported(device_type).telemetry_map_matches()
+    }
+
+    /// Three fields, from two places: the datalogger's own version comes from its identity report, the
+    /// inverter's and the battery's from telemetry. The caller holds both and does not have to know that.
+    fn firmware_version(&self, reported: &Reported<'_>) -> Option<String> {
+        let datalogger = reported("sw_version")?;
+        let raw = |name: &str| reported(name)?.parse::<u16>().ok().map(Raw);
+        let assembled = FirmwareVersion::assemble(raw("inverter_mppt_version")?, raw("pd_bms_version")?, &datalogger)?;
+        Some(assembled.to_string())
     }
 }
 

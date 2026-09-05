@@ -197,6 +197,7 @@ fn quantity(rendered: &str) -> Value {
 mod tests {
     use super::{Fields, StatePayload, quantity};
     use crate::control::{ReadingView, SettingView, TelemetryView};
+    use crate::growatt::driver::Growatt;
     use crate::homeassistant::entity::Catalogue;
     use crate::homeassistant::entity::LAST_UPDATE;
     use serde_json::json;
@@ -213,7 +214,7 @@ mod tests {
     }
 
     fn fields() -> Fields {
-        Fields::of(&Catalogue::default().entities())
+        Fields::of(&Catalogue::default().entities(&Growatt))
     }
 
     #[test]
@@ -256,7 +257,7 @@ mod tests {
                 packs: 1,
                 ..Catalogue::default()
             }
-            .entities(),
+            .entities(&Growatt),
         );
         let view = TelemetryView {
             timestamp: None,
@@ -367,7 +368,7 @@ mod tests {
 
     #[test]
     fn the_field_set_covers_the_whole_catalogue() {
-        let entities = Catalogue::default().entities();
+        let entities = Catalogue::default().entities(&Growatt);
         let fields = Fields::of(&entities);
         assert_eq!(fields.len(), entities.len(), "two entities share a key");
         assert!(!fields.is_empty());

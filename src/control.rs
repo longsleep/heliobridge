@@ -1570,8 +1570,9 @@ impl Api {
     /// than a writable register because these are not settings: they are a data channel with no read-back.
     ///
     /// **A reading expires after about two minutes, and nothing here refreshes it.** A caller supplying
-    /// readings has to write again inside that window, from a figure it has actually measured; see
-    /// [`crate::growatt::v7::meter`] for why that is deliberate rather than an omission.
+    /// readings has to write again inside that window, from a figure it has actually measured. Refreshing
+    /// it here would mean this program asserting a measurement nobody took, which is the one thing a
+    /// supplied reading must never be.
     ///
     /// No read-back, because the device offers none for these registers: the honest report is that the
     /// write was sent. What the device made of it appears in telemetry as `meter_active_power`, and

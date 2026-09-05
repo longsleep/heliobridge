@@ -52,7 +52,7 @@ impl Setting for HoldingRegister {
     }
 }
 
-impl Measurement for &'static InputRegister {
+impl Measurement for InputRegister {
     fn register(&self) -> Register {
         self.register
     }
@@ -79,7 +79,7 @@ impl Measurement for &'static InputRegister {
     }
 
     fn is_unknown(&self) -> bool {
-        InputRegister::is_unknown(self)
+        Self::is_unknown(self)
     }
 
     fn gated_by(&self) -> Option<&'static str> {
@@ -175,8 +175,11 @@ pub fn placeholder(register: Register) -> HoldingRegister {
 }
 
 /// Every reading the map documents.
-pub fn measurements() -> Vec<&'static InputRegister> {
-    INPUT_REGISTERS.iter().collect()
+///
+/// Copies rather than references: an entry is a handful of words, the map is read once per announcement,
+/// and a `'static` reference would make the seam's associated type a reference type for no gain.
+pub fn measurements() -> Vec<InputRegister> {
+    INPUT_REGISTERS.to_vec()
 }
 
 /// Every configuration register the map documents.
