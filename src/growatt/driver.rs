@@ -10,13 +10,15 @@
 //! would change.
 
 use crate::driver::arbiter::{Arbiter, Direction, Intent};
+use crate::driver::commands::{Command, Commands, Outgoing};
 use crate::driver::report::{Report, Sink};
 use crate::driver::upstream::{Endpoint, Target, Upstream};
 use crate::driver::{AdvertisedFirmware, Firmware, Unreadable, Wire};
 use crate::growatt::cloud::{self, Relay, RelayError};
+use crate::growatt::v7::encode::EncodeError;
 use crate::growatt::v7::frame::Frame;
 use crate::growatt::{Codec, peek_version};
-use crate::growatt::{firmware, report};
+use crate::growatt::{commands, firmware, report};
 
 /// Growatt's generation-7 protocol.
 #[derive(Debug, Clone, Copy, Default)]
@@ -41,6 +43,14 @@ impl Wire for Growatt {
         Frame::parse(payload).map_err(|error| Unreadable::Malformed {
             reason: error.to_string(),
         })
+    }
+}
+
+impl Commands for Growatt {
+    type Error = EncodeError;
+
+    fn prepare(&self, device_id: &str, command: &Command) -> Result<Outgoing, Self::Error> {
+        commands::prepare(device_id, command)
     }
 }
 

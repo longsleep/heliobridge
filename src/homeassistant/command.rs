@@ -20,7 +20,8 @@
 use serde_json::Value;
 use snafu::Snafu;
 
-use crate::growatt::v7::encode::{Command, EncodeError, WritableConfig};
+use crate::driver::commands::Command;
+use crate::growatt::v7::encode::WritableConfig;
 use crate::growatt::v7::meter;
 use crate::growatt::v7::registers::{Domain, HoldingRegister, SLOT_COUNT};
 use crate::homeassistant::entity::{METER_READING, WITHDRAW_METER_READING};
@@ -99,12 +100,14 @@ pub enum CommandError {
     },
 
     /// The value is outside what the device accepts.
-    #[snafu(display("{key}: {source}"))]
+    #[snafu(display("{key}: accepts {accepted}, not {value}"))]
     Domain {
         /// What was named.
         key: String,
-        /// What the encoder said.
-        source: EncodeError,
+        /// What the register accepts.
+        accepted: String,
+        /// The value offered.
+        value: u16,
     },
 }
 
@@ -183,18 +186,24 @@ impl Change {
             got: rendered(value),
         })?;
 
-        // Through `set` rather than a bare write, so `default_output_power` goes out as the register range
-        // the vendor uses. The encoder is also what rejects a value outside the register's domain, so an
-        // out-of-range command is refused here rather than being silently clamped by the device.
-        let command = Command::set(register.register, raw).map_err(|source| CommandError::Domain {
-            key: key.to_owned(),
-            source,
-        })?;
+        // Checked here as well as by the driver, which refuses the same value again before there are any
+        // octets: a control that answers "42 is not a work mode" is more use than one that reports a
+        // command it could not send. Either way the device never gets a chance to clamp it silently.
+        if !register.domain.accepts(raw) {
+            return Err(CommandError::Domain {
+                key: key.to_owned(),
+                accepted: register.domain.describe(),
+                value: raw,
+            });
+        }
 
         Ok(Self {
             key: key.to_owned(),
             register: register.register,
-            command,
+            command: Command::Set {
+                register: register.register,
+                value: raw,
+            },
             delivery: Delivery::Confirmed,
             requested: None,
         })
@@ -236,24 +245,20 @@ impl Change {
             }
         };
 
-        Some(
-            meter::command(watts, !withdrawing)
-                .map_err(|source| CommandError::Domain {
-                    key: key.to_owned(),
-                    source,
-                })
-                .map(|command| Self {
-                    key: key.to_owned(),
-                    register: meter::FIRST_REGISTER,
-                    command,
-                    delivery: Delivery::FireAndForget,
-                    requested: Some(if withdrawing {
-                        "withdrawn".to_owned()
-                    } else {
-                        format!("{watts} W")
-                    }),
-                }),
-        )
+        Some(Ok(Self {
+            key: key.to_owned(),
+            register: meter::FIRST_REGISTER,
+            command: Command::MeterReading {
+                watts,
+                valid: !withdrawing,
+            },
+            delivery: Delivery::FireAndForget,
+            requested: Some(if withdrawing {
+                "withdrawn".to_owned()
+            } else {
+                format!("{watts} W")
+            }),
+        }))
     }
 
     /// The config-space action a key names, if it names one.
@@ -279,7 +284,7 @@ impl Change {
             key: key.to_owned(),
             register: action.register(),
             command: Command::WriteConfig {
-                register: action,
+                register: action.register(),
                 value,
             },
             delivery: Delivery::FireAndForget,

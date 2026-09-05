@@ -26,11 +26,11 @@ use crate::control::{
 };
 use crate::driver::Driver;
 use crate::driver::arbiter::{CloudCommands, Direction, Intent, Originator, Policy};
+use crate::driver::commands::{Command, Outgoing};
 use crate::driver::report::{Sink, Snapshot, Telemetry, WriteAck};
 use crate::driver::upstream::{Message as CloudMessage, Relay as _, Target};
 use crate::driver::wire::Unreadable;
 use crate::growatt::product::Product;
-use crate::growatt::v7::encode::{Command, EncodeError};
 use crate::growatt::v7::registers::{ConfigRegister, HoldingRegister};
 use crate::model::{Confidence, Hex, Raw, Register, Timestamp, Unit};
 use crate::mqtt::{Packet, PacketStream, Publish, QoS, StreamError};
@@ -266,11 +266,12 @@ pub enum SessionError {
         level: u8,
     },
 
-    /// A frame this server wanted to send could not be built.
-    #[snafu(display("could not build a frame to send"))]
+    /// A command this server wanted to send could not be expressed by the driver.
+    #[snafu(display("the driver would not send that command"))]
     Encode {
-        /// What the encoder said.
-        source: EncodeError,
+        /// What the driver said. Boxed rather than made a type parameter of this error: a session reports
+        /// it and nothing here inspects it.
+        source: Box<dyn core::error::Error + Send + Sync + 'static>,
     },
 }
 
@@ -833,9 +834,7 @@ where
         let now = self.clock.now();
         self.check_clock_against_device(now);
 
-        let command = Command::time_push(now).context(EncodeSnafu)?;
-        let frame = command.to_frame(&device_id).context(EncodeSnafu)?;
-        let wire = frame.to_wire();
+        let wire = self.prepare(&Command::PushTime(now))?.payload;
 
         // Recorded as `inject` rather than `down`: from the device's side the two are indistinguishable,
         // and when a write misbehaves the first question is whether this program sent what it thought.
@@ -1010,8 +1009,7 @@ where
             return Ok(());
         };
 
-        let frame = Command::read(register).to_frame(&device_id).context(EncodeSnafu)?;
-        let wire = frame.to_wire();
+        let wire = self.prepare(&Command::Read { register })?.payload;
         self.record(RecordStream::Inject, &wire);
 
         tracing::debug!(register = %register, "reading a setting back");
@@ -1273,8 +1271,7 @@ where
                 self.enqueue_verification(register, None, Some(reply));
             }
             ControlAction::Apply(command) => {
-                let verify = command.registers_to_verify();
-                self.transmit(&command).await?;
+                let verify = self.transmit(&command).await?;
 
                 if verify.is_empty() {
                     // Nothing to read back — a read or a time push. Answer immediately so the caller is not
@@ -1296,7 +1293,7 @@ where
                 // Answering as soon as it is transmitted is the honest maximum.
                 let sent = self.transmit(&command).await;
                 let outcome = match &sent {
-                    Ok(()) => Outcome::sent(&command),
+                    Ok(_) => Outcome::sent(&command),
                     Err(error) => Outcome::not_sent(&command, &error.to_string()),
                 };
                 drop(reply.send(outcome));
@@ -1344,50 +1341,63 @@ where
     /// Writes go out at QoS 0 and the time push at QoS 1, matching what the vendor server was observed to
     /// do. Recorded as `inject`, because from the device's side our frames and the cloud's are
     /// indistinguishable and that is exactly what makes a misbehaving write hard to diagnose.
-    async fn transmit(&mut self, command: &Command) -> Result<(), SessionError> {
+    async fn transmit(&mut self, command: &Command) -> Result<Vec<(Register, Option<Raw>)>, SessionError> {
         let Some(device_id) = self.device_id.clone() else {
-            return Ok(());
+            return Ok(Vec::new());
         };
 
-        let frame = command.to_frame(&device_id).context(EncodeSnafu)?;
-        let wire = frame.to_wire();
-        self.record(RecordStream::Inject, &wire);
+        let outgoing = self.prepare(command)?;
+        self.record(RecordStream::Inject, &outgoing.payload);
 
         tracing::info!(
-            message_type = %frame.message_type(),
-            acknowledged = command.is_acknowledged(),
+            command = %outgoing.description,
+            acknowledged = outgoing.acknowledged,
             "sending a command to the device"
         );
         tracing::trace!(
             target: TARGET_WIRE,
             direction = "tx",
-            len = wire.len(),
+            len = outgoing.payload.len(),
             "{}",
-            Hex(&wire)
+            Hex(&outgoing.payload)
         );
 
-        // Matching the capture rather than picking one: the vendor sends config writes at QoS 1 and register
-        // writes at QoS 0. All four commands captured from its web interface were QoS 1, like the clock push.
-        let qos = if matches!(command, Command::WriteConfig { .. }) {
-            QoS::AtLeastOnce
-        } else {
-            QoS::AtMostOnce
-        };
-        let packet_id = if qos == QoS::AtMostOnce {
+        // The driver says at which quality of service its manufacturer's own server would send this, so
+        // that this program is indistinguishable from the one it replaces.
+        let packet_id = if outgoing.qos == QoS::AtMostOnce {
             None
         } else {
             Some(self.take_packet_id())
         };
 
+        let verify = outgoing.verify;
         self.send(&Packet::Publish(Publish {
             topic: format!("s/{device_id}"),
-            qos,
+            qos: outgoing.qos,
             retain: false,
             dup: false,
             packet_id,
-            payload: wire,
+            payload: outgoing.payload,
         }))
-        .await
+        .await?;
+
+        Ok(verify)
+    }
+
+    /// Ask the driver to express one command as octets, and everything that goes with them.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Encode`] when the driver refuses: an unwritable register, a value out of range, an
+    /// action its protocol cannot ask for. That refusal is a safety property rather than a formality —
+    /// nothing above the driver can build octets, so nothing above it can get round the allowlist.
+    fn prepare(&self, command: &Command) -> Result<Outgoing, SessionError> {
+        let device_id = self.device_id.clone().unwrap_or_default();
+        self.driver
+            .prepare(&device_id, command)
+            .map_err(|error| SessionError::Encode {
+                source: Box::new(error),
+            })
     }
 
     /// Publish the current settings for the control API to read.

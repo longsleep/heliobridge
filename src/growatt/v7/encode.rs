@@ -51,6 +51,13 @@ pub const CLOCK_TEXT_LEN: usize = 19;
 #[derive(Debug, Clone, PartialEq, Eq, Snafu)]
 #[snafu(visibility(pub))]
 pub enum EncodeError {
+    /// The config register is not one this implementation will write.
+    #[snafu(display("config register {register} is not writable: it is absent from the allowlist"))]
+    NotWritableConfig {
+        /// The register asked for.
+        register: Register,
+    },
+
     /// The register is not one this implementation will write.
     #[snafu(display("register {register} is not writable: it is absent from the holding register map"))]
     NotWritable {

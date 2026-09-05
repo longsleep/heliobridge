@@ -92,8 +92,8 @@ use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 
-use crate::growatt::v7::encode::{Command, WritableConfig};
-use crate::growatt::v7::meter;
+use crate::driver::commands::Command;
+use crate::growatt::v7::encode::WritableConfig;
 use crate::growatt::v7::registers::{CONFIG_REGISTER_LAST, ConfigRegister, HoldingRegister, SLOT_COUNT};
 use crate::model::{Raw, Register};
 
@@ -165,6 +165,9 @@ pub struct Outcome {
     pub confirmed: bool,
     /// Set when the device never answered.
     pub error: Option<String>,
+    /// Whether the driver refused to express the command at all, which is the caller's mistake.
+    #[serde(skip_serializing_if = "core::ops::Not::not")]
+    pub refused: bool,
 }
 
 impl Outcome {
@@ -178,6 +181,7 @@ impl Outcome {
             value: None,
             confirmed: false,
             error: Some("the device did not answer the read-back".to_owned()),
+            refused: false,
         }
     }
 
@@ -188,7 +192,10 @@ impl Outcome {
     /// caller to infer it. A read is answered, but asynchronously, in an uplink frame that lands in the
     /// identity cache rather than here; a write is never answered at all.
     pub fn sent(command: &Command) -> Self {
-        let caveat = if command.config_register().is_some() {
+        let caveat = if matches!(
+            command,
+            Command::WriteConfig { .. } | Command::Restart | Command::FactoryReset
+        ) {
             "sent; a config write draws no acknowledgement, so the device's action is unverified"
         } else {
             "sent; the answer arrives as a separate report, so read the register back to see it"
@@ -200,7 +207,7 @@ impl Outcome {
         }
     }
 
-    /// An outcome for a config command that could not be transmitted.
+    /// An outcome for a command that could not be transmitted.
     pub fn not_sent(command: &Command, error: &str) -> Self {
         Self {
             confirmed: false,
@@ -209,17 +216,35 @@ impl Outcome {
         }
     }
 
+    /// An outcome for a command the driver would not express.
+    ///
+    /// Distinct from [`Self::not_sent`] because the cause is: an unwritable register or a value out of
+    /// range is the caller's mistake, and a caller can only tell if it is told.
+    pub fn refused(command: &Command, error: &str) -> Self {
+        Self {
+            refused: true,
+            ..Self::not_sent(command, error)
+        }
+    }
+
     /// The register and value fields shared by both config outcomes.
     fn for_config(command: &Command) -> Self {
-        let target = command.config_target();
+        let (target, value) = match command {
+            Command::WriteConfig { register, value } => (Some(*register), Some(value.clone())),
+            Command::ReadConfig { registers } => (registers.first().copied(), None),
+            Command::Restart => (Some(WritableConfig::Restart.register()), None),
+            Command::FactoryReset => (Some(WritableConfig::FactoryReset.register()), None),
+            _ => (None, None),
+        };
         Self {
             name: target.and_then(ConfigRegister::lookup).map(|entry| entry.name),
             register: target.map_or(0, Register::number),
             requested: None,
             stored: None,
-            value: command.config_value().map(str::to_owned),
+            value,
             confirmed: false,
             error: None,
+            refused: false,
         }
     }
 
@@ -235,6 +260,7 @@ impl Outcome {
             // Nothing requested means nothing to disagree with, so learning the value is success.
             confirmed: requested.is_none_or(|wanted| wanted == stored),
             error: None,
+            refused: false,
         }
     }
 }
@@ -430,7 +456,13 @@ impl ConfigReader {
                 }
                 // A refusal or timeout is not retried: the register simply goes unanswered, which the
                 // summary reports as silent.
-                drop(handle.carry_out(Action::Send(Command::read_config_many(chunk))).await);
+                drop(
+                    handle
+                        .carry_out(Action::Send(Command::ReadConfig {
+                            registers: chunk.to_vec(),
+                        }))
+                        .await,
+                );
             }
         })
     }
@@ -904,8 +936,8 @@ impl DeviceAction {
     /// The command that performs it.
     fn command(self) -> Command {
         match self {
-            Self::Restart => Command::restart_datalogger(),
-            Self::FactoryReset => Command::factory_reset(),
+            Self::Restart => Command::Restart,
+            Self::FactoryReset => Command::FactoryReset,
         }
     }
 
@@ -1154,12 +1186,14 @@ impl Api {
         // uses rather than as a single-register write nobody has seen this device accept. Built here so a
         // refusal reads as a bad request rather than a device problem: the allowlist and the register's
         // domain are the encoder's decision, and both are the caller's mistake.
-        let command = match Command::set(setting.register, body.value) {
-            Ok(command) => command,
-            Err(error) => return problem(StatusCode::BAD_REQUEST, &error.to_string()),
-        };
-
-        dispatch(&handle, Action::Apply(command)).await
+        dispatch(
+            &handle,
+            Action::Apply(Command::Set {
+                register: setting.register,
+                value: body.value,
+            }),
+        )
+        .await
     }
 
     /// Force a read of one register.
@@ -1301,7 +1335,13 @@ impl Api {
             Ok(register) => register,
             Err(rejection) => return rejection.into_response(),
         };
-        dispatch(&handle, Action::Send(Command::read_config(register))).await
+        dispatch(
+            &handle,
+            Action::Send(Command::ReadConfig {
+                registers: vec![register],
+            }),
+        )
+        .await
     }
 
     /// Resolve a config register by documented name or by number.
@@ -1477,7 +1517,7 @@ impl Api {
         dispatch(
             &handle,
             Action::Send(Command::WriteConfig {
-                register,
+                register: register.register(),
                 value: value.to_owned(),
             }),
         )
@@ -1516,14 +1556,10 @@ impl Api {
             );
         };
 
-        let command = match meter::command(watts, true) {
-            Ok(command) => command,
-            Err(error) => return problem(StatusCode::BAD_REQUEST, &error.to_string()),
-        };
         // Logged here or nowhere: these registers answer no read-back, so this line is the only record of
         // what the device was told.
         tracing::info!(watts, "supplying a meter reading");
-        dispatch(&handle, Action::Send(command)).await
+        dispatch(&handle, Action::Send(Command::MeterReading { watts, valid: true })).await
     }
 
     /// Withdraw the supplied reading, telling the device its meter has gone.
@@ -1535,12 +1571,8 @@ impl Api {
     /// and the device acts on it by holding its output. Conflating the two would make "my meter has gone"
     /// unsayable.
     async fn delete_meter_reading(Session { handle, .. }: Session) -> Response {
-        let command = match meter::command(0, false) {
-            Ok(command) => command,
-            Err(error) => return problem(StatusCode::BAD_REQUEST, &error.to_string()),
-        };
         tracing::info!("withdrawing the supplied meter reading");
-        dispatch(&handle, Action::Send(command)).await
+        dispatch(&handle, Action::Send(Command::MeterReading { watts: 0, valid: false })).await
     }
 
     /// Serve a cached value, or explain that it has not arrived yet.
@@ -1562,6 +1594,10 @@ async fn dispatch(handle: &SessionHandle, action: Action) -> Response {
         Ok(outcome) => {
             let code = if outcome.confirmed {
                 StatusCode::OK
+            } else if outcome.refused {
+                // The driver would not express it: an unwritable register, a value outside its range.
+                // The caller's mistake, and worth saying so rather than blaming the device.
+                StatusCode::BAD_REQUEST
             } else {
                 // The request was carried out; the device simply did not do what was asked. 409 says that
                 // more precisely than either 200 or 500.

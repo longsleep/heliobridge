@@ -14,7 +14,7 @@
 //! # One capability per trait, one bundle to name them
 //!
 //! The seam is split by capability — [`Wire`] for framing, [`Report`] for what a frame says, [`Arbiter`]
-//! for what it is trying to do,
+//! for what it is trying to do, [`Commands`] for asking the device to do something,
 //! [`Firmware`] for update campaigns, [`Upstream`] for the manufacturer's cloud, and more to come — rather than gathered into a single wide trait. A consumer bounds on the capability it uses and
 //! nothing else, which keeps its requirements legible: `server::firmware` needs [`Firmware`], and the fact
 //! that it needs nothing else is worth being able to see.
@@ -41,12 +41,14 @@
 //! says so rather than implying more separation than exists.
 
 pub mod arbiter;
+pub mod commands;
 pub mod firmware;
 pub mod report;
 pub mod upstream;
 pub mod wire;
 
 pub use arbiter::{Arbiter, Direction, Intent, Policy};
+pub use commands::{Command, Commands, Outgoing};
 pub use firmware::{AdvertisedFirmware, Firmware};
 pub use report::{Report, Sink};
 pub use upstream::{Endpoint, Message, Relay, Target, Upstream};
@@ -57,9 +59,9 @@ pub use wire::{Unreadable, Wire};
 /// A bundle rather than a trait in its own right: it has no methods, and a blanket impl gives it to any
 /// type implementing every capability. Bound on this where a whole driver is meant — a session — and on a
 /// single capability everywhere else.
-pub trait Driver: Wire + Arbiter + Firmware + Report + Upstream {}
+pub trait Driver: Wire + Arbiter + Commands + Firmware + Report + Upstream {}
 
-impl<T> Driver for T where T: Wire + Arbiter + Firmware + Report + Upstream {}
+impl<T> Driver for T where T: Wire + Arbiter + Commands + Firmware + Report + Upstream {}
 
 /// A driver that recognises nothing.
 ///
@@ -78,6 +80,14 @@ impl Wire for Unknown {
         Err(Unreadable::Unsupported {
             generation: "none: this driver reads nothing".to_owned(),
         })
+    }
+}
+
+impl Commands for Unknown {
+    type Error = commands::Unsupported;
+
+    fn prepare(&self, _device_id: &str, _command: &Command) -> Result<Outgoing, Self::Error> {
+        Err(commands::Unsupported)
     }
 }
 

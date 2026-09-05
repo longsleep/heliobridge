@@ -41,6 +41,7 @@
 //! real, observed requirement.
 
 pub mod cloud;
+pub mod commands;
 pub mod driver;
 pub mod firmware;
 pub mod header;
