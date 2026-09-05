@@ -56,6 +56,10 @@ The device talks to it, and Home Assistant both shows it and drives it.
 unimplemented, though it would remove the need for the DNS override below. The protocol for it is
 understood; a wrong value there has no remote recovery.
 
+**How fast and how faithfully the device follows a command** — latency for both ways of setting the
+output, what each is accurate to, and what a loop holding your grid connection near zero actually needs —
+is measured in [docs/output-response.md](docs/output-response.md).
+
 ## How it works
 
 The Nexa 2000's datalogger speaks MQTT over TLS to a fixed cloud endpoint and performs **no
@@ -282,12 +286,18 @@ it is already computing the figure.
 approximately that amount:
 
 ```text
-new_output ≈ old_output + reading
+new_output ≈ old_output + 0.75 × reading
 ```
 
-Supply what a meter at the grid connection would read — `household load − ac_output_power` — and the output
-converges on covering the house and keeps tracking it. Supply a fixed target instead and the output walks in
-one direction until the battery limits it.
+The factor was measured at 0.68–0.81 for readings of 100–600 W, and closer to one-for-one at 10–20 W. It
+matters only if you supply a figure and expect it as an output: with a real meter the shortfall is reported
+back on the next reading and corrected then. Supply what a meter at the grid connection would read —
+`household load − ac_output_power` — and the output converges on covering the house and keeps tracking it.
+Supply a fixed target instead and the output walks in one direction until the battery limits it.
+
+**Supplying the same figure again does nothing.** The device acts on the reading *changing*; a repeat keeps
+it from expiring but moves nothing. [docs/output-response.md](docs/output-response.md) has the measured
+latencies and what happens when readings stop — which is not what most people expect.
 
 **A reading expires after about two minutes, and nothing here refreshes it.** Whatever holds the measurement
 writes it again inside that window; stop writing and the device drops the reading and behaves as though no
