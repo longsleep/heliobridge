@@ -47,6 +47,17 @@ pub const INPUT_BASE_OFFSET: usize = 0x4F;
 /// What it buys is that reading the whole space is a **terminating operation** rather than an open-ended
 /// probe: a sweep knows when it is finished, and a register outside the range is a mistake rather than
 /// something to try.
+///
+/// # It bounds this space, not what the device accepts
+///
+/// The write handler routes a key of **500 or more to a different store**, indexed from `key - 500`, and
+/// does not refuse it. The 146 above was measured by reading, and the read path was never asked past 145,
+/// so it says how far *this* store goes rather than what the device will take. Nothing is known about the
+/// second one.
+///
+/// Which turns this constant from a convenience into a guard: refusing a key above it keeps a mistyped
+/// number from landing in a store nobody has read, where the effect of a write is unknown and there is no
+/// way to look at what it did.
 pub const CONFIG_REGISTER_LAST: u16 = 145;
 
 /// What kind of quantity a register carries.
@@ -899,9 +910,15 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         Entry::on_request(35, "factory_reset", Dynamic, Vendor),
         // The Bluetooth handshake key, per device. A credential: Identity, so a fixture redacts it.
         Entry::on_request(54, "ble_handshake_key", Identity, Verified),
+        // How the datalogger reports its own two links, and the parameters a provisioning client polls
+        // after writing credentials: 55 is the router, where "0" means joined and anything else is a
+        // failure code, and 60 is the server, where 3, 4 and 16 mean connected. The meanings come from the
+        // vendor application's own flow and agree with what this device reports while connected here.
+        Entry::on_request(55, "router_status", Dynamic, Verified),
         // The joined network and its passphrase, both in clear.
         Entry::on_request(56, "wifi_ssid", Identity, Observed),
         Entry::on_request(57, "wifi_password", Identity, Observed),
+        Entry::on_request(60, "server_status", Dynamic, Verified),
         // The running build's ESP-IDF version.
         Entry::on_request(61, "sdk_version", Metadata, Observed),
         // Selects between DHCP and the static configuration of 14/25/26. "1" disables DHCP and takes the

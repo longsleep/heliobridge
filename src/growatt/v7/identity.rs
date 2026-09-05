@@ -112,6 +112,11 @@ impl Identity {
     ///
     /// Worth reading back rather than assuming: it is how a retarget would be confirmed, and how an
     /// unexpected reversion would become visible.
+    ///
+    /// **`remote_url` and `server_address` are one setting, not two.** The device's write handler passes
+    /// both to the same endpoint setter, so whichever was written last is what it holds — and this device
+    /// reports the same host in both. Taking either is therefore correct rather than a guess at a
+    /// precedence; the fallback exists because a client that wrote only one leaves the other stale.
     pub fn endpoint(&self) -> Option<String> {
         let host = self.get("remote_url").or_else(|| self.get("server_address"))?;
         Some(match self.get("remote_port") {

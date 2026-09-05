@@ -1268,13 +1268,15 @@ impl Api {
                 for key in keys {
                     match Self::config_register(state.driver.as_ref(), &key) {
                         Ok(register) if register.number() <= last => wanted.push(register),
-                        // Outside the space is worth naming rather than answering nothing: the bound is
-                        // known, so a number past it cannot be a typo the device will resolve.
+                        // Refused here rather than passed on. The device does not refuse a high key: a
+                        // key of 500 or more reaches a second store nothing has ever read, so a typo
+                        // would write somewhere whose effect cannot be looked at afterwards.
                         Ok(register) => {
                             return problem(
                                 StatusCode::BAD_REQUEST,
                                 &format!(
-                                    "config register {} is outside the space, which ends at {last}",
+                                    "config register {} is past {last}, the last one this build knows; \
+                                     higher keys reach a store nothing here can read",
                                     register.number()
                                 ),
                             );
