@@ -594,6 +594,33 @@ impl Entity {
         }
     }
 
+    /// What accessories the device has been told about, over the network and over its radio.
+    ///
+    /// Config registers 122 and 102, both carried in the identity report the device sends on every
+    /// connect. Diagnostics rather than readings: an accessory is something an installation either has or
+    /// has not, and the answer changes only when somebody registers one.
+    ///
+    /// **The value is the device's own line, not an interpretation of it.** `DEV:` alone means nothing is
+    /// registered; an entry reads `<index>-<mode>-<state>,<name>,<address>`, and a **state of 5 is a
+    /// deleted entry** — the device tombstones rather than removing, and the entry survives in the list
+    /// until the datalogger restarts. Showing the line as sent is what lets a reader tell an accessory
+    /// that is registered from one that was removed; a tidied version could not.
+    pub fn accessory_list(key: &'static str, name: &str) -> Self {
+        Self {
+            key,
+            name: name.to_owned(),
+            component: Component::Sensor,
+            device_class: None,
+            unit: None,
+            category: Some(Category::Diagnostic),
+            precision: None,
+            shape: Shape::Reading(None),
+            source: Some(Source::Config),
+            presence: Presence::Device,
+            gate: None,
+        }
+    }
+
     /// The same entity with nothing writable about it.
     ///
     /// What `HELIOBRIDGE_ALLOW_WRITES=false` produces: a setting still worth seeing, published as a plain
@@ -731,6 +758,10 @@ impl Catalogue {
             .chain([Entity::connected(), Entity::last_update(), Entity::bridge_version()])
             .chain([Entity::wifi_signal(), Entity::data_interval(), Entity::serial_number()])
             .chain([Entity::firmware_version()])
+            .chain([
+                Entity::accessory_list("accessory_list", "Accessories on the network"),
+                Entity::accessory_list("accessory_list_rf", "Accessories on the radio"),
+            ])
             // An action has nothing to publish but a control, so refusing writes withdraws it entirely
             // rather than downgrading it to a reading the way a setting does. The meter controls go the
             // same way: both are write-only, so read-only versions of them would be entities that can

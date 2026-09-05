@@ -916,6 +916,13 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         // default of 16, 14, 25, 26 and 12. Named by number only: nothing establishes what they are for,
         // the vendor application never reads them, and a name like `network_ip` invites a reader to take
         // one for the address the device is using.
+        // The same list for the other transport: 122 is what the device reaches over the network, this is
+        // what it reaches over its sub-GHz radio. The firmware dispatches both from one handler with the
+        // same `ADD:`/`DEL:` syntax, differing in the third field — a bare serial here against an address
+        // and a name there — and this one feeds the RF queue rather than a TCP client. Named from that
+        // reading rather than from an entry ever appearing in it: this device has no RF accessory, so every
+        // report of it so far has been the empty `DEV:`.
+        Entry::new(102, "accessory_list_rf", Dynamic, Vendor),
         Entry::on_request(105, "unknown_105", Identity, Inferred),
         Entry::on_request(106, "unknown_106", Inert, Inferred),
         Entry::on_request(107, "unknown_107", Inert, Inferred),

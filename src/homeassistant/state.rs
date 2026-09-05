@@ -129,7 +129,7 @@ impl StatePayload {
                     Ok(number) => json!(number),
                     Err(_) => continue,
                 },
-                _ => json!(entry.value),
+                _ => json!(printable(&entry.value)),
             };
             object.insert(name.to_owned(), value);
         }
@@ -177,6 +177,31 @@ impl StatePayload {
         Publication::retained(topic, self.into_bytes())
     }
 }
+
+/// One config value, fit to be a Home Assistant state.
+///
+/// Two things the device does that a state cannot carry. Values arrive **NUL-padded** — a fixed-width
+/// buffer sent as it sits in memory — and a NUL inside a JSON string is legal but renders as nothing
+/// anybody can see, so a reader cannot tell where the value stopped. And Home Assistant caps a state at
+/// 255 characters, silently: a longer one is rejected and the entity keeps its previous value, which reads
+/// as a device that stopped reporting.
+///
+/// So trailing padding and control octets go, and what is left is truncated with an ellipsis that says so.
+/// Anything needing the exact octets has the control API, which returns the value as sent.
+fn printable(value: &str) -> String {
+    let cleaned: String = value
+        .trim_end_matches(|c: char| c == '\0' || c.is_whitespace())
+        .chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect();
+    if cleaned.chars().count() <= STATE_LIMIT {
+        return cleaned;
+    }
+    cleaned.chars().take(STATE_LIMIT - 1).chain(['…']).collect()
+}
+
+/// What Home Assistant will accept as a state, in characters.
+const STATE_LIMIT: usize = 255;
 
 /// A rendered value as JSON: a number where it is one, a string where it is not.
 ///

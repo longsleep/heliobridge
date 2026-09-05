@@ -162,9 +162,11 @@ fn unrecognised_keys_are_carried_rather_than_rejected() {
         !unknown.is_empty(),
         "this device reports keys outside the documented map; carrying them is how the next one is named"
     );
-    // Register 102 reads "DEV:" like the accessory list at 122, and is still undocumented: nothing
-    // establishes what it lists, so it is carried by number.
-    assert!(unknown.contains(&102), "got {unknown:?}");
+    // Register 23 stands for the class. 102 used to: it reads "DEV:" like the accessory list at 122 and
+    // nothing established what it listed — until the firmware showed it dispatched from the same handler
+    // into the radio's queue, at which point it left this list and became `accessory_list_rf`. That is the
+    // point of carrying an unnamed key rather than dropping it.
+    assert!(unknown.contains(&23), "got {unknown:?}");
 }
 
 #[test]
