@@ -7,9 +7,10 @@
 //!
 //! # Status
 //!
-//! Early. The wire protocol is reverse engineered and specified, and the offline codec is
-//! implemented; none of the networking exists yet. The API will change without regard for
-//! compatibility until 0.1.0.
+//! Runs against one device — the author's — and does what it says: serves it, decodes it, publishes it
+//! and accepts commands back. The wire protocol is reverse engineered and specified from captures of that
+//! device, so anything here is as true as one unit's firmware makes it. The API changes without regard
+//! for compatibility while the version is below 1.0.
 //!
 //! # Layout
 //!
@@ -22,11 +23,11 @@
 //!   and the vendor cloud client both speak it, which is why it sits here rather than inside either.
 //! - [`server`] — everything device-facing: the session state machine, the accept loop, server TLS and
 //!   the clock behind the time push.
+//! - [`homeassistant`] — autodiscovery, state publishing and the command topic, over the operator's own
+//!   broker rather than this program's device-facing one.
 //! - [`control`] — a local HTTP control API over a Unix socket, off unless configured.
 //! - [`record`] — raw frame recording for later analysis, off unless configured.
 //! - [`config`] — environment configuration, all of it prefixed `HELIOBRIDGE_`.
-//!
-//! Still to come: `bridge` (cached state, Home Assistant, optional cloud relay).
 //!
 //! Module paths double as tracing targets, so that layout is also the logging control surface.
 

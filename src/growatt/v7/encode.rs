@@ -311,14 +311,14 @@ pub enum Command {
 /// recovery, because the device listens on no port and would simply stop arriving.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum WritableConfig {
-    /// Register 31, the device's clock. Written on every connect **[O]**.
+    /// Register 31, the device's clock. Written on every connect **`[O]`**.
     Clock,
-    /// Register 32. Restarts the datalogger; observed from the vendor's own interface **[O]**.
+    /// Register 32. Restarts the datalogger; observed from the vendor's own interface **`[O]`**.
     Restart,
     /// Register 35. **Resets the datalogger to factory defaults** — not a log wipe, whatever the
-    /// vendor's own web interface labels it **[F]**. See [`Self::is_destructive`].
+    /// vendor's own web interface labels it **`[F]`**. See [`Self::is_destructive`].
     FactoryReset,
-    /// Register 122, the device's list of network accessories **[O]**.
+    /// Register 122, the device's list of network accessories **`[O]`**.
     ///
     /// Takes a command rather than a value — `ADD:`, `DEL:` or `CRL:` — followed by one or more entries
     /// separated by `&`, each `<type>-<mode>-<parameters>`. Mode 1 is an outbound TCP client whose
@@ -339,7 +339,7 @@ pub enum WritableConfig {
     /// Register 18, the broker port. **Retargets the device.**
     RemotePort,
     /// Register 17, the broker address. **Retargets the device**, and is the one member never observed
-    /// being written **[I]**.
+    /// being written **`[I]`**.
     ServerAddress,
 }
 

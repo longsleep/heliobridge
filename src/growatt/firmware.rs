@@ -16,7 +16,7 @@ pub const UPDATE_URL_REGISTER: Register = Register(80);
 
 /// What the datalogger calls itself when it fetches.
 ///
-/// Read out of the request template compiled into its firmware **[F]**:
+/// Read out of the request template compiled into its firmware **`[F]`**:
 ///
 /// ```text
 /// %s %s HTTP/1.1\r\nUser-Agent: esp-07s\r\nCache-Control: no-cache\r\nHost: %s

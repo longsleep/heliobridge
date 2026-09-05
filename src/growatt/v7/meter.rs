@@ -55,7 +55,7 @@ pub const READING_LIFETIME: Duration = Duration::from_mins(2);
 /// Encode a reading as the four registers the device expects.
 ///
 /// The datalogger builds these from `0x135` = **309** after polling a meter, so this reproduces them
-/// **[F]**:
+/// **`[F]`**:
 ///
 /// | Register | Content |
 /// |---|---|

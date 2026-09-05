@@ -32,7 +32,7 @@ The device talks to it, and Home Assistant both shows it and drives it.
 - **Optionally relays to the vendor cloud**, so the phone app keeps working — with a policy
   deciding how much authority the cloud keeps.
 - **Records raw frames** for later analysis, including the ones the relay policy refused.
-- **Publishes to Home Assistant** over your own broker, with MQTT autodiscovery. Sixty-odd entities
+- **Publishes to Home Assistant** over your own broker, with MQTT autodiscovery. Seventy entities
   per device, derived from the register maps rather than from a second list, and two availability
   topics — this program's own as a last will, the device's own as a telemetry watchdog — so a reading
   goes `unavailable` instead of flat-lining when the device drops off. Nothing publishes a substitute
@@ -45,10 +45,16 @@ The device talks to it, and Home Assistant both shows it and drives it.
   the LAN, by Modbus, by a sub-GHz radio, or — for the vendor's documented integration — from the meter
   manufacturer's cloud by way of Growatt's. Writing the figure directly needs none of that: any source
   Home Assistant can read becomes usable, and no account anywhere is involved.
+- **Reads and publishes the datalogger's own configuration** — its network settings, its endpoint, its
+  signal strength and the interval it reports on — and identifies the product from the type code the
+  device reports, so a device page names the model and one assembled firmware version rather than three
+  register values.
+- **Notices the firmware the vendor's cloud advertises**, logs the URL, and can keep the image. Nothing
+  installs it; the campaign is refused either way.
 
-Also unimplemented: **retargeting the device's broker endpoint** by writing its config registers,
-which would remove the need for the DNS override below. The protocol for it is understood; it stays
-unimplemented because a wrong value there has no remote recovery.
+**Retargeting the device's broker endpoint** by writing its config registers is deliberately
+unimplemented, though it would remove the need for the DNS override below. The protocol for it is
+understood; a wrong value there has no remote recovery.
 
 ## How it works
 
@@ -301,6 +307,35 @@ to say so, because the register still stores and reads back whatever is written 
 measures itself, so a wrong one is obeyed — an import that no load justifies will discharge the battery to
 serve a load that is not there.
 
+## Firmware the cloud advertises
+
+The vendor's cloud advertises a firmware update by writing a URL into datalogger configuration register 80,
+about once an hour until the device installs it. The relay policy refuses cloud writes to the configuration
+space, so it never reaches the device.
+
+**This needs `HELIOBRIDGE_CLOUD_RELAY`.** An advertisement arrives on the relay's cloud-to-device path;
+without a relay the device never hears from the vendor's cloud through this program, so there is nothing to
+notice and nothing to fetch.
+
+With a relay, the advertisement is logged in full whether or not anything is kept, URL included:
+
+```
+the cloud advertised a firmware update source="configuration register 80"
+  url=http://cdn.growatt.com/update/device/GB/manualUpgrade/…/WIFI/4.0.2.6.bin
+  file=WIFI-4.0.2.6.bin refused=true fetch=false
+```
+
+`HELIOBRIDGE_FIRMWARE_DIR` keeps the image as well, and `HELIOBRIDGE_FETCH_FIRMWARE=true` downloads it.
+Fetching is off by default: an advertisement is traffic that arrives anyway, while downloading reaches out
+to a vendor host. An image already on disk is left alone, so an hourly campaign costs one download. The
+transfer is capped, is written under a temporary name and renamed once complete, and its SHA-256 is logged
+so the file can be compared with an image already held.
+
+The request presents the same user agent and cache directive the datalogger's own firmware sends, and
+nothing else — this program does not announce itself to the vendor's CDN.
+
+**Nothing installs firmware.** The image is stored and that is all.
+
 ## Control API
 
 HTTP over the Unix socket, so `curl --unix-socket` is the whole client. Errors are
@@ -486,8 +521,9 @@ packages one for aarch64-musl. Installed as a Python package, Zig has no `zig` e
   tested against recorded frames rather than against hardware.
 - `#![forbid(unsafe_code)]`, edition 2024, and lints that deny `unwrap`, `expect`, slice indexing
   and unchecked arithmetic in the library.
-- Vendor- and generation-neutral seams: the relay policy speaks in intents, and the Growatt
-  generation-7 codec translates into them.
+- One seam between the server and the manufacturer: framing, decoding, commands, the register
+  catalogue, the relay policy, the cloud endpoint and firmware are each a trait the server owns and a
+  driver implements. Only the binary names Growatt, and a test fails the build if anything else does.
 
 ## Safety
 
@@ -516,33 +552,4 @@ better than this one:
 Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE).
 
 Copyright 2026 Simon Eisenmann. See [NOTICE](NOTICE).
-
-## Firmware the cloud advertises
-
-The vendor's cloud advertises a firmware update by writing a URL into datalogger configuration register 80,
-about once an hour until the device installs it. The relay policy refuses cloud writes to the configuration
-space, so it never reaches the device.
-
-**This needs `HELIOBRIDGE_CLOUD_RELAY`.** An advertisement arrives on the relay's cloud-to-device path;
-without a relay the device never hears from the vendor's cloud through this program, so there is nothing to
-notice and nothing to fetch.
-
-With a relay, the advertisement is logged in full whether or not anything is kept, URL included:
-
-```
-the cloud advertised a firmware update source="configuration register 80"
-  url=http://cdn.growatt.com/update/device/GB/manualUpgrade/…/WIFI/4.0.2.6.bin
-  file=WIFI-4.0.2.6.bin refused=true fetch=false
-```
-
-`HELIOBRIDGE_FIRMWARE_DIR` keeps the image as well, and `HELIOBRIDGE_FETCH_FIRMWARE=true` downloads it.
-Fetching is off by default: an advertisement is traffic that arrives anyway, while downloading reaches out
-to a vendor host. An image already on disk is left alone, so an hourly campaign costs one download. The
-transfer is capped, is written under a temporary name and renamed once complete, and its SHA-256 is logged
-so the file can be compared with an image already held.
-
-The request presents the same user agent and cache directive the datalogger's own firmware sends, and
-nothing else — this program does not announce itself to the vendor's CDN.
-
-**Nothing installs firmware.** The image is stored and that is all.
 
