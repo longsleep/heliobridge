@@ -9,8 +9,9 @@ use std::sync::Arc;
 use heliobridge::VERSION;
 use heliobridge::config::{Command, Config, LogFormat};
 use heliobridge::control::{self, Registry};
-use heliobridge::driver::upstream::{Target, Upstream as _};
-use heliobridge::growatt::{self};
+use heliobridge::driver::Driver;
+use heliobridge::driver::upstream::Target;
+use heliobridge::growatt::driver::Growatt;
 use heliobridge::homeassistant::broker::{BrokerConfig, BrokerUrl};
 use heliobridge::homeassistant::command;
 use heliobridge::homeassistant::publisher::Publisher;
@@ -69,7 +70,9 @@ fn healthz(config: &Config) -> ExitCode {
 fn run(config: &Config) -> Result<(), String> {
     tracing::info!(version = VERSION, "heliobridge starting");
 
-    Bridge::new(config)?
+    // The one line in the program that names a manufacturer. Everything the bridge assembles below takes
+    // this as a `Driver` and cannot tell which one it got.
+    Bridge::new(config, Arc::new(Growatt))?
         .with_cloud_relay()?
         .with_recording()?
         .with_control_api()?
@@ -83,11 +86,11 @@ fn run(config: &Config) -> Result<(), String> {
 /// Home Assistant publisher needs the registry the control API may already have created — so they are
 /// methods over shared state rather than functions passing it along. What is optional stays `Option`, and
 /// a step that is switched off is a method that does nothing.
-struct Bridge<'a> {
+struct Bridge<'a, D: Driver> {
     config: &'a Config,
-    /// The one place in the program that names a manufacturer. Everything below reaches it through
-    /// [`heliobridge::driver`].
-    driver: Arc<growatt::driver::Growatt>,
+    /// What the bytes mean, whoever made the device. Chosen by the caller and passed on unopened: this
+    /// type knows only what [`heliobridge::driver`] says a driver can do.
+    driver: Arc<D>,
     /// Runs every task. The recorder, the control API and the publisher all spawn into it, so it must
     /// exist before any of them.
     runtime: tokio::runtime::Runtime,
@@ -100,10 +103,12 @@ struct Bridge<'a> {
     registry: Option<Registry>,
 }
 
-impl<'a> Bridge<'a> {
+impl<'a, D: Driver> Bridge<'a, D> {
     /// The parts that are not optional: a runtime, a certificate to present, and anchors to trust.
-    fn new(config: &'a Config) -> Result<Self, String> {
-        let driver = Arc::new(growatt::driver::Growatt);
+    ///
+    /// The certificate is the driver's business too: a device dialing its manufacturer's host name and
+    /// reaching this program has to be offered something that looks like what it expected.
+    fn new(config: &'a Config, driver: Arc<D>) -> Result<Self, String> {
         let pair = config.tls_pair().map_err(str::to_owned)?;
         let (cert, key) = match pair {
             Some((cert, key)) => (Some(cert.as_path()), Some(key.as_path())),
