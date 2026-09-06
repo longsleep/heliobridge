@@ -59,6 +59,9 @@ use core::fmt;
 /// new device could break.
 const PREFIX: &str = "111-7";
 
+/// The mode that means "discovered by name", which is the one this module enrols.
+const MODE: u16 = 7;
+
 /// How long the device browses after an `ADD:`.
 ///
 /// Measured rather than documented: the device reports what it has found every ~7 s and then stops, and the
@@ -207,14 +210,6 @@ impl Search {
     pub fn start(&self) -> String {
         format!("ADD:{PREFIX}-{},{}", self.service, self.accessory)
     }
-
-    /// The command that tombstones the entry this search enrolled.
-    ///
-    /// Identical in effect to [`forget`], which is the one to prefer: the parameters are not matched
-    /// against anything. Kept for a caller that wants the command it would have sent.
-    pub fn forget(&self) -> String {
-        format!("DEL:{PREFIX}-{},{}", self.service, self.accessory)
-    }
 }
 
 /// The payload a delete carries, which the device does not read.
@@ -223,18 +218,18 @@ impl Search {
 /// that is ignored, and only the second has been run.
 const FORGET_PAYLOAD: &str = "_http._tcp.,0";
 
-/// Tombstone the network accessory entry, whatever search enrolled it.
+/// Tombstone one discovered accessory, by the number the device gave it.
 ///
-/// **The device matches on the type and mode alone.** A `DEL:` naming a service that was never browsed and
-/// a type that was never requested tombstoned a paired entry exactly as the correct parameters did — so
-/// there is nothing here for a caller to supply, and nothing to recover from a list that does not record
-/// it. The entry carries no service name and no model index, so this is what makes a delete expressible
-/// from what the device itself reports.
+/// **The number selects and the payload is ignored.** Measured against a device holding two mode-7 entries:
+/// a delete naming `112` tombstoned `112` and left `111` paired; naming `111` then tombstoned `111`. The
+/// payload was a service never browsed and an index never requested in both cases, and made no difference —
+/// so a caller supplies the number from [`Entry::number`] and nothing else.
 ///
-/// It follows that this is as precise as the device allows: it removes the network entry at type `111`,
-/// mode `7`, and cannot single one out if a device is ever seen holding two.
-pub fn forget() -> String {
-    format!("DEL:{PREFIX}-{FORGET_PAYLOAD}")
+/// A delete that names no particular entry is therefore not expressible, which is why this takes an
+/// argument at all. With a single entry any number that happened to match it worked, and that is how this
+/// was first, wrongly, read as taking nothing.
+pub fn forget(entry: u16) -> String {
+    format!("DEL:{entry}-{MODE}-{FORGET_PAYLOAD}")
 }
 
 /// The pair command: which accessory, and whether the device should use what it reads.
@@ -327,8 +322,12 @@ impl State {
 /// One entry as the device reports it in register 122.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    /// The accessory type — `111` in everything observed.
-    pub accessory: u16,
+    /// The device's own number for this record, which is what a delete names.
+    ///
+    /// **Assigned by the device, not by the server.** Every discovery write sends `111`; the device puts
+    /// the entry wherever it likes, and a second one registered while the first was live came back as
+    /// `112`. So it can be read back and used, but never predicted.
+    pub number: u16,
     /// The mode — `7`, name discovery, for everything this module builds.
     pub mode: u16,
     /// What the device is doing with it.
@@ -392,7 +391,7 @@ impl Entry {
         // The head is three dash-separated numbers, and the state is the last of them. Split from the left
         // so a type that grows a dash would fail to parse rather than silently read as something else.
         let mut parts = head.split('-');
-        let accessory = parts.next()?.parse().ok()?;
+        let number = parts.next()?.parse().ok()?;
         let mode = parts.next()?.parse().ok()?;
         let state = parts.next()?.parse().ok()?;
         if parts.next().is_some() {
@@ -400,7 +399,7 @@ impl Entry {
         }
 
         Some(Self {
-            accessory,
+            number,
             mode,
             state: State::of(state),
             name: Some(serial.trim().to_owned()).filter(|text| !text.is_empty()),
@@ -456,12 +455,16 @@ mod tests {
     }
 
     #[test]
-    fn a_delete_needs_no_search_because_the_device_matches_on_type_and_mode() {
-        // Verified against the device: `DEL:111-7-_nothing._tcp.,9` tombstoned a paired entry that had been
-        // enrolled through `_http._tcp.,2`. So the payload is ignored, and a delete is expressible from
-        // what the accessory list reports — which records neither the service nor the model index.
-        assert_eq!(super::forget(), "DEL:111-7-_http._tcp.,0");
-        assert!(super::forget().starts_with("DEL:111-7-"));
+    fn a_delete_names_the_entry_and_the_device_ignores_the_rest() {
+        // Measured against a device holding two mode-7 entries: naming 112 tombstoned 112 and left 111
+        // paired, then naming 111 tombstoned 111. The payload was a service never browsed in both cases.
+        assert_eq!(super::forget(112), "DEL:112-7-_http._tcp.,0");
+        assert_eq!(super::forget(111), "DEL:111-7-_http._tcp.,0");
+        assert_ne!(
+            super::forget(111),
+            super::forget(112),
+            "the number is the whole selector"
+        );
     }
 
     #[test]
@@ -470,9 +473,9 @@ mod tests {
         assert_eq!(search.service, "_http._tcp.");
         assert_eq!(search.accessory, 2);
         assert_eq!(search.start(), "ADD:111-7-_http._tcp.,2");
-        // The delete takes the search's parameters, not the entry's, and carries no serial.
-        assert_eq!(search.forget(), "DEL:111-7-_http._tcp.,2");
-        assert!(!search.forget().contains("187723572702975"));
+        // A search always sends 111. Which entry the device puts it in is the device's business, and a
+        // delete has to name what it chose — see `forget`.
+        assert!(search.start().starts_with("ADD:111-7-"));
     }
 
     #[test]
@@ -522,7 +525,7 @@ mod tests {
         let entries = Entry::parse_list("DEV:111-7-3,187723572702975,192.168.2.212\0");
         assert_eq!(entries.len(), 1);
         let entry = &entries[0];
-        assert_eq!(entry.accessory, 111);
+        assert_eq!(entry.number, 111);
         assert_eq!(entry.mode, 7);
         assert_eq!(entry.state, State::Paired);
         assert!(entry.state.is_paired());
@@ -568,7 +571,7 @@ mod tests {
     fn several_entries_are_separated_by_an_ampersand() {
         let entries = Entry::parse_list("DEV:2-1-3,helio-a,192.168.1.77&111-7-5,,");
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].accessory, 2);
+        assert_eq!(entries[0].number, 2);
         assert_eq!(entries[0].mode, 1);
         assert_eq!(entries[1].mode, 7);
     }
@@ -582,7 +585,7 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].kind(), "dialled");
         assert_eq!(entries[1].kind(), "dialled");
-        assert_eq!((entries[0].accessory, entries[1].accessory), (2, 3));
+        assert_eq!((entries[0].number, entries[1].number), (2, 3));
 
         // A dialled entry's second field is a name, not a serial, so it parses as one and not the other.
         assert_eq!(entries[0].name.as_deref(), Some("helio-a"));

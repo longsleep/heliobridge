@@ -68,7 +68,7 @@ fn translate(asked: &Asked) -> Result<Command, EncodeError> {
             }
             .start(),
         )),
-        Asked::ForgetDiscoveredAccessory => Ok(Command::write_accessories(network::forget())),
+        Asked::ForgetDiscoveredAccessory { entry } => Ok(Command::write_accessories(network::forget(*entry))),
         Asked::PairDiscoveredAccessory { serial, access } => match network::Serial::new(*serial) {
             Some(serial) => Ok(Command::write_accessories(
                 network::Pairing {

@@ -21,9 +21,10 @@ pub struct Enrolled {
     /// together, so an entry that cannot be told apart from another is one a caller cannot act on. The
     /// enrolment routes manage **one** of these kinds; the rest are reported and left alone.
     pub kind: &'static str,
-    /// The accessory type, in the device's own numbering. Part of the key that identifies an entry.
-    pub accessory: u16,
-    /// The mode, which selects the sub-protocol the device uses to reach it. The other half of the key.
+    /// The device's own number for this record — what a delete names, and the only thing that identifies
+    /// one entry among several. Assigned by the device and readable only from its own report.
+    pub entry: u16,
+    /// The mode, which selects the sub-protocol the device uses to reach it.
     pub mode: u16,
     /// The entry's own second field, as the device spells it: a serial for one it discovered, a name for
     /// one it was given an address for.
@@ -59,6 +60,11 @@ pub trait Enrols {
 
     /// Every model name this driver can resolve, so a refusal can name the alternatives.
     fn accessory_models(&self) -> Vec<&'static str>;
+
+    /// Remove one accessory by the number its own entry carries.
+    ///
+    /// Split from the rest because only the driver knows what identifies an entry on this protocol.
+    fn forget_accessory(&self, entry: u16) -> String;
 
     /// Decode an accessory list register.
     ///

@@ -204,7 +204,7 @@ impl Enrols for Growatt {
             .into_iter()
             .map(|entry| Enrolled {
                 kind: entry.kind(),
-                accessory: entry.accessory,
+                entry: entry.number,
                 mode: entry.mode,
                 name: entry.name,
                 state: entry.state.code(),
@@ -214,6 +214,10 @@ impl Enrols for Growatt {
                 address: entry.address,
             })
             .collect()
+    }
+
+    fn forget_accessory(&self, entry: u16) -> String {
+        network::forget(entry)
     }
 
     fn accessory_found(&self, value: &str) -> Option<u64> {

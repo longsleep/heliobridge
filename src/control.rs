@@ -29,7 +29,8 @@
 //! GET  /devices/{device}/accessories           everything enrolled, on either transport
 //! POST /devices/{device}/accessories/network/discovered/search  {"model":"…"} — candidates as JSON Lines
 //! POST /devices/{device}/accessories/network/discovered  confirm one: {"serial":"…","access":0}
-//! DELETE /devices/{device}/accessories/network/discovered  remove it; takes nothing
+//! GET  /devices/{device}/accessories/network/discovered/{entry}   one record
+//! DELETE /devices/{device}/accessories/network/discovered/{entry}  remove it
 //! POST /devices/{device}/accessories/lora/pair        open the radio's pairing window
 //! ```
 //!
@@ -386,10 +387,11 @@ pub struct AccessoryEntryView {
     /// routes manage, `dialled` for an accessory the server gave an address for. Several of the latter can
     /// coexist and none of them is touched by those routes.
     pub kind: &'static str,
-    /// The accessory type in the device's own numbering, and the mode that selects how it is reached.
-    /// Together they are the key the device's list is held under, which is why both are reported.
-    pub accessory_type: u16,
-    /// See [`Self::accessory_type`].
+    /// The device's own number for this record. **This is what addresses it**: a delete names it, and the
+    /// routes under `…/discovered/{entry}` take it. It is assigned by the device and cannot be predicted,
+    /// so it is read from here and used, never guessed.
+    pub entry: u16,
+    /// The mode, which says how the device reaches the accessory.
     pub mode: u16,
     /// The entry's second field as the device spells it: a serial for a discovered accessory, a name for
     /// one reached by address.
@@ -1077,7 +1079,11 @@ pub fn listen<D: Catalogue + Enrols>(path: &Path, registry: Registry, driver: Ar
         )
         .route(
             "/devices/{device}/accessories/network/discovered",
-            post(Api::pair_discovered::<D>).delete(Api::forget_discovered::<D>),
+            post(Api::pair_discovered::<D>),
+        )
+        .route(
+            "/devices/{device}/accessories/network/discovered/{entry}",
+            get(Api::discovered_one::<D>).delete(Api::forget_discovered::<D>),
         )
         .route("/devices", get(Api::devices::<D>))
         .route("/devices/{device}", get(Api::device))
@@ -1276,6 +1282,26 @@ impl<D: Send + Sync + 'static> FromRequestParts<ApiState<D>> for Key {
 
     async fn from_request_parts(parts: &mut Parts, _state: &ApiState<D>) -> Result<Self, Self::Rejection> {
         path_param(parts, "key").await.map(Self)
+    }
+}
+
+/// The `{entry}` path segment: the device's own number for one accessory record.
+///
+/// A number rather than a name because that is what the device's own list and its delete command use, and
+/// what `GET …/accessories` reports for every entry.
+struct Entry(u16);
+
+impl<D: Send + Sync + 'static> FromRequestParts<ApiState<D>> for Entry {
+    type Rejection = Rejection;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &ApiState<D>) -> Result<Self, Self::Rejection> {
+        let raw = path_param(parts, "entry").await?;
+        raw.parse().map(Self).map_err(|_ignored| {
+            Rejection::new(
+                StatusCode::BAD_REQUEST,
+                format!("{raw:?} is not an accessory entry number; see GET …/accessories"),
+            )
+        })
     }
 }
 
@@ -1927,7 +1953,7 @@ impl Api {
                 AccessoryEntryView {
                     transport,
                     kind: entry.kind,
-                    accessory_type: entry.accessory,
+                    entry: entry.entry,
                     mode: entry.mode,
                     name: entry.name,
                     state: entry.state_label,
@@ -1957,10 +1983,12 @@ impl Api {
     /// candidates. A search for a *different* service or type does start a new one, because streaming the
     /// results of something the caller did not ask for would be worse than restarting.
     ///
-    /// ⚠ **Refused while an accessory is enrolled**, with `409`. The search command resets the list entry,
-    /// and what that does to an accessory the device is actively polling has never been observed — a
-    /// tombstone loses its address, so silently unenrolling a working meter is among the possibilities.
-    /// `{"replace": true}` says to delete it first and search anyway.
+    /// ⚠ **Refused while an accessory is enrolled**, with `409`, and the refusal is load-bearing. A search
+    /// over a live entry does **not** restart it: the device allocates a *second* entry, whose own search
+    /// then finds nothing, and whose presence stops the paired accessory being polled until it is deleted.
+    /// That is what the vendor's application runs into, and it reports it as a failed search.
+    /// `{"replace": true}` says to delete the paired entry first and search anyway, which is the sequence
+    /// that works — against a tombstone the same write revives it in place, keeping its number.
     async fn search_discovered<D: Catalogue + Enrols>(
         State(state): State<ApiState<D>>,
         Session { handle, device }: Session,
@@ -1998,12 +2026,9 @@ impl Api {
                     ),
                 );
             }
-            tracing::info!(%device, "replacing an enrolled accessory: deleting it before searching");
-            if handle
-                .carry_out(Action::Send(Command::ForgetDiscoveredAccessory))
-                .await
-                .is_err()
-            {
+            tracing::info!(%device, entry = paired.entry, "replacing an enrolled accessory: deleting it first");
+            let forget = Command::ForgetDiscoveredAccessory { entry: paired.entry };
+            if handle.carry_out(Action::Send(forget)).await.is_err() {
                 return problem(
                     StatusCode::BAD_GATEWAY,
                     "could not delete the enrolled accessory, so the search was not started",
@@ -2188,35 +2213,73 @@ impl Api {
         .into_response()
     }
 
-    /// Remove the **discovered** accessory — the one an mDNS search enrolled.
+    /// One enrolled accessory, by the number its entry carries.
     ///
-    /// **Takes nothing, because the device matches on nothing.** Its delete command names neither the
-    /// accessory nor — in any way it reads — the search: a `DEL:` carrying a service that was never browsed
-    /// and a type that was never requested tombstones a paired entry exactly as the right parameters do.
-    /// That is what makes this expressible from `GET …/accessories` alone, which reports no service name
-    /// and no model index because the device's own entry holds neither.
+    /// The number comes from `GET …/accessories`, where every entry reports it. It is the device's own and
+    /// cannot be predicted, so this is always a read-then-address operation.
+    async fn discovered_one<D: Catalogue + Enrols>(
+        State(state): State<ApiState<D>>,
+        Session { handle, .. }: Session,
+        Entry(entry): Entry,
+    ) -> Response {
+        let driver = state.driver.as_ref();
+        let Some(value) = Self::cached_config(&handle, driver, driver.accessory_list()) else {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the device has not reported its accessories yet",
+            );
+        };
+        let found = driver.enrolled(&value).into_iter().find(|one| one.entry == entry);
+        let Some(found) = found else {
+            return problem(
+                StatusCode::NOT_FOUND,
+                &format!("no accessory entry {entry} on this device"),
+            );
+        };
+
+        let in_use = Self::reading_is_set(&handle, driver.accessory_in_use_reading());
+        let reported = handle.accessory.borrow().clone();
+        let mut described = Self::describe_all(driver, Transport::Network, vec![found], reported.as_ref(), in_use);
+        match described.pop() {
+            Some(view) => axum::Json(view).into_response(),
+            None => problem(
+                StatusCode::NOT_FOUND,
+                &format!("no accessory entry {entry} on this device"),
+            ),
+        }
+    }
+
+    /// Remove one enrolled accessory, by the number its entry carries.
     ///
-    /// **Scoped to the discovered entry.** Only one has ever been seen, and the vendor's own cloud tracks
-    /// this family with a *flag* where it tracks its plugs with a *count* — so one is what this expects,
-    /// though what the device would do with two is untested. Accessories reached by address are a different
-    /// kind: they are removed by naming their own address and name, not by this, and they appear in
-    /// `GET …/accessories` with `kind` saying so. Nothing here manages them.
+    /// **The number is the whole selector.** The device's delete names it and reads nothing else — a
+    /// command carrying a service never browsed and an index never requested removes the named entry just
+    /// the same. With one entry in the list any number that matched it worked, which is how this was first
+    /// written as taking nothing at all; a device holding two showed that wrong.
+    ///
+    /// The number cannot be guessed. It is assigned by the device — a second entry registered while the
+    /// first was live came back as `112` — so a caller reads it from `GET …/accessories` and passes it
+    /// here.
     ///
     /// The reply is the list as it reads afterwards, so a caller sees what the device did.
     async fn forget_discovered<D: Catalogue + Enrols>(
         State(state): State<ApiState<D>>,
         Session { handle, device }: Session,
+        Entry(entry): Entry,
     ) -> Response {
         let driver = state.driver.as_ref();
 
         // Taken before the write, so the read-back can tell the new value from the old one.
         let before = Self::read_enrolled(&handle, driver).await;
-        tracing::info!(%device, "deleting the network accessory");
-        if handle
-            .carry_out(Action::Send(Command::ForgetDiscoveredAccessory))
-            .await
-            .is_err()
-        {
+        if !before.iter().any(|one| one.entry == entry) {
+            return problem(
+                StatusCode::NOT_FOUND,
+                &format!("no accessory entry {entry} on this device"),
+            );
+        }
+
+        tracing::info!(%device, entry, "deleting an enrolled accessory");
+        let command = Command::ForgetDiscoveredAccessory { entry };
+        if handle.carry_out(Action::Send(command)).await.is_err() {
             return problem(StatusCode::BAD_GATEWAY, "the delete could not be sent to the device");
         }
 
@@ -2226,8 +2289,8 @@ impl Api {
         let accessories = Self::describe_all(driver, Transport::Network, entries, reported.as_ref(), in_use);
         axum::Json(serde_json::json!({
             "accessories": accessories,
-            "detail": "a delete tombstones the entry rather than removing it; the next search clears what it \
-                       still holds",
+            "detail": "a delete tombstones the entry rather than removing it; a later search revives it in \
+                       place, keeping its number",
         }))
         .into_response()
     }

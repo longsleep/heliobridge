@@ -116,12 +116,14 @@ pub enum Command {
         access: u16,
     },
 
-    /// Remove the accessory an mDNS search enrolled.
+    /// Remove one accessory an mDNS search enrolled, by the number its entry carries.
     ///
-    /// Carries nothing, because the device's own command matches on nothing a caller could supply: it
-    /// names neither the accessory nor, in any way that is read, the search. A driver that needs
-    /// parameters to express this builds them itself.
-    ForgetDiscoveredAccessory,
+    /// The number is the device's own and cannot be predicted — it is read back from the accessory list,
+    /// which is why removing one is a two-step operation for any caller that does not already hold it.
+    ForgetDiscoveredAccessory {
+        /// The entry to remove, as the device reported it.
+        entry: u16,
+    },
 }
 
 /// A command, ready to send.
