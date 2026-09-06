@@ -160,6 +160,7 @@ impl<'a, D: Driver + Enrols> Bridge<'a, D> {
         tracing::info!(
             mode = ?self.config.relay_mode,
             answers = ?self.config.relay_answers,
+            accessory_pairing = self.config.relay_accessory_pairing,
             "relay policy: how much the cloud may change, and which command answers it is told about. \
              Telemetry, identity and settings snapshots are always forwarded"
         );

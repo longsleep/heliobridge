@@ -104,6 +104,7 @@ regenerated when missing. Point `HELIOBRIDGE_STATE_DIR` somewhere durable to kee
 | `HELIOBRIDGE_CLOUD_RELAY` | off | Relay to the vendor cloud |
 | `HELIOBRIDGE_RELAY_MODE` | `controls` | How much authority the cloud keeps |
 | `HELIOBRIDGE_RELAY_ANSWERS` | `cloud-only` | Which answers to earlier commands reach the cloud |
+| `HELIOBRIDGE_RELAY_ACCESSORY_PAIRING` | `false` | Let the cloud write the accessory list, and nothing else in the config space |
 | `HELIOBRIDGE_FIRMWARE_DIR` | off | Keep firmware the cloud advertises here |
 | `HELIOBRIDGE_FETCH_FIRMWARE` | `false` | Download the advertised image, rather than only logging its URL |
 | `HELIOBRIDGE_FIRMWARE_MAX_BYTES` | `16777216` | Cap on a single firmware download |
@@ -178,6 +179,16 @@ In every mode the vendor app keeps **displaying** correctly. What differs is wha
   functionality.
 - `observer` — the cloud sees everything and changes nothing. The right choice once settings are
   driven locally, since a second writer is only a way for two pictures to disagree.
+
+**One exception, off by default.** `HELIOBRIDGE_RELAY_ACCESSORY_PAIRING=true` lets a cloud write reach the
+**accessory list** — and only that register — while `controls` goes on refusing every other configuration
+write. It exists because enrolling a meter through the vendor's own application is a three-stage
+conversation between the cloud and the device, and in `controls` mode the app's first command is refused and
+it reports a failed search.
+
+Turn it on to pair a meter from the app, and leave it off otherwise: it is the one hole in the
+configuration-write policy, and the register it opens is the one that decides which accessory this device
+polls. The enrolment routes below do the same job without it.
 
 Nothing the device sends is ever withheld from the cloud in any mode: a report cannot change the
 device's behaviour, and withholding one only makes the app's picture wrong — which matters, because
