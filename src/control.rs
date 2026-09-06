@@ -91,7 +91,7 @@ use axum::routing::{get, post, put};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use tokio::net::UnixListener;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
@@ -764,6 +764,13 @@ pub struct SessionHandle {
     /// What an enrolled accessory last reported about itself. Absent until one does, which is once a
     /// minute and only while one is paired.
     pub accessory: watch::Receiver<Option<AccessoryView>>,
+    /// Fired when this session is displaced by a newer one for the same device.
+    ///
+    /// A session cannot tell on its own that the device has reconnected: its socket is half-open, reads
+    /// simply stop, and it goes on holding a cloud relay that the vendor keeps delivering commands to —
+    /// which are then written to a dead socket and lost. The registry knows, because it is the thing that
+    /// replaced it, so it says so.
+    pub stop: Arc<Notify>,
 }
 
 impl SessionHandle {
@@ -902,6 +909,9 @@ impl Registry {
         // against the entry under the *same* key, so process-wide uniqueness is more than enough: device A
         // holding 0, 3, 7 while B holds 1, 2 answers "is this entry still mine" as well as contiguous
         // numbering would.
+        // Taken under the lock and signalled outside it: a session that is ending should not be waited on
+        // while the registry every other session needs is held.
+        let mut displaced: Option<SessionHandle> = None;
         let session = match self.inner.lock() {
             Ok(mut inner) => {
                 let session = SessionId(inner.next_session);
@@ -910,7 +920,10 @@ impl Registry {
                 match inner.next_session.checked_add(1) {
                     Some(next) => {
                         inner.next_session = next;
-                        inner.devices.insert(device_id.to_owned(), (session, handle));
+                        displaced = inner
+                            .devices
+                            .insert(device_id.to_owned(), (session, handle))
+                            .map(|(_, handle)| handle);
                         Some(session)
                     }
                     None => None,
@@ -921,6 +934,13 @@ impl Registry {
         };
         if session.is_none() {
             tracing::error!(device = %device_id, "could not register the device; it will not be addressable");
+        }
+        // The device has reconnected, so whatever was serving it before is serving a socket that is gone.
+        // Nothing else tells that session: its reads stop rather than fail, and it would go on taking
+        // cloud commands and writing them nowhere until a write finally errored.
+        if let Some(displaced) = displaced {
+            tracing::info!(device = %device_id, "a newer session replaced this device's; stopping the old one");
+            displaced.stop.notify_one();
         }
         self.announce();
 
@@ -2451,6 +2471,8 @@ mod tests {
     use crate::driver::catalogue::Catalogue as _;
     use crate::growatt::driver::Growatt;
     use crate::model::{Raw, Register};
+    use std::sync::Arc;
+    use tokio::sync::Notify;
 
     /// The device in these tests, matching the serial used across the documentation.
     const DEVICE: &str = "0EXAMPLE00000001";
@@ -2569,6 +2591,7 @@ mod tests {
                 telemetry: telemetry_rx,
                 status: status_rx,
                 accessory: tokio::sync::watch::channel(None).1,
+                stop: Arc::new(Notify::new()),
             },
             requests_rx,
             settings_tx,
@@ -2710,6 +2733,61 @@ mod tests {
 
         assert_ne!(before, after, "a replacement is a different session");
         assert!(registry.session("0EXAMPLE00000002").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_replaced_session_is_told_to_stop() {
+        // A displaced session cannot discover this for itself: its socket is half-open, so reads stop
+        // rather than fail, while its cloud relay goes on taking commands and writing them to a connection
+        // that is gone. One vendor-app meter search was swallowed exactly that way.
+        let registry = Registry::new();
+        let (first, _rx1, _s1) = handle();
+        let stop = Arc::clone(&first.stop);
+        let _old = registry.register("0EXAMPLE00000001", first);
+
+        // Nothing has displaced it yet.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), stop.notified())
+                .await
+                .is_err(),
+            "a session that is still current must not be told to stop"
+        );
+
+        let (second, _rx2, _s2) = handle();
+        let live = Arc::clone(&second.stop);
+        let _new = registry.register("0EXAMPLE00000001", second);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), stop.notified())
+                .await
+                .is_ok(),
+            "the displaced session must be told"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), live.notified())
+                .await
+                .is_err(),
+            "and the session that replaced it must not be"
+        );
+    }
+
+    #[tokio::test]
+    async fn registering_a_second_device_stops_nothing() {
+        // The signal is per device. A second inverter arriving must not end the first one's session.
+        let registry = Registry::new();
+        let (first, _rx1, _s1) = handle();
+        let stop = Arc::clone(&first.stop);
+        let _a = registry.register("0EXAMPLE00000001", first);
+
+        let (second, _rx2, _s2) = handle();
+        let _b = registry.register("0EXAMPLE00000002", second);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), stop.notified())
+                .await
+                .is_err(),
+            "another device's registration says nothing about this one"
+        );
     }
 
     #[test]

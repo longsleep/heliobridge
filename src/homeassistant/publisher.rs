@@ -1024,7 +1024,7 @@ mod tests {
     use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
     use core::time::Duration;
     use std::sync::Arc;
-    use tokio::sync::{mpsc, watch};
+    use tokio::sync::{Notify, mpsc, watch};
 
     /// The device's own serial in these tests, matching the one used across the documentation.
     const DEVICE: &str = "0EXAMPLE00000001";
@@ -1106,6 +1106,7 @@ mod tests {
                     telemetry: telemetry_rx,
                     status: status_rx,
                     accessory: watch::channel(None).1,
+                    stop: Arc::new(Notify::new()),
                 },
                 session_id: SessionId::sole(),
                 publications,
@@ -1174,6 +1175,7 @@ mod tests {
                 telemetry: telemetry_rx,
                 status: status_rx,
                 accessory: watch::channel(None).1,
+                stop: Arc::new(Notify::new()),
             },
         }
     }

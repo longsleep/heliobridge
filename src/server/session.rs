@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::control::{
@@ -414,6 +414,8 @@ pub struct Session<S, D: Driver> {
     /// What an enrolled accessory last reported about itself, for the API. Only the enrolment routes read
     /// it, so nothing is published to Home Assistant from here — see `accessory_reading`.
     accessory_out: Option<watch::Sender<Option<crate::control::AccessoryView>>>,
+    /// Fired by the registry when a newer session takes this device over. Absent before registration.
+    replaced: Option<Arc<Notify>>,
     /// Where to publish the most recent telemetry frame.
     telemetry_out: Option<watch::Sender<Option<TelemetryView>>>,
     /// Where to publish what this session is doing: relay, clock, counts.
@@ -519,6 +521,7 @@ where
             settings_out: None,
             identity_out: None,
             accessory_out: None,
+            replaced: None,
             telemetry_out: None,
             status_out: None,
             registration: None,
@@ -615,6 +618,14 @@ where
     pub async fn run(&mut self) -> Result<SessionStats, SessionError> {
         loop {
             let packet = match self.wait().await? {
+                Woke::Replaced => {
+                    // The device is on a newer socket. This one's reads would simply stop, while its cloud
+                    // relay went on accepting commands and writing them to a connection that is gone —
+                    // which is how a vendor-app meter search was silently swallowed. Ending the session
+                    // closes the relay with it.
+                    tracing::info!(?self.stats, "this device reconnected elsewhere; ending the stale session");
+                    return Ok(self.stats);
+                }
                 Woke::TimePushDue => {
                     self.time_push_due = None;
                     self.push_time().await?;
@@ -963,6 +974,7 @@ where
     async fn wait(&mut self) -> Result<Woke, SessionError> {
         Ok(tokio::select! {
             biased;
+            () = Self::until_replaced(self.replaced.as_deref()) => Woke::Replaced,
             () = Self::at(self.time_push_due) => Woke::TimePushDue,
             () = Self::at(self.read_deadline) => Woke::ReadTimedOut,
             request = Self::from_control(self.requests.as_mut()) => Woke::Control(request),
@@ -975,6 +987,14 @@ where
     async fn from_control(requests: Option<&mut mpsc::Receiver<ControlRequest>>) -> Option<ControlRequest> {
         match requests {
             Some(requests) => requests.recv().await,
+            None => core::future::pending().await,
+        }
+    }
+
+    /// Resolve when the registry says a newer session has taken this device, or never before registration.
+    async fn until_replaced(replaced: Option<&Notify>) {
+        match replaced {
+            Some(replaced) => replaced.notified().await,
             None => core::future::pending().await,
         }
     }
@@ -1296,6 +1316,7 @@ where
         let (telemetry_tx, telemetry_rx) = watch::channel(None);
         let (status_tx, status_rx) = watch::channel(StatusView::default());
         let (accessory_tx, accessory_rx) = watch::channel(None);
+        let stop = Arc::new(Notify::new());
 
         self.registration = Some(registry.register(
             &device_id,
@@ -1306,6 +1327,7 @@ where
                 telemetry: telemetry_rx,
                 status: status_rx,
                 accessory: accessory_rx,
+                stop: Arc::clone(&stop),
             },
         ));
         self.requests = Some(request_rx);
@@ -1314,6 +1336,7 @@ where
         self.telemetry_out = Some(telemetry_tx);
         self.status_out = Some(status_tx);
         self.accessory_out = Some(accessory_tx);
+        self.replaced = Some(stop);
         self.publish_status();
 
         // An identity report arrives once per connect, and registration happens on CONNECT — so if this
@@ -1872,6 +1895,8 @@ enum Woke {
     Control(Option<ControlRequest>),
     /// The cloud sent something for the device, or the relay stopped.
     FromCloud(Option<CloudMessage>),
+    /// A newer session took this device over.
+    Replaced,
 }
 
 #[cfg(test)]
