@@ -339,7 +339,7 @@ $ curl $SOCK -X POST -H 'content-type: application/json' \
  "state_code":3,"address":"192.168.2.212","in_use":true,"waited_seconds":9}
 
 $ curl $SOCK "http://local/devices/$SERIAL/accessories"
-{"accessories":[{"transport":"network","kind":"discovered","accessory_type":111,"mode":7,
+{"accessories":[{"transport":"network","kind":"discovered","entry":111,"mode":7,
   "name":"187723572702975","state":"paired","state_code":3,
   "serial":"187723572702975","mac":"aa:bb:cc:dd:ee:ff","address":"192.168.2.212",
   "in_use":true,"manufacturer":"shelly","model":"SPEM-003CEBEU","access":0,
@@ -351,27 +351,41 @@ device's own sixty seconds. Start a second search while one is running and it jo
 restarting it. `{"model": …}` resolves to an mDNS service and the device's accessory type; name them
 directly with `{"service":"_http._tcp.","type":2}` for a model this build does not list.
 
-The serial the confirm takes is the one the search reported. A serial no search has reported is ignored silently.
+The serial the confirm takes is the one the search reported. One the device never found is not refused
+here — it simply changes nothing, and the reply shows the entry unchanged and `in_use` null.
 
 **`access` decides whether the device uses the reading.** It defaults to `0`, which puts the meter in
 service. Pass `1` and the device polls the accessory and reports its figures while its own
 `meter_active_power` and `meter_connected` stay at zero. Both look identical in the accessory list, so
 `in_use` in the replies above is read from telemetry, not from the list.
 
-Removing it takes no arguments at all — the device's own delete command reads none:
+**`entry` is how a record is addressed.** It is the device's own number for it, not something a caller
+chooses — every search sends `111` and the device puts the entry where it likes — so it is read from the
+listing and used:
 
 ```console
-$ curl $SOCK -X DELETE "http://local/devices/$SERIAL/accessories/network/discovered"
-{"accessories":[{"transport":"network","kind":"discovered","accessory_type":111,"mode":7,
+$ curl $SOCK "http://local/devices/$SERIAL/accessories/network/discovered/111"
+{"transport":"network","kind":"discovered","entry":111,"mode":7,"state":"paired",…}
+
+$ curl $SOCK -X DELETE "http://local/devices/$SERIAL/accessories/network/discovered/111"
+{"accessories":[{"transport":"network","kind":"discovered","entry":111,"mode":7,
   "name":"187723572702975","state":"deleted","state_code":5,
   "serial":"187723572702975","mac":"aa:bb:cc:dd:ee:ff","address":"192.168.2.212",
   "in_use":null,"manufacturer":null,"model":null,"access":null,"communicating":null}],
- "detail":"a delete tombstones the entry rather than removing it; the next search clears what it still holds"}
+ "detail":"a delete tombstones the entry rather than removing it; a later search revives it in place, keeping its number"}
 ```
 
-So anything `GET /accessories` shows is enough to act on. The serial and the MAC are accepted wherever
-either appears. A search **is** refused while an accessory is enrolled — it resets the entry — so replacing
-one is `{"model":…,"replace":true}`, which deletes first.
+The serial and the MAC are accepted wherever either appears.
+
+⚠ **A search is refused while an accessory is paired, and that refusal matters.** Searching over a live
+entry does not restart it: the device makes a *second* entry, whose search finds nothing, and whose presence
+stops the paired accessory being polled until it is deleted. Replacing one is `{"model":…,"replace":true}`,
+which deletes first.
+
+Delete and re-enrol without a restart in between, and keep the gap short: the accessory list rides in the
+connect-time report the vendor's cloud reads, so a reconnect inside that window tells it the accessory is
+gone. Whether that has any lasting effect on the vendor application is unestablished — its meter display
+comes and goes on its own — but there is no reason to send it a state that is about to be untrue.
 
 **The routes read `accessories/<transport>/<how it was acquired>/`.** `discovered` is the one found by
 mDNS and enrolled above. A device can hold others that a server reaches by an address it supplies — several
@@ -473,7 +487,8 @@ DELETE /devices/{device}/meter-reading       withdraw it
 GET    /devices/{device}/accessories              everything enrolled, on either transport
 POST   …/accessories/network/discovered/search    search: {"model":"shelly-pro-3em"} — streamed
 POST   …/accessories/network/discovered           enrol one a search found: {"serial":"…"}
-DELETE …/accessories/network/discovered           remove it; takes nothing
+GET    …/accessories/network/discovered/{entry}   one record
+DELETE …/accessories/network/discovered/{entry}   remove that one
 POST   /devices/{device}/accessories/lora/pair    open a pairing window on the LoRa radio
 ```
 
