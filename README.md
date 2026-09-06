@@ -42,7 +42,7 @@ The device talks to it, and Home Assistant both shows it and drives it.
   it was asked for.
 - **Supplies the smart meter reading that smart self-use needs**, written straight into the inverter's
   holding registers. The device's own supported meters reach the same registers by polling a Shelly over
-  the LAN, by Modbus, by a sub-GHz radio, or — for the vendor's documented integration — from the meter
+  the LAN, by Modbus, by a LoRa radio, or — for the vendor's documented integration — from the meter
   manufacturer's cloud by way of Growatt's. Writing the figure directly needs none of that: any source
   Home Assistant can read becomes usable, and no account anywhere is involved.
 - **Reads and publishes the datalogger's own configuration** — its network settings, its endpoint, its
@@ -317,6 +317,106 @@ to say so, because the register still stores and reads back whatever is written 
 measures itself, so a wrong one is obeyed — an import that no load justifies will discharge the battery to
 serve a load that is not there.
 
+## Enrolling an accessory on the local network
+
+A meter on the local network is searched for by mDNS, chosen from what answered, and then polled by
+address. Three stages, three calls:
+
+```console
+$ SERIAL=0EXAMPLE00000001
+$ SOCK="--unix-socket /run/heliobridge.sock"
+
+$ curl -N $SOCK -X POST -H 'content-type: application/json' \
+    -d '{"model":"shelly-pro-3em"}' \
+    "http://local/devices/$SERIAL/accessories/network/discovered/search"
+{"serial":"187723572702975","mac":"aa:bb:cc:dd:ee:ff"}
+{"found":1,"duration_seconds":60}
+
+$ curl $SOCK -X POST -H 'content-type: application/json' \
+    -d '{"serial":"187723572702975"}' \
+    "http://local/devices/$SERIAL/accessories/network/discovered"
+{"serial":"187723572702975","mac":"aa:bb:cc:dd:ee:ff","access":0,"state":"paired",
+ "state_code":3,"address":"192.168.2.212","in_use":true,"waited_seconds":9}
+
+$ curl $SOCK "http://local/devices/$SERIAL/accessories"
+{"accessories":[{"transport":"network","kind":"discovered","accessory_type":111,"mode":7,
+  "name":"187723572702975","state":"paired","state_code":3,
+  "serial":"187723572702975","mac":"aa:bb:cc:dd:ee:ff","address":"192.168.2.212",
+  "in_use":true,"manufacturer":"shelly","model":"SPEM-003CEBEU","access":0,
+  "communicating":true}]}
+```
+
+The search streams one line per accessory as the device reports it, then a summary, and runs for the
+device's own sixty seconds. Start a second search while one is running and it joins that one rather than
+restarting it. `{"model": …}` resolves to an mDNS service and the device's accessory type; name them
+directly with `{"service":"_http._tcp.","type":2}` for a model this build does not list.
+
+The serial the confirm takes is the one the search reported. A serial no search has reported is ignored silently.
+
+**`access` decides whether the device uses the reading.** It defaults to `0`, which puts the meter in
+service. Pass `1` and the device polls the accessory and reports its figures while its own
+`meter_active_power` and `meter_connected` stay at zero. Both look identical in the accessory list, so
+`in_use` in the replies above is read from telemetry, not from the list.
+
+Removing it takes no arguments at all — the device's own delete command reads none:
+
+```console
+$ curl $SOCK -X DELETE "http://local/devices/$SERIAL/accessories/network/discovered"
+{"accessories":[{"transport":"network","kind":"discovered","accessory_type":111,"mode":7,
+  "name":"187723572702975","state":"deleted","state_code":5,
+  "serial":"187723572702975","mac":"aa:bb:cc:dd:ee:ff","address":"192.168.2.212",
+  "in_use":null,"manufacturer":null,"model":null,"access":null,"communicating":null}],
+ "detail":"a delete tombstones the entry rather than removing it; the next search clears what it still holds"}
+```
+
+So anything `GET /accessories` shows is enough to act on. The serial and the MAC are accepted wherever
+either appears. A search **is** refused while an accessory is enrolled — it resets the entry — so replacing
+one is `{"model":…,"replace":true}`, which deletes first.
+
+**The routes read `accessories/<transport>/<how it was acquired>/`.** `discovered` is the one found by
+mDNS and enrolled above. A device can hold others that a server reaches by an address it supplies — several
+can coexist — and those appear in `GET /accessories` as `kind: "dialled"`. Nothing here searches for, enrols
+or removes them, and `accessories/network/dialled/` is reserved for when something does. The transport alone
+would not have separated the two, since both are on the local network and share one register.
+
+Accessories the vendor binds through its own cloud — its smart plugs, of which there may be several —
+appear in neither list, so an empty reply does not mean nothing is attached.
+
+A paired accessory survives a datalogger restart and the device resumes polling it unasked; nothing here
+has to re-assert it.
+
+⚠ **The accessory has to be on the device's own network segment.** mDNS is link-local, so a responder one
+subnet away is never found, and wireless client isolation defeats the search with no error anywhere.
+
+Enrolment is not exposed to Home Assistant: it needs a person to choose from a list. The result is —
+`accessory_list` as a diagnostic, with `meter_connected` beside it.
+
+## Pairing an accessory on the LoRa radio
+
+The datalogger carries a LoRa radio alongside its network interfaces. An accessory that arrives over it is
+not given an address — it is adopted, during a window this opens:
+
+```console
+$ curl --unix-socket /run/heliobridge.sock -X POST \
+    "http://local/devices/$SERIAL/accessories/lora/pair"
+```
+
+From Home Assistant it is the **Pair a LoRa accessory** button.
+
+Then put the accessory into its own pairing state, however it is done for that accessory. The window
+closes on its own and the register clears itself, so nothing has to be turned off afterwards and nothing
+is left open by a caller that forgets.
+
+**Which accessory gets adopted is decided by the accessory.** The command carries no type and no serial,
+so this cannot pair a named device: whichever one is asking to be paired at that moment is the one that
+ends up paired.
+
+An accessory on the **local network** is enrolled the other way, in the three stages above.
+
+⚠ While the window is open the device will adopt an accessory that asks to be adopted, and nothing in the
+protocol authenticates either side. Press it when you are standing next to the hardware, not on a
+schedule.
+
 ## Firmware the cloud advertises
 
 The vendor's cloud advertises a firmware update by writing a URL into datalogger configuration register 80,
@@ -370,10 +470,11 @@ GET    /devices/{device}/actions
 POST   /devices/{device}/actions/{key}       restart the datalogger
 PUT    /devices/{device}/meter-reading       supply a meter reading: {"watts": <signed>}
 DELETE /devices/{device}/meter-reading       withdraw it
-GET    /meter                                the simulated meter: what it reports, and polls served
-PUT    /meter                                start answering polls: {"watts": <number>}
-POST   /meter                                report a different figure, without starting it
-DELETE /meter                                stop answering polls
+GET    /devices/{device}/accessories              everything enrolled, on either transport
+POST   …/accessories/network/discovered/search    search: {"model":"shelly-pro-3em"} — streamed
+POST   …/accessories/network/discovered           enrol one a search found: {"serial":"…"}
+DELETE …/accessories/network/discovered           remove it; takes nothing
+POST   /devices/{device}/accessories/lora/pair    open a pairing window on the LoRa radio
 ```
 
 A supplied meter reading expires after about two minutes and nothing here refreshes it, so a caller that
@@ -562,4 +663,3 @@ better than this one:
 Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE).
 
 Copyright 2026 Simon Eisenmann. See [NOTICE](NOTICE).
-
