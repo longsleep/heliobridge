@@ -110,8 +110,14 @@ pub enum Command {
 }
 
 /// A local MQTT bridge for the Growatt Nexa 2000.
+///
+/// `struct_excessive_bools` warns about types whose callers have to pass a row of unlabelled booleans.
+/// Nothing constructs this one: it is clap's parse target, every field arrives named as `--flag` or an
+/// environment variable, and grouping the switches into sub-structs would rename the flags to satisfy a
+/// lint about an ergonomic problem this struct does not have.
 #[derive(Debug, Clone, Parser)]
 #[command(version, about, long_about = None)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Config {
     /// What to do instead of serving.
     #[command(subcommand)]
@@ -266,6 +272,23 @@ pub struct Config {
     /// writes every allowlisted setting whatever this says.
     #[arg(long, env = "HELIOBRIDGE_ALLOW_POWER_PLUS", default_value_t = true, action = clap::ArgAction::Set)]
     pub allow_power_plus: bool,
+
+    /// Let the cloud write the accessory list while relaying, which `--relay-mode=controls` otherwise
+    /// refuses.
+    ///
+    /// Pairing an accessory is the one vendor flow a replacement server cannot carry out on its own: the
+    /// command the cloud sends is a discovery request the device answers *upstream*, so substituting the
+    /// write locally gets the device searching but leaves the cloud unaware, and the app never offers what
+    /// was found. Turning this on lets that one exchange happen end to end.
+    ///
+    /// One register, and nothing else moves with it — the broker endpoint, the clock, the timezone and
+    /// anything unrecognised stay refused, which is what distinguishes this from `--relay-mode=full`. The
+    /// list it admits is RAM-only and cleared by a datalogger restart.
+    ///
+    /// Off by default. Leave it off unless you are pairing something: it is the cloud, not you, deciding
+    /// what the device goes looking for.
+    #[arg(long, env = "HELIOBRIDGE_RELAY_ACCESSORY_PAIRING", default_value_t = false, action = clap::ArgAction::Set)]
+    pub relay_accessory_pairing: bool,
 
     /// Seconds without a telemetry frame before the device is reported absent.
     ///
@@ -429,6 +452,7 @@ impl Config {
         Policy {
             mode: self.relay_mode,
             answers: self.relay_answers,
+            cloud_may_pair_accessories: self.relay_accessory_pairing,
         }
     }
 

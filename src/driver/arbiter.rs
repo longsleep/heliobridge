@@ -69,6 +69,12 @@ use crate::model::Register;
 
 use super::wire::Wire;
 
+/// The configuration register holding the accessory list.
+///
+/// Named here rather than taken from the driver because a policy is generation-agnostic and this is the one
+/// register it has an opinion about; a driver whose protocol numbers it differently simply never matches.
+const ACCESSORY_LIST: u16 = 122;
+
 /// How long a cloud command stays claimable by its answer.
 ///
 /// Acknowledgement latency was observed between 1.0 s and 4.3 s, and a read was answered in about 0.6 s.
@@ -366,6 +372,18 @@ pub struct Policy {
     pub mode: Mode,
     /// Which answers to earlier commands reach the cloud.
     pub answers: Answers,
+    /// Whether the cloud may write the accessory list, despite [`Mode::Controls`] refusing config writes.
+    ///
+    /// One register, opened on its own, because pairing an accessory is the one vendor flow that cannot be
+    /// reproduced from this side. The command carries a discovery request the device acts on and then
+    /// reports upstream, so a replacement server can substitute the *string* but not the exchange — the
+    /// cloud has to have asked, or it never learns what was found and the app never offers it.
+    ///
+    /// Off by default, and narrow on purpose. It permits exactly the accessory list: the endpoint
+    /// registers, the clock, the timezone and anything unrecognised stay refused, which is the difference
+    /// between this and [`Mode::Full`]. What it does admit is a list that is RAM-only, cleared by a
+    /// datalogger restart, and whose worst case is an accessory the owner did not ask for.
+    pub cloud_may_pair_accessories: bool,
 }
 
 impl Policy {
@@ -373,6 +391,7 @@ impl Policy {
     pub const OPEN: Self = Self {
         mode: Mode::Full,
         answers: Answers::All,
+        cloud_may_pair_accessories: true,
     };
 
     /// Whether the cloud is permitted to write datalogger configuration.
@@ -407,6 +426,13 @@ impl Policy {
                 // cloud cannot see the new endpoint — then config reads must be held back with them, or the
                 // cloud simply asks for register 19 instead. They are one disclosure through two doors.
                 Intent::WriteSettings { .. } | Intent::ReadRequest { .. } => Decision::Allow,
+                // The accessory list, and only when it has been opened deliberately. See
+                // [`Self::cloud_may_pair_accessories`] for why one register earns an exception.
+                Intent::WriteConfig { register }
+                    if self.cloud_may_pair_accessories && register.number() == ACCESSORY_LIST =>
+                {
+                    Decision::Allow
+                }
                 Intent::WriteConfig { .. } => Decision::Refuse(Refusal::ConfigWrite),
                 // Fails closed, and deliberately: an unrecognised frame heading for the device is the shape
                 // an unknown firmware trigger would take. Nothing observed from the vendor server falls here.
@@ -445,6 +471,61 @@ mod tests {
 
     fn evaluate(policy: Policy, direction: Direction, intent: &Intent) -> Decision {
         policy.evaluate(direction, intent, Originator::Unknown)
+    }
+
+    #[test]
+    fn accessory_pairing_opens_one_register_and_no_other() {
+        // The whole value of this option is its narrowness, so the test is mostly about what stays shut.
+        let open = Policy {
+            cloud_may_pair_accessories: true,
+            ..Policy::default()
+        };
+        assert_eq!(
+            evaluate(open, Direction::ToDevice, &Intent::WriteConfig { register: reg(122) }).refusal(),
+            None,
+            "the accessory list is the register this option exists for"
+        );
+        for shut in [31, 17, 18, 19, 30, 32, 35, 80, 102, 143] {
+            assert_eq!(
+                evaluate(open, Direction::ToDevice, &Intent::WriteConfig { register: reg(shut) }).refusal(),
+                Some(Refusal::ConfigWrite),
+                "config register {shut} must stay refused: this option is not a second `full`"
+            );
+        }
+    }
+
+    #[test]
+    fn accessory_pairing_is_off_unless_asked_for() {
+        // Default-off is the property that makes the option safe to have at all.
+        assert!(!Policy::default().cloud_may_pair_accessories);
+        assert_eq!(
+            evaluate(
+                Policy::default(),
+                Direction::ToDevice,
+                &Intent::WriteConfig { register: reg(122) }
+            )
+            .refusal(),
+            Some(Refusal::ConfigWrite)
+        );
+    }
+
+    #[test]
+    fn accessory_pairing_does_not_reopen_observer_mode() {
+        // Observer means the cloud changes nothing. An accessory is a change.
+        let observer = Policy {
+            mode: Mode::Observer,
+            cloud_may_pair_accessories: true,
+            ..Policy::default()
+        };
+        assert_eq!(
+            evaluate(
+                observer,
+                Direction::ToDevice,
+                &Intent::WriteConfig { register: reg(122) }
+            )
+            .refusal(),
+            Some(Refusal::ObserverMode)
+        );
     }
 
     #[test]
@@ -490,6 +571,7 @@ mod tests {
         let policy = Policy {
             mode: Mode::Observer,
             answers: Answers::default(),
+            cloud_may_pair_accessories: false,
         };
         assert_eq!(
             evaluate(
@@ -511,7 +593,11 @@ mod tests {
         // displays, so withholding one would make the app wrong for no gain.
         for mode in [Mode::Full, Mode::Controls, Mode::Observer] {
             for answers in [Answers::All, Answers::CloudOnly] {
-                let policy = Policy { mode, answers };
+                let policy = Policy {
+                    mode,
+                    answers,
+                    cloud_may_pair_accessories: false,
+                };
                 for intent in [Intent::Telemetry, Intent::Identity, Intent::SettingsSnapshot] {
                     assert!(
                         evaluate(policy, Direction::ToCloud, &intent).allowed(),

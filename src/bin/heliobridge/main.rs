@@ -10,6 +10,7 @@ use heliobridge::VERSION;
 use heliobridge::config::{Command, Config, LogFormat};
 use heliobridge::control::{self, Registry};
 use heliobridge::driver::Driver;
+use heliobridge::driver::Enrols;
 use heliobridge::driver::upstream::Target;
 use heliobridge::growatt::driver::Growatt;
 use heliobridge::homeassistant::broker::{BrokerConfig, BrokerUrl};
@@ -86,7 +87,7 @@ fn run(config: &Config) -> Result<(), String> {
 /// Home Assistant publisher needs the registry the control API may already have created — so they are
 /// methods over shared state rather than functions passing it along. What is optional stays `Option`, and
 /// a step that is switched off is a method that does nothing.
-struct Bridge<'a, D: Driver> {
+struct Bridge<'a, D: Driver + Enrols> {
     config: &'a Config,
     /// What the bytes mean, whoever made the device. Chosen by the caller and passed on unopened: this
     /// type knows only what [`heliobridge::driver`] says a driver can do.
@@ -103,7 +104,7 @@ struct Bridge<'a, D: Driver> {
     registry: Option<Registry>,
 }
 
-impl<'a, D: Driver> Bridge<'a, D> {
+impl<'a, D: Driver + Enrols> Bridge<'a, D> {
     /// The parts that are not optional: a runtime, a certificate to present, and anchors to trust.
     ///
     /// The certificate is the driver's business too: a device dialing its manufacturer's host name and
