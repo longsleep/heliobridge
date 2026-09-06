@@ -22,7 +22,7 @@ use snafu::Snafu;
 
 use crate::driver::catalogue::{Catalogue, ConfigField, Setting, Shape};
 use crate::driver::commands::Command;
-use crate::homeassistant::entity::{METER_READING, WITHDRAW_METER_READING};
+use crate::homeassistant::entity::{METER_READING, PAIR_LORA_ACCESSORY, WITHDRAW_METER_READING};
 use crate::model::Register;
 
 /// What a command topic is allowed to change.
@@ -175,6 +175,9 @@ impl Change {
         if let Some(reading) = Self::meter_reading(key, value, permitted) {
             return reading;
         }
+        if let Some(pairing) = Self::pair_lora_accessory(key, permitted) {
+            return pairing;
+        }
 
         let setting = driver
             .setting_named(key)
@@ -262,6 +265,27 @@ impl Change {
             } else {
                 format!("{watts} W")
             }),
+        }))
+    }
+
+    /// The radio pairing window, if the key names it.
+    ///
+    /// Resolved here rather than through the action table, which is config-space only: this is a holding
+    /// register the device acts on and then clears, so it is neither a setting nor a config action. Whatever
+    /// value a button payload carries is ignored — there is nothing to say.
+    fn pair_lora_accessory(key: &str, permitted: Permitted) -> Option<Result<Self, CommandError>> {
+        if key != PAIR_LORA_ACCESSORY {
+            return None;
+        }
+        if !permitted.allows(key) {
+            return Some(Err(CommandError::Refused { key: key.to_owned() }));
+        }
+        Some(Ok(Self {
+            key: key.to_owned(),
+            register: None,
+            command: Command::PairLoraAccessory,
+            delivery: Delivery::FireAndForget,
+            requested: Some("pairing window opened".to_owned()),
         }))
     }
 
@@ -365,7 +389,7 @@ fn rendered(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Change, CommandError, Delivery, POWER_PLUS, Permitted};
+    use super::{Change, Command, CommandError, Delivery, POWER_PLUS, Permitted};
     use crate::driver::catalogue::{Catalogue as _, ConfigField as _, Setting as _};
     use crate::growatt::driver::Growatt;
     use crate::model::Register;
@@ -566,6 +590,37 @@ mod tests {
     }
 
     #[test]
+    fn the_lora_pairing_button_ignores_whatever_value_it_is_pressed_with() {
+        // A button's payload is whatever Home Assistant felt like sending, and the command carries nothing
+        // regardless: there is no accessory to name and no value to pass on.
+        for payload in [
+            &br#"{"pair_lora_accessory": 1}"#[..],
+            &br#"{"pair_lora_accessory": "PRESS"}"#[..],
+            &br#"{"pair_lora_accessory": null}"#[..],
+        ] {
+            let changes = Change::from_payload(payload, Permitted::default(), &Growatt).expect("accepted");
+            assert_eq!(changes[0].command, Command::PairLoraAccessory);
+            assert_eq!(changes[0].register, None);
+            assert_eq!(changes[0].delivery, Delivery::FireAndForget);
+        }
+    }
+
+    #[test]
+    fn the_lora_pairing_button_is_withdrawn_with_writes() {
+        // Opening the radio is a write in every sense that matters, so a bridge that writes nothing must
+        // not offer it — including to a command retained on the broker from when it did.
+        let refused = Change::from_payload(
+            br#"{"pair_lora_accessory": 1}"#,
+            Permitted {
+                writes: false,
+                power_plus: false,
+            },
+            &Growatt,
+        );
+        assert!(matches!(refused, Err(CommandError::Refused { .. })));
+    }
+
+    #[test]
     fn a_setting_needs_no_remembered_value_because_the_read_back_carries_it() {
         let changes =
             Change::from_payload(br#"{"slot1_output_power": 300}"#, Permitted::default(), &Growatt).expect("accepted");
@@ -593,11 +648,15 @@ mod tests {
                 .writable_config()
                 .into_iter()
                 .any(|field| field.action().is_some() && !field.is_destructive() && field.name() == entity.key);
-            // And the supplied meter reading, which is neither: a data channel with no read-back.
-            let reading = entity.key == crate::homeassistant::entity::METER_READING
-                || entity.key == crate::homeassistant::entity::WITHDRAW_METER_READING;
+            // And the three that are neither, each resolving on its own route: the supplied meter reading
+            // is a data channel with no read-back, and the radio pairing window is a holding register the
+            // device acts on and then clears.
+            let direct = matches!(
+                entity.key,
+                super::METER_READING | super::WITHDRAW_METER_READING | super::PAIR_LORA_ACCESSORY
+            );
             assert!(
-                setting || action || reading,
+                setting || action || direct,
                 "{} is writable but not commandable",
                 entity.key
             );

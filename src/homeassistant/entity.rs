@@ -186,6 +186,16 @@ pub const METER_READING: &str = "supplied_meter_reading";
 /// The control that withdraws it.
 pub const WITHDRAW_METER_READING: &str = "withdraw_meter_reading";
 
+/// The control that opens a pairing window on the device's LoRa radio.
+///
+/// Named for the transport because it is one of two ways this device gains an accessory, and the other — a
+/// search of the local network — is a different operation that would need its own control. `lora` rather
+/// than `radio`: this unit has three radios, so `radio` would name none of them.
+///
+/// This key becomes part of the entity's `unique_id`, so changing it orphans the entity in anyone's Home
+/// Assistant. It is settled before the first release for that reason and should not move afterwards.
+pub const PAIR_LORA_ACCESSORY: &str = "pair_lora_accessory";
+
 /// What a numeric control accepts.
 ///
 /// Signed, though every *setting* the device holds is unsigned: a supplied meter reading is a signed
@@ -559,6 +569,40 @@ impl Entity {
         }
     }
 
+    /// Open a pairing window on the device's LoRa radio, so it adopts an accessory that asks to be adopted.
+    ///
+    /// A button, and it could not be anything else: the command carries no accessory type and no serial,
+    /// so there is nothing to choose. Which accessory is adopted is decided by whichever one is in its own
+    /// pairing state, because somebody pressed a button on it — which also means this is only useful to
+    /// somebody standing next to the hardware.
+    ///
+    /// Ungated. The window closes itself and the register clears itself, so there is nothing that says
+    /// whether pressing it would achieve anything.
+    ///
+    /// **No companion sensor, on purpose.** The window does have observable state — the register reads `1`
+    /// for the 60 s it is open — but only to a reader that asks: no telemetry field carries it. Publishing
+    /// it would mean a poll loop running whenever a window might be open, to report something whose whole
+    /// lifetime is a minute and which the person who just pressed the button already knows.
+    ///
+    /// Deliberately *not* named for accessories in general. A network accessory is searched for by service
+    /// name and identified over HTTP afterwards; that needs arguments and produces a list, so it would be
+    /// its own control rather than a second meaning for this one.
+    pub fn pair_lora_accessory() -> Self {
+        Self {
+            key: PAIR_LORA_ACCESSORY,
+            name: "Pair a LoRa accessory".to_owned(),
+            component: Component::Button,
+            device_class: None,
+            unit: None,
+            category: Some(Category::Config),
+            precision: None,
+            shape: Shape::Action,
+            source: None,
+            presence: Presence::Device,
+            gate: None,
+        }
+    }
+
     /// The product's full firmware version, one field per component.
     ///
     /// Assembled rather than reported: four fields come from two telemetry registers, the CT field is a
@@ -678,7 +722,7 @@ impl Entity {
         }
     }
 
-    /// What accessories the device has been told about, over the network and over its radio.
+    /// What accessories the device has been told about, over the network and over its LoRa radio.
     ///
     /// Config registers 122 and 102, both carried in the identity report the device sends on every
     /// connect. Diagnostics rather than readings: an accessory is something an installation either has or
@@ -844,7 +888,7 @@ impl Catalogue {
             .chain([Entity::firmware_version()])
             .chain([
                 Entity::accessory_list("accessory_list", "Accessories on the network"),
-                Entity::accessory_list("accessory_list_rf", "Accessories on the radio"),
+                Entity::accessory_list("accessory_list_rf", "Accessories on the LoRa radio"),
             ])
             .chain([Entity::cell_spread(), Entity::resting_voltage(), Entity::soc_credible()])
             // An action has nothing to publish but a control, so refusing writes withdraws it entirely
@@ -854,6 +898,7 @@ impl Catalogue {
             .chain(self.permitted.writes.then(Entity::restart))
             .chain(self.permitted.writes.then(Entity::meter_reading))
             .chain(self.permitted.writes.then(Entity::withdraw_meter_reading))
+            .chain(self.permitted.writes.then(Entity::pair_lora_accessory))
             .collect()
     }
 
