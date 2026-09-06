@@ -358,6 +358,24 @@ impl Broker {
         })
     }
 
+    /// A handle to no broker at all, for tests of what would be published over one.
+    ///
+    /// The queue is handed back rather than drained by a client, so a test reads the messages themselves.
+    /// No event ever arrives, which is why a test drives [`Event`]s in by hand instead of running the
+    /// publisher's own loop.
+    #[cfg(test)]
+    pub(crate) fn detached() -> (Self, mpsc::Receiver<Publication>) {
+        let (publications, publications_rx) = Publications::channel(QUEUE_DEPTH);
+        let (_events_tx, events_rx) = mpsc::channel(QUEUE_DEPTH);
+        (
+            Self {
+                publications,
+                events: events_rx,
+            },
+            publications_rx,
+        )
+    }
+
     /// A handle for publishing, for a task that has something to say but no interest in events.
     pub fn publications(&self) -> Publications {
         self.publications.clone()

@@ -28,7 +28,7 @@ use crate::driver::Driver;
 use crate::driver::arbiter::{CloudCommands, Direction, Intent, Originator, Policy};
 use crate::driver::catalogue::{Catalogue, ConfigField as _, Setting as _};
 use crate::driver::commands::{Command, Outgoing};
-use crate::driver::report::{Sink, Snapshot, Telemetry, WriteAck};
+use crate::driver::report::{AccessoryReading, Sink, Snapshot, Telemetry, WriteAck};
 use crate::driver::upstream::{Message as CloudMessage, Relay as _, Target};
 use crate::driver::wire::Unreadable;
 use crate::model::{Hex, Raw, Register, Timestamp};
@@ -184,6 +184,41 @@ where
 
     fn snapshot(&mut self, snapshot: &Snapshot<'_>) {
         self.session.accept_snapshot(snapshot);
+    }
+
+    /// Once a minute while an accessory is paired, so `debug` like telemetry rather than `info`.
+    ///
+    /// Nothing is published from it. The figure the inverter acts on arrives as `meter_active_power` in
+    /// ordinary telemetry, and publishing a second copy from here would put two sources behind one number.
+    /// What this adds is the per-phase detail, which appears in no other frame, and the accessory's
+    /// identity — so a log line is the right home for it until something asks for more.
+    ///
+    /// A fault or a broken poll is worth more than `debug`: those say the accessory is there and not
+    /// answering, which is invisible from telemetry alone, where the reading simply stops moving.
+    fn accessory_reading(&mut self, reading: &AccessoryReading<'_>) {
+        self.session.publish_accessory(reading);
+        let phases = reading
+            .phase_power
+            .map_or_else(String::new, |phase| format!("{phase:?}"));
+        if reading.faulted || !reading.communicating {
+            tracing::warn!(
+                manufacturer = reading.manufacturer,
+                model = reading.model,
+                serial = reading.serial,
+                communicating = reading.communicating,
+                faulted = reading.faulted,
+                "an accessory is reporting a problem"
+            );
+            return;
+        }
+        tracing::debug!(
+            manufacturer = reading.manufacturer,
+            model = reading.model,
+            serial = reading.serial,
+            active_w = reading.active_power,
+            phases_w = phases,
+            "accessory reading"
+        );
     }
 
     fn undecoded(&mut self, kind: &str, len: usize) {
@@ -376,6 +411,9 @@ pub struct Session<S, D: Driver> {
     settings_out: Option<watch::Sender<Vec<SettingView>>>,
     /// Where to publish the datalogger's own report of itself.
     identity_out: Option<watch::Sender<Option<IdentityView>>>,
+    /// What an enrolled accessory last reported about itself, for the API. Only the enrolment routes read
+    /// it, so nothing is published to Home Assistant from here — see `accessory_reading`.
+    accessory_out: Option<watch::Sender<Option<crate::control::AccessoryView>>>,
     /// Where to publish the most recent telemetry frame.
     telemetry_out: Option<watch::Sender<Option<TelemetryView>>>,
     /// Where to publish what this session is doing: relay, clock, counts.
@@ -480,6 +518,7 @@ where
             requests: None,
             settings_out: None,
             identity_out: None,
+            accessory_out: None,
             telemetry_out: None,
             status_out: None,
             registration: None,
@@ -1138,9 +1177,12 @@ where
             }
         }
 
+        // Taken before absorbing: afterwards the accumulated view cannot say which of its entries are the
+        // ones that just arrived.
+        let reported: Vec<u16> = report.fields.iter().map(|field| field.register.number()).collect();
         self.identity.get_or_insert_with(Described::default).absorb(report);
         self.note_product();
-        self.publish_identity();
+        self.publish_identity(&reported);
     }
 
     /// Say which product this is, the first time a report identifies one.
@@ -1253,6 +1295,7 @@ where
         let (identity_tx, identity_rx) = watch::channel(None);
         let (telemetry_tx, telemetry_rx) = watch::channel(None);
         let (status_tx, status_rx) = watch::channel(StatusView::default());
+        let (accessory_tx, accessory_rx) = watch::channel(None);
 
         self.registration = Some(registry.register(
             &device_id,
@@ -1262,6 +1305,7 @@ where
                 identity: identity_rx,
                 telemetry: telemetry_rx,
                 status: status_rx,
+                accessory: accessory_rx,
             },
         ));
         self.requests = Some(request_rx);
@@ -1269,21 +1313,22 @@ where
         self.identity_out = Some(identity_tx);
         self.telemetry_out = Some(telemetry_tx);
         self.status_out = Some(status_tx);
+        self.accessory_out = Some(accessory_tx);
         self.publish_status();
 
         // An identity report arrives once per connect, and registration happens on CONNECT — so if this
         // session already has one, it was decoded before the API could see it. Republish rather than make a
         // caller wait for a reconnect.
-        self.publish_identity();
+        self.publish_identity(&[]);
         tracing::info!("registered with the control API");
     }
 
     /// Carry out one control request.
     ///
     /// Both kinds end the same way: a register is read off the device and the answer reports what it holds.
-    /// A write is not confirmed by having been sent — range writes are acknowledged with the register range
-    /// and nothing else, single-register writes are not acknowledged at all, and out-of-range values are
-    /// clamped silently.
+    /// A write is not confirmed by having been sent — a range write is acknowledged with its register range
+    /// and nothing else, a single-register write reports a value only ever observed for a write accepted
+    /// verbatim, and out-of-range values are clamped silently.
     async fn handle_control(&mut self, request: ControlRequest) -> Result<(), SessionError> {
         let ControlRequest { action, reply } = request;
 
@@ -1471,7 +1516,12 @@ where
         }
     }
 
-    fn publish_identity(&self) {
+    /// Publish the accumulated identity, saying which registers the report behind it carried.
+    ///
+    /// `reported` is empty for a republish — registration re-publishes what was decoded before the API
+    /// could see it — because nothing arrived to make it fresh. A caller watching for a register the device
+    /// volunteers needs that difference: see `IdentityView::reported`.
+    fn publish_identity(&self, reported: &[u16]) {
         let (Some(out), Some(identity)) = (self.identity_out.as_ref(), self.identity.as_ref()) else {
             return;
         };
@@ -1490,6 +1540,27 @@ where
             truncated: identity.truncated,
             endpoint: identity.endpoint.clone(),
             entries,
+            reported: reported.to_vec(),
+        })));
+    }
+
+    /// Publish what an accessory reported, for the API.
+    ///
+    /// Nothing is published to Home Assistant from here — see `accessory_reading` for why — but the
+    /// enrolment routes need it: `access` says what an accessory was enrolled with and appears in no other
+    /// frame and in no register, so without this there is no way to read it back at all.
+    fn publish_accessory(&self, reading: &AccessoryReading<'_>) {
+        let Some(out) = self.accessory_out.as_ref() else {
+            return;
+        };
+        drop(out.send(Some(crate::control::AccessoryView {
+            manufacturer: reading.manufacturer.to_owned(),
+            model: reading.model.to_owned(),
+            serial: reading.serial.to_owned(),
+            access: reading.access,
+            communicating: reading.communicating,
+            faulted: reading.faulted,
+            active_power: reading.active_power,
         })));
     }
 

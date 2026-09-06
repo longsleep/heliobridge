@@ -367,6 +367,7 @@ mod tests {
                     value: (*value).to_owned(),
                 })
                 .collect(),
+            reported: Vec::new(),
         }
     }
 

@@ -22,9 +22,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::control::{Action as ControlAction, Connected, Registry, SessionHandle, TelemetryView};
+use crate::control::{Action as ControlAction, Connected, Registry, SessionHandle, SessionId, TelemetryView};
 use crate::driver::catalogue::Catalogue as Registers;
 use crate::driver::describes::Describes;
 use crate::homeassistant::broker::{Broker, BrokerConfig, BrokerError, Event, Publication, Publications};
@@ -106,12 +107,24 @@ pub struct Publisher<D> {
     devices: watch::Receiver<Connected>,
     /// Bumped on every broker connection, so every link republishes what the broker retains.
     generation: watch::Sender<Generation>,
-    /// Devices with a link running, so a second one is never started for the same device.
-    linked: HashSet<String>,
+    /// Devices with a link running, so a second one is never started for the same session.
+    linked: HashMap<String, Linked>,
     /// How a link reports that its session ended.
-    farewell: mpsc::Sender<String>,
+    farewell: mpsc::Sender<(String, SessionId)>,
     /// Where those reports arrive.
-    ended: mpsc::Receiver<String>,
+    ended: mpsc::Receiver<(String, SessionId)>,
+}
+
+/// A running link, and which session it publishes for.
+///
+/// The session is what makes this more than a set of serials: a link holds one session's channels, so a
+/// device that has reconnected needs a *new* link even though nothing about the connected set changed.
+#[derive(Debug)]
+struct Linked {
+    /// The session whose telemetry, settings and identity the link watches.
+    session: SessionId,
+    /// The task, so a link whose session has been replaced can be stopped instead of left publishing.
+    task: JoinHandle<()>,
 }
 
 impl<D: Registers + Describes> Publisher<D> {
@@ -141,7 +154,7 @@ impl<D: Registers + Describes> Publisher<D> {
             options,
             devices,
             generation: watch::Sender::new(Generation::default()),
-            linked: HashSet::new(),
+            linked: HashMap::new(),
             farewell,
             ended,
         })
@@ -170,8 +183,8 @@ impl<D: Registers + Describes> Publisher<D> {
 
                 ended = self.ended.recv() => {
                     // The channel cannot close while this holds the sender.
-                    if let Some(device) = ended {
-                        self.session_ended(&device);
+                    if let Some((device, session)) = ended {
+                        self.session_ended(&device, session);
                     }
                 }
             }
@@ -197,19 +210,30 @@ impl<D: Registers + Describes> Publisher<D> {
         }
     }
 
-    /// Start a link for every connected device that has none.
+    /// Start a link for every connected device that has none, and replace one whose session has changed.
     ///
-    /// Called whenever anything might have changed rather than only on a device arriving, because the
-    /// connected *set* does not change when a device reconnects — the registry replaces the session behind
-    /// the same serial. A link ending is what reveals that, so this runs then too.
+    /// Called whenever anything might have changed rather than only on a device arriving, because the set
+    /// of connected *serials* does not change when a device reconnects — the registry replaces the session
+    /// behind the same serial.
+    ///
+    /// **A link left on a replaced session publishes nothing ever again.** It watches that session's
+    /// channels, and they stay open for as long as the task that owns them lives, so it neither sees the
+    /// new session's frames nor exits: a half-open socket has been measured lingering ten minutes, and a
+    /// device that reconnects repeatedly can hold its own slot indefinitely. Whatever was last said about
+    /// the device stands for the whole of it — `offline`, if the watchdog had already fired. So the session
+    /// is compared, not just the serial, and the link left behind is stopped rather than waited for.
     fn link_devices(&mut self) {
-        for device in self.devices.borrow().devices() {
-            if self.linked.contains(device) {
-                continue;
-            }
-            let Some(handle) = self.registry.handle(device) else {
+        // Owned, because linking a device mutates what this walks the snapshot to decide.
+        let connected: Vec<String> = self.devices.borrow().devices().map(str::to_owned).collect();
+        for device in connected {
+            // Which session serves it *now*, from the registry rather than from the snapshot: the snapshot
+            // says a change happened, and can itself be a reconnect out of date by the time this runs.
+            let Some((session, handle)) = self.registry.session(&device) else {
                 continue;
             };
+            if self.linked.get(&device).is_some_and(|linked| linked.session == session) {
+                continue;
+            }
             // A session that has already dropped its request channel is on its way out. Its own link would
             // exit immediately; skipping it leaves the work to the registration that replaces it.
             if handle.requests.is_closed() {
@@ -217,12 +241,19 @@ impl<D: Registers + Describes> Publisher<D> {
                 continue;
             }
 
-            tracing::info!(%device, "device connected; announcing it to Home Assistant");
-            self.linked.insert(device.clone());
-            tokio::spawn(
+            // Before the task is spawned, so this line precedes the link's own however the runtime
+            // schedules it. The log is the record of what happened to a device, and it reads in order.
+            if self.linked.contains_key(&device) {
+                tracing::info!(%device, "the device reconnected; announcing it again for its new session");
+            } else {
+                tracing::info!(%device, "device connected; announcing it to Home Assistant");
+            }
+
+            let task = tokio::spawn(
                 Link {
                     driver: Arc::clone(&self.driver),
                     device: device.clone(),
+                    session_id: session,
                     session: handle,
                     publications: self.broker.publications(),
                     topics: Arc::clone(&self.topics),
@@ -240,6 +271,14 @@ impl<D: Registers + Describes> Publisher<D> {
                 }
                 .run(),
             );
+
+            // A link left behind by a reconnect is stopped rather than waited for. Nothing else would stop
+            // it — it is not waiting on anything that has ended — and both links publish to the same
+            // topics, so leaving it running lets a dead session's idea of the device overwrite a live
+            // one's.
+            if let Some(replaced) = self.linked.insert(device.clone(), Linked { session, task }) {
+                replaced.task.abort();
+            }
         }
     }
 
@@ -247,7 +286,16 @@ impl<D: Registers + Describes> Publisher<D> {
     ///
     /// Its readings are reported gone rather than left at their last value, and a link is started again if
     /// the device has meanwhile reconnected.
-    fn session_ended(&mut self, device: &str) {
+    ///
+    /// A farewell from a session that has already been replaced says nothing about the device: the link for
+    /// the session serving it now is running, and reporting *that* one's device offline would take a live
+    /// dashboard down on the strength of a socket closing minutes late.
+    fn session_ended(&mut self, device: &str, session: SessionId) {
+        if self.linked.get(device).is_some_and(|linked| linked.session != session) {
+            tracing::debug!(%device, "a replaced session ended; the device is served by a newer one");
+            return;
+        }
+
         tracing::info!(%device, "device session ended");
         self.linked.remove(device);
         self.publish(Publication::retained(self.topics.device_availability(device), OFFLINE));
@@ -304,11 +352,14 @@ struct Link<D> {
     driver: Arc<D>,
     device: String,
     session: SessionHandle,
+    /// Which session that is, so a farewell arriving after the session was replaced can be told from the
+    /// farewell of the session serving the device now.
+    session_id: SessionId,
     publications: Publications,
     topics: Arc<Topics>,
     options: PublisherOptions,
     generation: watch::Receiver<Generation>,
-    farewell: mpsc::Sender<String>,
+    farewell: mpsc::Sender<(String, SessionId)>,
     /// The broker connection everything currently published was published for.
     published_for: Option<Generation>,
     /// What the discovery messages on the broker describe.
@@ -449,7 +500,8 @@ impl<D: Registers + Describes> Link<D> {
 
         // Not the availability topic: the publisher owns that, so the same message is not published from
         // two places, and so it is still published if this task is torn down rather than ending.
-        drop(self.farewell.send(self.device).await);
+        let ended = (self.device, self.session_id);
+        drop(self.farewell.send(ended).await);
     }
 
     /// Say everything the broker retains, for a connection that has just been established.
@@ -956,15 +1008,18 @@ fn reading(view: &TelemetryView, name: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Catalogue, Component, FAREWELL_DEPTH, Fields, Generation, Link, OFFLINE_AFTER, PublisherOptions, reading,
+        Catalogue, Component, FAREWELL_DEPTH, Fields, Generation, Link, OFFLINE_AFTER, Publisher, PublisherOptions,
+        reading,
     };
-    use crate::control::{IdentityView, ReadingView, SessionHandle, SettingView, StatusView, TelemetryView};
+    use crate::control::{
+        IdentityView, ReadingView, Registry, SessionHandle, SessionId, SettingView, StatusView, TelemetryView,
+    };
     use crate::growatt::driver::Growatt;
     use crate::homeassistant::rest::RestWatch;
     use std::collections::HashMap;
 
     use crate::growatt::v7::registers::{SMART_SELF_USE, WORK_MODE_LABELS};
-    use crate::homeassistant::broker::{Publication, Publications};
+    use crate::homeassistant::broker::{Broker, Event, Publication, Publications};
     use crate::homeassistant::entity::LAST_UPDATE;
     use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
     use core::time::Duration;
@@ -973,6 +1028,9 @@ mod tests {
 
     /// The device's own serial in these tests, matching the one used across the documentation.
     const DEVICE: &str = "0EXAMPLE00000001";
+
+    /// The device's availability topic, which is what a latched presence flag gets wrong.
+    const AVAILABILITY: &str = "heliobridge/0EXAMPLE00000001/availability";
 
     /// The ends a session would hold, kept alive so nothing closes underneath the link.
     struct Session {
@@ -986,18 +1044,14 @@ mod tests {
     struct Wire {
         published: mpsc::Receiver<Publication>,
         generation: watch::Sender<Generation>,
-        farewells: mpsc::Receiver<String>,
+        farewells: mpsc::Receiver<(String, SessionId)>,
         session: Session,
     }
 
     impl Wire {
         /// Every message published so far, in order.
         fn drain(&mut self) -> Vec<Publication> {
-            let mut out = Vec::new();
-            while let Ok(publication) = self.published.try_recv() {
-                out.push(publication);
-            }
-            out
+            drained(&mut self.published)
         }
 
         /// Every message published to one topic.
@@ -1007,6 +1061,27 @@ mod tests {
                 .filter(|publication| publication.topic == topic)
                 .collect()
         }
+    }
+
+    /// Every message published so far, in order.
+    fn drained(published: &mut mpsc::Receiver<Publication>) -> Vec<Publication> {
+        let mut out = Vec::new();
+        while let Ok(publication) = published.try_recv() {
+            out.push(publication);
+        }
+        out
+    }
+
+    /// The payload last published to one topic, if anything was.
+    ///
+    /// Draining consumes the queue, so this answers one question per call by design: two questions about
+    /// the same batch of messages are asked of a [`drained`] vector instead.
+    fn latest(published: &mut mpsc::Receiver<Publication>, topic: &str) -> Option<Vec<u8>> {
+        let messages = drained(published);
+        messages
+            .iter()
+            .rfind(|publication| publication.topic == topic)
+            .map(|publication| publication.payload.clone())
     }
 
     /// A link over channels a test controls, already running.
@@ -1030,7 +1105,9 @@ mod tests {
                     identity: identity_rx,
                     telemetry: telemetry_rx,
                     status: status_rx,
+                    accessory: watch::channel(None).1,
                 },
+                session_id: SessionId::sole(),
                 publications,
                 topics: Arc::new(Topics {
                     instance: "attic".to_owned(),
@@ -1062,6 +1139,71 @@ mod tests {
                 _requests: requests_rx,
             },
         }
+    }
+
+    /// One session's ends, and the handle a registration would carry.
+    ///
+    /// Held together so that nothing closes underneath a link: a session's channels stay open for exactly
+    /// as long as the task that owns them, which is the whole reason a replaced link goes on waiting.
+    struct Ends {
+        telemetry: watch::Sender<Option<TelemetryView>>,
+        _settings: watch::Sender<Vec<SettingView>>,
+        _identity: watch::Sender<Option<IdentityView>>,
+        _status: watch::Sender<StatusView>,
+        _requests: mpsc::Receiver<crate::control::Request>,
+        handle: SessionHandle,
+    }
+
+    /// A session nothing is driving, as the server side would register it.
+    fn ends() -> Ends {
+        let (telemetry, telemetry_rx) = watch::channel(None);
+        let (settings, settings_rx) = watch::channel(Vec::new());
+        let (identity, identity_rx) = watch::channel(None);
+        let (status, status_rx) = watch::channel(StatusView::default());
+        let (requests, requests_rx) = mpsc::channel(4);
+        Ends {
+            telemetry,
+            _settings: settings,
+            _identity: identity,
+            _status: status,
+            _requests: requests_rx,
+            handle: SessionHandle {
+                requests,
+                settings: settings_rx,
+                identity: identity_rx,
+                telemetry: telemetry_rx,
+                status: status_rx,
+                accessory: watch::channel(None).1,
+            },
+        }
+    }
+
+    /// A publisher over a broker that goes nowhere, with the registry sessions register into.
+    ///
+    /// Built by hand rather than through [`Publisher::start`], which wants a broker to connect to. What
+    /// these tests drive is the reconciliation between the registry and the links, so the broker only has
+    /// to hold a queue.
+    fn publisher() -> (Publisher<Growatt>, Registry, mpsc::Receiver<Publication>) {
+        let (broker, queue) = Broker::detached();
+        let (farewell, ended) = mpsc::channel(FAREWELL_DEPTH);
+        let registry = Registry::new();
+        let devices = registry.watch();
+        let publisher = Publisher {
+            driver: Arc::new(Growatt),
+            broker,
+            topics: Arc::new(Topics {
+                instance: "attic".to_owned(),
+                ..Topics::default()
+            }),
+            registry: registry.clone(),
+            options: PublisherOptions::default(),
+            devices,
+            generation: watch::Sender::new(Generation::default()),
+            linked: HashMap::new(),
+            farewell,
+            ended,
+        };
+        (publisher, registry, queue)
     }
 
     /// Let the link run until it is waiting again.
@@ -1557,6 +1699,162 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_device_that_reconnects_while_its_old_session_lingers_is_linked_to_the_new_one() {
+        // The bug this guards against, seen twice in service. A link watches *one* session's channels, and
+        // the registry replaces the session behind a serial on every reconnect while the replaced
+        // session's task keeps its channels open — measured at ten minutes on a half-open socket. Keying
+        // the links on the serial alone left the dead link holding the device and published nothing at all
+        // for the session actually serving it, so Home Assistant kept the last thing it had been told:
+        // `offline`, once the watchdog had fired.
+        let (mut publisher, registry, mut queue) = publisher();
+
+        let first = ends();
+        let _old = registry.register(DEVICE, first.handle.clone());
+        // What a broker connection does: establish the generation, then link whatever is connected.
+        publisher.handle(Event::Connected);
+        settle().await;
+        drained(&mut queue);
+
+        // The device comes back on a new session while the old one is still open.
+        let second = ends();
+        let _new = registry.register(DEVICE, second.handle.clone());
+        assert!(
+            publisher.devices.has_changed().expect("the registry outlives this"),
+            "a reconnect must wake the publisher, though the same one device is connected before and after"
+        );
+        publisher.devices.borrow_and_update();
+        publisher.link_devices();
+        settle().await;
+        drained(&mut queue);
+
+        // A frame on the session that is actually serving the device.
+        second.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        assert_eq!(
+            latest(&mut queue, AVAILABILITY).as_deref(),
+            Some(ONLINE),
+            "the device is reporting on its new session, so it is present"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_link_of_a_replaced_session_is_stopped_rather_than_left_publishing() {
+        // Both links publish to the same topics, so one left on a replaced session would let a dead
+        // session's idea of the device overwrite the live one's — including the `offline` it latched when
+        // that socket went quiet.
+        let (mut publisher, registry, mut queue) = publisher();
+
+        let first = ends();
+        let _old = registry.register(DEVICE, first.handle.clone());
+        publisher.handle(Event::Connected);
+        settle().await;
+
+        let second = ends();
+        let _new = registry.register(DEVICE, second.handle.clone());
+        publisher.devices.borrow_and_update();
+        publisher.link_devices();
+        settle().await;
+        drained(&mut queue);
+
+        // Whatever still arrives on the replaced session is not the device speaking.
+        first.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        assert_eq!(
+            latest(&mut queue, AVAILABILITY),
+            None,
+            "nothing should be published for a session that has been replaced"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_farewell_of_a_replaced_session_leaves_the_live_link_alone() {
+        // The old socket closes minutes after the device has come back on a new one. That farewell is news
+        // about a session nothing is watching, not about the device, and acting on it would report the
+        // device gone while its own link is publishing frames.
+        let (mut publisher, registry, mut queue) = publisher();
+
+        let first = ends();
+        let _old = registry.register(DEVICE, first.handle.clone());
+        publisher.handle(Event::Connected);
+        settle().await;
+        let (replaced, _) = registry.session(DEVICE).expect("the session just registered");
+
+        let second = ends();
+        let _new = registry.register(DEVICE, second.handle.clone());
+        publisher.devices.borrow_and_update();
+        publisher.link_devices();
+        second.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        drained(&mut queue);
+
+        publisher.session_ended(DEVICE, replaced);
+        settle().await;
+        assert_eq!(
+            latest(&mut queue, AVAILABILITY),
+            None,
+            "a replaced session's farewell must not be published as the device going away"
+        );
+        assert!(
+            publisher.linked.contains_key(DEVICE),
+            "the link for the session serving the device must survive it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_farewell_of_the_current_session_reports_the_device_gone() {
+        // The other half of the same rule: a farewell from the session that *is* serving the device is the
+        // device going away, and its readings are reported gone rather than left at their last value.
+        let (mut publisher, registry, mut queue) = publisher();
+
+        let only = ends();
+        let registration = registry.register(DEVICE, only.handle.clone());
+        publisher.handle(Event::Connected);
+        settle().await;
+        let (session, _) = registry.session(DEVICE).expect("the session just registered");
+        only.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        drained(&mut queue);
+
+        // The session that ended is gone from the registry too, which is what makes this the device
+        // leaving rather than the device reconnecting.
+        drop(registration);
+        publisher.session_ended(DEVICE, session);
+        settle().await;
+        assert_eq!(
+            latest(&mut queue, AVAILABILITY).as_deref(),
+            Some(OFFLINE),
+            "the session serving the device ended, so the device is gone"
+        );
+        assert!(!publisher.linked.contains_key(DEVICE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_is_started_once_for_a_session_however_often_the_registry_is_announced() {
+        // The reconciliation runs on anything that might have changed, including a broker reconnecting, so
+        // it has to be idempotent: a second link for the same session would double every message.
+        let (mut publisher, registry, _queue) = publisher();
+
+        let only = ends();
+        let _registration = registry.register(DEVICE, only.handle.clone());
+        publisher.handle(Event::Connected);
+        settle().await;
+        let linked = publisher
+            .linked
+            .get(DEVICE)
+            .expect("the device should be linked")
+            .session;
+
+        publisher.link_devices();
+        publisher.link_devices();
+        settle().await;
+        assert_eq!(
+            publisher.linked.get(DEVICE).map(|linked| linked.session),
+            Some(linked),
+            "the same session should still hold the one link that was started for it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_session_ending_is_reported_to_the_publisher_rather_than_announced_here() {
         // The publisher owns the availability topic on this path, so the same message is not published from
         // two places — and so it is still published if the link is torn down instead of ending.
@@ -1565,7 +1863,11 @@ mod tests {
 
         drop(wire.session);
         settle().await;
-        assert_eq!(wire.farewells.try_recv().ok().as_deref(), Some(DEVICE));
+        assert_eq!(
+            wire.farewells.try_recv().ok(),
+            Some((DEVICE.to_owned(), SessionId::sole())),
+            "the farewell names the session too, so one arriving late can be told from the current one"
+        );
     }
 
     #[test]

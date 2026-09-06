@@ -26,6 +26,11 @@
 //! PUT  /devices/{device}/settings/{key}       {"value": 100}
 //! POST /devices/{device}/settings/{key}/read
 //! POST /devices/{device}/config/read           ?registers=a,b,c or ?all — streamed as JSON Lines
+//! GET  /devices/{device}/accessories           everything enrolled, on either transport
+//! POST /devices/{device}/accessories/network/discovered/search  {"model":"…"} — candidates as JSON Lines
+//! POST /devices/{device}/accessories/network/discovered  confirm one: {"serial":"…","access":0}
+//! DELETE /devices/{device}/accessories/network/discovered  remove it; takes nothing
+//! POST /devices/{device}/accessories/lora/pair        open the radio's pairing window
 //! ```
 //!
 //! # Shapes are consistent, so a client can be written against one
@@ -92,6 +97,7 @@ use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 
+use crate::driver::accessories::{Enrolled, Enrols};
 use crate::driver::catalogue::{Catalogue, ConfigField, Setting as SettingInfo};
 use crate::driver::commands::Command;
 use crate::model::{Raw, Register};
@@ -313,7 +319,174 @@ pub struct IdentityView {
     /// The endpoint the device believes it should dial, assembled from three registers.
     pub endpoint: Option<String>,
     /// Every entry reported, in the order sent.
+    ///
+    /// **Accumulated**, not one report: the device volunteers 32 registers on connect and answers reads one
+    /// at a time, and this is everything it has said so far. So an entry being present says the device
+    /// reported that register at some point, not that it just did — which is what [`Self::reported`] is for.
     pub entries: Vec<ConfigView>,
+    /// The registers the *latest* report carried, which is the only way to tell a value that just arrived
+    /// from one sitting in the accumulated view.
+    ///
+    /// It matters for a register the device volunteers rather than answers for: config 123 reports what an
+    /// accessory search found, is **not** cleared afterwards, and so keeps its last value indefinitely.
+    /// Reading the accumulated entry cannot distinguish "found now" from "found an hour ago", and treating
+    /// a stale one as a discovery would invent an accessory that nothing is offering. Empty when the view is
+    /// republished without a new report behind it.
+    pub reported: Vec<u16>,
+}
+
+/// What an accessory the device polls last reported about itself.
+///
+/// From the accessory's own telemetry frame, which is the **only** place two of these appear. `access` is
+/// what the accessory was enrolled with — it is absent from the accessory list, so this is the one way to
+/// read it back — and the manufacturer and model are the device's own vocabulary for what it is talking to.
+///
+/// Note that `access` and `communicating` answer different questions and both matter: an accessory enrolled
+/// with `access` 1 communicates perfectly and its reading is never used.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccessoryView {
+    /// What the accessory is, in the device's own vocabulary.
+    pub manufacturer: String,
+    /// Its model code, as the device spells it — a vendor code, unrelated to the accessory type a search
+    /// names.
+    pub model: String,
+    /// Its serial, as the device identifies it: the decimal MAC.
+    pub serial: String,
+    /// What it was enrolled with. `0` means the device uses the reading; see the enrolment routes.
+    pub access: u16,
+    /// Whether the device is managing to read it.
+    pub communicating: bool,
+    /// Whether it is reporting a fault.
+    pub faulted: bool,
+    /// Total active power, watts, where it measures one.
+    pub active_power: Option<f64>,
+}
+
+/// How a device reaches an accessory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    /// Searched for by mDNS on the local network, then polled by address.
+    Network,
+    /// Adopted over the device's own radio.
+    Lora,
+}
+
+/// One accessory, as the enrolment routes report it.
+///
+/// Assembled from three places, because no one of them can answer the question a caller has. The list
+/// register says the state and the address; the accessory's own report says what it is and what it was
+/// enrolled with; telemetry says whether the reading is actually in use. A field is absent rather than
+/// guessed when its source has not spoken.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccessoryEntryView {
+    /// Which way the device reaches it.
+    pub transport: Transport,
+    /// How it got into the list, and so what can be done with it: `discovered` for the one the enrolment
+    /// routes manage, `dialled` for an accessory the server gave an address for. Several of the latter can
+    /// coexist and none of them is touched by those routes.
+    pub kind: &'static str,
+    /// The accessory type in the device's own numbering, and the mode that selects how it is reached.
+    /// Together they are the key the device's list is held under, which is why both are reported.
+    pub accessory_type: u16,
+    /// See [`Self::accessory_type`].
+    pub mode: u16,
+    /// The entry's second field as the device spells it: a serial for a discovered accessory, a name for
+    /// one reached by address.
+    pub name: Option<String>,
+    /// The device's own state, as a word.
+    pub state: &'static str,
+    /// The same state as the device's number, for a caller that wants it unrendered.
+    pub state_code: u16,
+    /// The accessory's serial, in the protocol's own form. A string because it is wider than a JSON number
+    /// can carry through every encoder.
+    pub serial: Option<String>,
+    /// The same value as a MAC.
+    pub mac: Option<String>,
+    /// Where the device found it.
+    pub address: Option<String>,
+    /// Whether the device is using the reading. `None` for an entry it is not polling, or before telemetry
+    /// has said. **Not** derivable from the list: see the enrolment routes.
+    pub in_use: Option<bool>,
+    /// What the accessory says it is, once it has reported.
+    pub manufacturer: Option<String>,
+    /// Its model code, in the vendor's vocabulary rather than the search's.
+    pub model: Option<String>,
+    /// What it was enrolled with, echoed back by the accessory itself.
+    pub access: Option<u16>,
+    /// Whether the device is managing to read it.
+    pub communicating: Option<bool>,
+}
+
+/// The accessory searches this bridge has open.
+///
+/// The one piece of state this module keeps, for the one thing the protocol cannot answer: the device's
+/// search is a single register, so a second caller must be able to *join* a window rather than restart it
+/// under the first, and nothing on the wire says whether one is open.
+///
+/// It is deliberately not authoritative, and nothing depends on it being complete. A window opened by the
+/// vendor's application, or before this program started, is not in here — the consequence is a redundant
+/// search command, which is harmless. A window expires on its own after the device's own sixty seconds, so
+/// nothing has to clean it up. Nothing *else* is remembered: an earlier draft kept the search that enrolled
+/// each accessory, because the delete appeared to need it, and it turned out the device reads no such thing.
+#[derive(Debug, Clone, Default)]
+struct Searches(Arc<Mutex<HashMap<String, Searching>>>);
+
+/// One device's search.
+#[derive(Debug, Clone)]
+struct Searching {
+    /// What it asked for, which the delete route also needs: the device's delete names the search.
+    target: (String, u16),
+    /// When the device's own window closes.
+    until: Instant,
+}
+
+/// What opening a search did.
+struct Opened {
+    /// Whether a search command has to be sent, as against joining one already running.
+    started: bool,
+    /// When to stop streaming.
+    until: Instant,
+}
+
+impl Searches {
+    /// Start a search, or join the one already open for the same target.
+    fn open(&self, device: &str, target: &(String, u16), window: Duration) -> Opened {
+        let now = Instant::now();
+        let until = now.checked_add(window).unwrap_or(now);
+        let Ok(mut searches) = self.0.lock() else {
+            // A poisoned lock must not stop an owner enrolling a meter: start a search and stream it.
+            return Opened { started: true, until };
+        };
+        if let Some(open) = searches.get_mut(device) {
+            if open.until > now && open.target == *target {
+                return Opened {
+                    started: false,
+                    until: open.until,
+                };
+            }
+            open.target = target.clone();
+            open.until = until;
+            return Opened { started: true, until };
+        }
+        searches.insert(
+            device.to_owned(),
+            Searching {
+                target: target.clone(),
+                until,
+            },
+        );
+        Opened { started: true, until }
+    }
+
+    /// Mark the window closed, for a search that could not be sent.
+    fn close(&self, device: &str) {
+        if let Ok(mut searches) = self.0.lock()
+            && let Some(open) = searches.get_mut(device)
+        {
+            open.until = Instant::now();
+        }
+    }
 }
 
 /// Which config registers a read is for.
@@ -588,6 +761,9 @@ pub struct SessionHandle {
     pub telemetry: watch::Receiver<Option<TelemetryView>>,
     /// What the session is doing: relay, clock, counts.
     pub status: watch::Receiver<StatusView>,
+    /// What an enrolled accessory last reported about itself. Absent until one does, which is once a
+    /// minute and only while one is paired.
+    pub accessory: watch::Receiver<Option<AccessoryView>>,
 }
 
 impl SessionHandle {
@@ -620,21 +796,32 @@ impl SessionHandle {
 /// A type rather than a bare `Vec<String>` so it can grow — when each device connected, which peer it
 /// came from, how many sessions it has had — without changing the signature of everything that watches
 /// it. Subscribers ask it questions instead of indexing a vector.
+///
+/// Each serial is paired with the session serving it, and **that pair is what makes a reconnect visible**.
+/// A device reconnecting does not change which devices are connected: the registry replaces the session
+/// behind the same serial, so a set of serials alone compares equal and the change is never announced.
+/// Anything holding one session's channels would then go on holding the replaced one's — which is what
+/// left Home Assistant reading `offline` for as long as a half-open socket took to time out.
+///
+/// The session is not published, only compared. A subscriber that has just been woken should ask the
+/// registry which session serves a device rather than read it off a snapshot that may already be one
+/// reconnect out of date.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Connected {
-    /// Device serials, sorted, so equality is meaningful and output is stable.
-    devices: Vec<String>,
+    /// Each device and the session serving it, sorted by serial, so equality is meaningful and output is
+    /// stable.
+    devices: Vec<(String, SessionId)>,
 }
 
 impl Connected {
     /// The connected serials, in a stable order.
-    pub fn devices(&self) -> &[String] {
-        &self.devices
+    pub fn devices(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.devices.iter().map(|(device, _)| device.as_str())
     }
 
     /// Whether a device is connected.
     pub fn contains(&self, device: &str) -> bool {
-        self.devices.iter().any(|known| known == device)
+        self.devices.iter().any(|(known, _)| known == device)
     }
 
     /// How many devices are connected.
@@ -671,17 +858,30 @@ impl Default for Registry {
 /// The registry's contents: each device's handle, tagged with which registration owns it.
 #[derive(Debug, Default)]
 struct Inner {
-    devices: HashMap<String, (Epoch, SessionHandle)>,
-    next_epoch: u64,
+    devices: HashMap<String, (SessionId, SessionHandle)>,
+    next_session: u64,
 }
 
-/// Which registration owns a device's entry.
+/// Which session a device's entry belongs to.
 ///
-/// A registration removes the entry on drop only if it is still the one that put it there. Without that,
-/// the ordering on a reconnect — new session registers, old session's guard drops a moment later — would
-/// delete the live entry and leave a connected device unaddressable.
+/// Two jobs, both about telling one session for a serial from the next. A registration removes the entry
+/// on drop only if it is still the one that put it there: without that, the ordering on a reconnect — new
+/// session registers, old session's guard drops a moment later — would delete the live entry and leave a
+/// connected device unaddressable. And anything that holds a session's channels can compare what it holds
+/// against what is serving the device now, rather than wait for the replaced session to notice it is dead.
+///
+/// Distinct rather than meaningful: the number says nothing except which registration, and is only ever
+/// compared for equality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Epoch(u64);
+pub struct SessionId(u64);
+
+impl SessionId {
+    /// The only session there is, for a test that stands in for a registration rather than making one.
+    #[cfg(test)]
+    pub(crate) const fn sole() -> Self {
+        Self(0)
+    }
+}
 
 impl Registry {
     /// An empty registry.
@@ -694,23 +894,24 @@ impl Registry {
     /// Replacing is right: the device reconnects aggressively, and a stale handle would accept requests
     /// nothing is listening to.
     ///
-    /// Each registration carries an epoch, and dropping one removes the entry **only if it is still the
+    /// Each registration carries a session id, and dropping one removes the entry **only if it is still the
     /// current one**. Without that, the ordering on a reconnect — new session registers, then the old
     /// session's guard drops — would delete the live entry and leave a connected device unaddressable.
     pub fn register(&self, device_id: &str, handle: SessionHandle) -> Registration {
-        // One counter for every device rather than one per device. An epoch is only ever compared against
-        // the entry under the *same* key, so process-wide uniqueness is more than enough: device A holding
-        // 0, 3, 7 while B holds 1, 2 answers "is this entry still mine" as well as contiguous numbering.
-        let epoch = match self.inner.lock() {
+        // One counter for every device rather than one per device. A session id is only ever compared
+        // against the entry under the *same* key, so process-wide uniqueness is more than enough: device A
+        // holding 0, 3, 7 while B holds 1, 2 answers "is this entry still mine" as well as contiguous
+        // numbering would.
+        let session = match self.inner.lock() {
             Ok(mut inner) => {
-                let epoch = Epoch(inner.next_epoch);
+                let session = SessionId(inner.next_session);
                 // Distinctness is the whole property, so the counter refuses to issue rather than repeat.
                 // Reaching the end takes 2^64 reconnects.
-                match inner.next_epoch.checked_add(1) {
+                match inner.next_session.checked_add(1) {
                     Some(next) => {
-                        inner.next_epoch = next;
-                        inner.devices.insert(device_id.to_owned(), (epoch, handle));
-                        Some(epoch)
+                        inner.next_session = next;
+                        inner.devices.insert(device_id.to_owned(), (session, handle));
+                        Some(session)
                     }
                     None => None,
                 }
@@ -718,7 +919,7 @@ impl Registry {
             // Nothing was inserted, so this registration owns no entry and must remove none.
             Err(_) => None,
         };
-        if epoch.is_none() {
+        if session.is_none() {
             tracing::error!(device = %device_id, "could not register the device; it will not be addressable");
         }
         self.announce();
@@ -726,7 +927,7 @@ impl Registry {
         Registration {
             registry: self.clone(),
             device_id: device_id.to_owned(),
-            epoch,
+            session,
         }
     }
 
@@ -741,7 +942,7 @@ impl Registry {
     /// Publish the connected set, skipping the wake-up when nothing changed.
     fn announce(&self) {
         let connected = Connected {
-            devices: self.devices(),
+            devices: self.registered(),
         };
         self.changes.send_if_modified(|current| {
             if *current == connected {
@@ -754,18 +955,39 @@ impl Registry {
 
     /// Find a device's session.
     pub fn handle(&self, device_id: &str) -> Option<SessionHandle> {
+        self.session(device_id).map(|(_, handle)| handle)
+    }
+
+    /// Find a device's session, and which session it is.
+    ///
+    /// Both under one lock, because a caller that took the identity from a [`Connected`] snapshot and the
+    /// handle from here could pair a serial with a session that no longer serves it — and then believe it
+    /// is up to date while holding channels nobody writes to.
+    pub fn session(&self, device_id: &str) -> Option<(SessionId, SessionHandle)> {
         let inner = self.inner.lock().ok()?;
-        inner.devices.get(device_id).map(|(_, handle)| handle.clone())
+        inner
+            .devices
+            .get(device_id)
+            .map(|(session, handle)| (*session, handle.clone()))
     }
 
     /// Every connected device, sorted so output is stable.
     pub fn devices(&self) -> Vec<String> {
+        self.registered().into_iter().map(|(device, _)| device).collect()
+    }
+
+    /// Every connected device with the session serving it, sorted so output is stable.
+    fn registered(&self) -> Vec<(String, SessionId)> {
         let Ok(inner) = self.inner.lock() else {
             return Vec::new();
         };
-        let mut names: Vec<String> = inner.devices.keys().cloned().collect();
-        names.sort_unstable();
-        names
+        let mut registered: Vec<(String, SessionId)> = inner
+            .devices
+            .iter()
+            .map(|(device, (session, _))| (device.clone(), *session))
+            .collect();
+        registered.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        registered
     }
 }
 
@@ -775,17 +997,17 @@ pub struct Registration {
     registry: Registry,
     device_id: String,
     /// `None` when registration did not take effect, in which case this owns no entry and removes none.
-    epoch: Option<Epoch>,
+    session: Option<SessionId>,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        if let (Some(epoch), Ok(mut inner)) = (self.epoch, self.registry.inner.lock())
+        if let (Some(session), Ok(mut inner)) = (self.session, self.registry.inner.lock())
             // Only if this registration is still the current one for the device.
             && inner
                 .devices
                 .get(&self.device_id)
-                .is_some_and(|(current, _)| *current == epoch)
+                .is_some_and(|(current, _)| *current == session)
         {
             inner.devices.remove(&self.device_id);
         }
@@ -806,7 +1028,7 @@ struct WriteBody {
 /// # Errors
 ///
 /// [`ControlError::Bind`] if the path cannot be bound.
-pub fn listen<D: Catalogue>(path: &Path, registry: Registry, driver: Arc<D>) -> Result<(), ControlError> {
+pub fn listen<D: Catalogue + Enrols>(path: &Path, registry: Registry, driver: Arc<D>) -> Result<(), ControlError> {
     // A leftover socket from a previous run would make binding fail. Removing it is safe: a socket file is
     // not data, and a live one would have gone when its owner exited.
     if path.exists() {
@@ -821,15 +1043,21 @@ pub fn listen<D: Catalogue>(path: &Path, registry: Registry, driver: Arc<D>) -> 
     let router = Router::new()
         .route("/healthz", get(Api::health))
         .route(
-            "/meter",
-            get(Api::meter_state)
-                .put(Api::meter_enable)
-                .post(Api::meter_update)
-                .delete(Api::meter_disable),
-        )
-        .route(
             "/devices/{device}/meter-reading",
             put(Api::put_meter_reading).delete(Api::delete_meter_reading),
+        )
+        .route(
+            "/devices/{device}/accessories/lora/pair",
+            post(Api::pair_lora_accessory),
+        )
+        .route("/devices/{device}/accessories", get(Api::accessories::<D>))
+        .route(
+            "/devices/{device}/accessories/network/discovered/search",
+            post(Api::search_discovered::<D>),
+        )
+        .route(
+            "/devices/{device}/accessories/network/discovered",
+            post(Api::pair_discovered::<D>).delete(Api::forget_discovered::<D>),
         )
         .route("/devices", get(Api::devices::<D>))
         .route("/devices/{device}", get(Api::device))
@@ -847,7 +1075,11 @@ pub fn listen<D: Catalogue>(path: &Path, registry: Registry, driver: Arc<D>) -> 
             get(Api::config::<D>).put(Api::write_config::<D>),
         )
         .route("/devices/{device}/config/{key}/read", post(Api::read_config::<D>))
-        .with_state(ApiState { registry, driver });
+        .with_state(ApiState {
+            registry,
+            driver,
+            searches: Searches::default(),
+        });
 
     let socket = path.to_path_buf();
     tokio::spawn(async move {
@@ -943,6 +1175,8 @@ struct ApiState<D> {
     registry: Registry,
     /// The one driver this program serves.
     driver: Arc<D>,
+    /// Accessory searches in progress. See [`Searches`] for why this is the one thing kept here.
+    searches: Searches,
 }
 
 // Derived `Clone` would demand `D: Clone`, which a driver has no reason to be.
@@ -951,6 +1185,7 @@ impl<D> Clone for ApiState<D> {
         Self {
             registry: self.registry.clone(),
             driver: Arc::clone(&self.driver),
+            searches: self.searches.clone(),
         }
     }
 }
@@ -1080,6 +1315,25 @@ struct Api;
               about."
 )]
 impl Api {
+    /// How long to wait for a config register to be reported after asking for it.
+    ///
+    /// A config write draws no acknowledgement and the answer arrives as a separate report, so everything
+    /// that reports what the device did waits at least this long before believing a read.
+    const READ_BACK: Duration = Duration::from_secs(8);
+
+    /// How long to leave between read-backs while waiting for a config write to show up.
+    const READ_BACK_PACE: Duration = Duration::from_secs(2);
+
+    /// How long to wait for the device to start using a newly paired accessory's reading.
+    ///
+    /// Polling has been observed beginning within ten seconds, and the reading follows on the next
+    /// telemetry cycle. Long enough to answer the question the caller asked; short enough that a failure is
+    /// reported rather than hung on.
+    const PAIR_SETTLE: Duration = Duration::from_secs(30);
+
+    /// How often a search stream re-checks, when no report has woken it.
+    const SEARCH_POLL: Duration = Duration::from_millis(500);
+
     /// Liveness, for a supervisor that wants a cheap check.
     async fn health() -> &'static str {
         "ok\n"
@@ -1437,67 +1691,6 @@ impl Api {
         dispatch(&handle, Action::Send(Command::WriteConfig { register, value })).await
     }
 
-    /// What the simulated meter is reporting.
-    ///
-    /// Not device-scoped: there is one simulated meter and the device fetches from it, so it is a property
-    /// of this program rather than of a session. `served` is the answer to the experiment — a nonzero count
-    /// means the device really does poll a meter it has been given.
-    async fn meter_state() -> Response {
-        let meter = &crate::server::meter::METER;
-        axum::Json(serde_json::json!({
-            "enabled": meter.enabled(),
-            "watts": meter.watts(),
-            "served": meter.served(),
-        }))
-        .into_response()
-    }
-
-    /// Start answering meter polls, reporting `watts`.
-    ///
-    /// Idempotent: a second `PUT` changes the figure without stopping and starting. Omitting `watts` keeps
-    /// whatever was last reported, so a meter can be switched back on at the figure it had.
-    async fn meter_enable(body: Option<axum::Json<serde_json::Value>>) -> Response {
-        let meter = &crate::server::meter::METER;
-        let watts = body
-            .and_then(|axum::Json(body)| body.get("watts").and_then(serde_json::Value::as_i64))
-            .unwrap_or_else(|| meter.watts());
-        meter.enable(watts);
-        tracing::info!(watts = meter.watts(), "the simulated meter is on");
-        Self::meter_state().await
-    }
-
-    /// Stop answering meter polls.
-    ///
-    /// The figure is kept rather than cleared, so turning it back on resumes where it left off. What
-    /// changes is that a non-TLS connection is dropped again, as it is when this has never been used.
-    async fn meter_disable() -> Response {
-        let meter = &crate::server::meter::METER;
-        meter.disable();
-        tracing::info!("the simulated meter is off");
-        Self::meter_state().await
-    }
-
-    /// Report a different figure, without changing whether the meter answers.
-    ///
-    /// Separate from `PUT` so a load can be swept without re-stating that the meter is on, and so that
-    /// sweeping one does not silently switch it on if it was off — which would be a change nobody asked
-    /// for in the middle of a measurement.
-    async fn meter_update(axum::Json(body): axum::Json<serde_json::Value>) -> Response {
-        let meter = &crate::server::meter::METER;
-        let Some(watts) = body.get("watts").and_then(serde_json::Value::as_i64) else {
-            return problem(StatusCode::BAD_REQUEST, r#"expected a body like {"watts":250}"#);
-        };
-        if !meter.enabled() {
-            return problem(
-                StatusCode::CONFLICT,
-                "the simulated meter is not answering; PUT to start it",
-            );
-        }
-        meter.set_watts(watts);
-        tracing::info!(watts, "the simulated meter reports a new figure");
-        Self::meter_state().await
-    }
-
     /// Write one config register.
     ///
     /// Deliberately narrow. Two whole classes are refused rather than exposed:
@@ -1604,6 +1797,27 @@ impl Api {
         dispatch(&handle, Action::Send(Command::MeterReading { watts, valid: true })).await
     }
 
+    /// Open a pairing window on the device's **LoRa radio**.
+    ///
+    /// **A segment per transport**, so this is `accessories/lora/pair` and never `accessories/pair`. The
+    /// radio has one way in, so it needs no mechanism below it; the local network has two and they are
+    /// grouped under `accessories/network/`. Sharing one level would put this one-shot action beside a
+    /// staged flow as though they were siblings.
+    ///
+    /// `lora` rather than `radio` because this unit has three radios, so `radio` names none of them.
+    ///
+    /// `POST` and no body: there is nothing to say. The command carries no accessory type and no serial,
+    /// because the device adopts whichever accessory is in its own pairing state — so this is a button and
+    /// not a choice, and a body offering one would be a lie about what the protocol can express.
+    ///
+    /// Nothing has to close the window. The register clears itself when it ends.
+    async fn pair_lora_accessory(Session { handle, .. }: Session) -> Response {
+        // Worth a line of its own: for as long as the window is open the device will adopt an accessory
+        // that asks to be adopted, and this is the only record that somebody opened it.
+        tracing::info!("opening a pairing window on the LoRa radio");
+        dispatch(&handle, Action::Send(Command::PairLoraAccessory)).await
+    }
+
     /// Withdraw the supplied reading, telling the device its meter has gone.
     ///
     /// Writes the all-zero block the firmware itself writes for a meter that is not answering, so the
@@ -1615,6 +1829,554 @@ impl Api {
     async fn delete_meter_reading(Session { handle, .. }: Session) -> Response {
         tracing::info!("withdrawing the supplied meter reading");
         dispatch(&handle, Action::Send(Command::MeterReading { watts: 0, valid: false })).await
+    }
+
+    /// Everything the device has an accessory entry for, on either transport.
+    ///
+    /// **A list, not a meter.** The enrolment routes manage the one entry an mDNS search puts here; the
+    /// device can hold others, reached by an address a server supplies, and those are reported with `kind`
+    /// distinguishing them rather than hidden. Accessories the vendor binds through its cloud rather than
+    /// through the device — its own smart plugs, of which there may be several — never appear in either
+    /// list, so an empty reply is not a claim that nothing is attached.
+    ///
+    /// The routes are grouped `accessories/<transport>/<how it was acquired>/`, and the second segment is
+    /// the same vocabulary as an entry's `kind`: one reading `discovered` is managed at
+    /// `accessories/network/discovered/`. A `dialled` entry has no routes yet and
+    /// `accessories/network/dialled/` is reserved for it. Both levels are needed — the transport alone
+    /// would cover two mechanisms that share register 122 and leave the second nothing to be called, and
+    /// the mechanism alone would put the radio's one-shot adoption on the same footing as a staged flow.
+    ///
+    /// Cached, so it costs no device traffic: both lists ride in the identity report. A `POST
+    /// …/config/{key}/read` on the list register is how a caller asks for a fresh one.
+    ///
+    /// `in_use` is read from **telemetry**, not from the list, because the list cannot answer it: an
+    /// accessory enrolled with `access` 1 appears in it identically to one in service, and only the meter
+    /// reading says which. `manufacturer`, `model` and `access` come from the accessory's own report and are
+    /// absent until one arrives — an accessory the device has never reached has none of them, which is
+    /// itself worth seeing.
+    async fn accessories<D: Catalogue + Enrols>(
+        State(state): State<ApiState<D>>,
+        Session { handle, .. }: Session,
+    ) -> Response {
+        let driver = state.driver.as_ref();
+        let mut accessories = Vec::new();
+
+        let reported = handle.accessory.borrow().clone();
+        let in_use = Self::reading_is_set(&handle, driver.accessory_in_use_reading());
+
+        for (transport, register) in [
+            (Transport::Network, Some(driver.accessory_list())),
+            (Transport::Lora, driver.accessory_list_radio()),
+        ] {
+            let Some(register) = register else { continue };
+            let Some(value) = Self::cached_config(&handle, driver, register) else {
+                continue;
+            };
+            accessories.extend(Self::describe_all(
+                driver,
+                transport,
+                driver.enrolled(&value),
+                reported.as_ref(),
+                in_use,
+            ));
+        }
+
+        axum::Json(serde_json::json!({ "accessories": accessories })).into_response()
+    }
+
+    /// Render decoded entries, filling in what the accessory's own report and telemetry can add.
+    ///
+    /// Shared so that a route which changes the list answers in the same shape as the one that reads it.
+    fn describe_all<D: Catalogue + Enrols>(
+        driver: &D,
+        transport: Transport,
+        entries: Vec<Enrolled>,
+        reported: Option<&AccessoryView>,
+        in_use: Option<bool>,
+    ) -> Vec<AccessoryEntryView> {
+        entries
+            .into_iter()
+            .map(|entry| {
+                // Only the accessory the device is actually reporting about can be matched to a report: it
+                // names one serial, and an entry with none cannot be it.
+                let report = reported.filter(|report| {
+                    entry
+                        .serial
+                        .is_some_and(|serial| driver.accessory_serial(&report.serial) == Some(serial))
+                });
+                AccessoryEntryView {
+                    transport,
+                    kind: entry.kind,
+                    accessory_type: entry.accessory,
+                    mode: entry.mode,
+                    name: entry.name,
+                    state: entry.state_label,
+                    state_code: entry.state,
+                    serial: entry.serial.map(|serial| serial.to_string()),
+                    mac: entry.serial.map(|serial| driver.accessory_mac(serial)),
+                    address: entry.address,
+                    // Only meaningful for an entry the device is polling, and only knowable from telemetry.
+                    in_use: entry.paired.then_some(in_use).flatten(),
+                    manufacturer: report.map(|report| report.manufacturer.clone()),
+                    model: report.map(|report| report.model.clone()),
+                    access: report.map(|report| report.access),
+                    communicating: report.map(|report| report.communicating),
+                }
+            })
+            .collect()
+    }
+
+    /// Start a search for an accessory on the local network, streaming what the device finds.
+    ///
+    /// `{"model": "shelly-pro-3em"}`, or `{"service": "_http._tcp.", "type": 2}` to name both fields
+    /// directly — the type is the *device's* index for a model and not the vendor's model code, so the
+    /// table is what spares a caller knowing it.
+    ///
+    /// **A second search joins the first.** The window is one register on the device, so two cannot run
+    /// independently; rather than refuse, this attaches to the window already open and streams its
+    /// candidates. A search for a *different* service or type does start a new one, because streaming the
+    /// results of something the caller did not ask for would be worse than restarting.
+    ///
+    /// ⚠ **Refused while an accessory is enrolled**, with `409`. The search command resets the list entry,
+    /// and what that does to an accessory the device is actively polling has never been observed — a
+    /// tombstone loses its address, so silently unenrolling a working meter is among the possibilities.
+    /// `{"replace": true}` says to delete it first and search anyway.
+    async fn search_discovered<D: Catalogue + Enrols>(
+        State(state): State<ApiState<D>>,
+        Session { handle, device }: Session,
+        body: Result<axum::Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+    ) -> Response {
+        const EXPECTED: &str =
+            r#"expected a body like {"model":"shelly-pro-3em"} or {"service":"_http._tcp.","type":2}"#;
+
+        let driver = state.driver.as_ref();
+        let Ok(axum::Json(body)) = body else {
+            return problem(StatusCode::BAD_REQUEST, EXPECTED);
+        };
+        let target = match Self::search_target(driver, &body) {
+            Ok(target) => target,
+            Err(response) => return response,
+        };
+        let replace = body
+            .get("replace")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        // Read the list rather than trust the cache: this decides whether a working accessory is about to
+        // be reset, and a config write is not acknowledged, so the cache can lag a change by seconds.
+        let enrolled = Self::read_enrolled(&handle, driver).await;
+        if let Some(paired) = enrolled.iter().find(|entry| entry.paired) {
+            if !replace {
+                let named = paired
+                    .serial
+                    .map_or_else(|| "an accessory".to_owned(), |serial| driver.accessory_mac(serial));
+                return problem(
+                    StatusCode::CONFLICT,
+                    &format!(
+                        "{named} is enrolled and being polled; a search resets the entry it uses, so delete it \
+                         first or repeat this with {{\"replace\":true}}"
+                    ),
+                );
+            }
+            tracing::info!(%device, "replacing an enrolled accessory: deleting it before searching");
+            if handle
+                .carry_out(Action::Send(Command::ForgetDiscoveredAccessory))
+                .await
+                .is_err()
+            {
+                return problem(
+                    StatusCode::BAD_GATEWAY,
+                    "could not delete the enrolled accessory, so the search was not started",
+                );
+            }
+        }
+
+        let window = driver.accessory_search_window();
+        let opened = state.searches.open(&device, &target, window);
+        if opened.started {
+            tracing::info!(%device, service = %target.0, accessory = target.1, "searching for a network accessory");
+            let search = Command::DiscoverAccessories {
+                service: target.0.clone(),
+                accessory: target.1,
+            };
+            if handle.carry_out(Action::Send(search)).await.is_err() {
+                state.searches.close(&device);
+                return problem(StatusCode::BAD_GATEWAY, "the search could not be sent to the device");
+            }
+        } else {
+            tracing::info!(%device, "joining a search already running");
+        }
+
+        let found_register = match driver.config_named(driver.accessory_found_register()) {
+            Some(field) => field.register().number(),
+            None => return problem(StatusCode::NOT_IMPLEMENTED, "this driver has no search-result register"),
+        };
+        Self::stream_candidates(handle, Arc::clone(&state.driver), device, found_register, opened.until)
+    }
+
+    /// Yield each accessory the device reports, once, until the window closes.
+    ///
+    /// **Only what the device *reports* inside the window counts.** The result register is not cleared —
+    /// not by a pair, not by a delete — so its value can be a leftover from a search minutes ago, and
+    /// emitting the cached value would invent a candidate nothing is offering. What separates the two is
+    /// how a value arrived: the device volunteers this register only while a search is open, and nothing
+    /// here reads it, so a report carrying it is this window's.
+    fn stream_candidates<D: Catalogue + Enrols + Send + Sync + 'static>(
+        handle: SessionHandle,
+        driver: Arc<D>,
+        device: String,
+        found_register: u16,
+        until: Instant,
+    ) -> Response {
+        let (tx, rx) = mpsc::channel::<Result<String, Infallible>>(QUEUE_DEPTH);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let mut identity = handle.identity.clone();
+            let mut found: Vec<u64> = Vec::new();
+
+            loop {
+                // Cloned out of the borrow before any await: a held guard blocks every writer.
+                let report = identity.borrow_and_update().clone();
+                if let Some(report) = report {
+                    let fresh = report.reported.contains(&found_register);
+                    let value = fresh
+                        .then(|| {
+                            report
+                                .entries
+                                .iter()
+                                .find(|entry| entry.register == found_register)
+                                .map(|entry| entry.value.clone())
+                        })
+                        .flatten();
+                    if let Some(serial) = value.and_then(|value| driver.accessory_found(&value))
+                        && !found.contains(&serial)
+                    {
+                        {
+                            found.push(serial);
+                            let line = serde_json::json!({
+                                "serial": serial.to_string(),
+                                "mac": driver.accessory_mac(serial),
+                            });
+                            let mut line = line.to_string();
+                            line.push('\n');
+                            if tx.send(Ok(line)).await.is_err() {
+                                // The caller left. The device goes on searching regardless — the window is
+                                // its own, not this request's — so there is nothing to stop, only to stop
+                                // watching.
+                                tracing::debug!(%device, "a caller stopped reading an accessory search");
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                let now = Instant::now();
+                if now >= until {
+                    break;
+                }
+                let wait = until.saturating_duration_since(now).min(Self::SEARCH_POLL);
+                drop(tokio::time::timeout(wait, identity.changed()).await);
+            }
+
+            let duration = started.elapsed().as_secs();
+            tracing::info!(%device, found = found.len(), duration_seconds = duration, "accessory search finished");
+            let summary = serde_json::json!({ "found": found.len(), "duration_seconds": duration });
+            let mut line = summary.to_string();
+            line.push('\n');
+            drop(tx.send(Ok(line)).await);
+        });
+
+        (
+            [(http::header::CONTENT_TYPE, "application/jsonl")],
+            axum::body::Body::from_stream(ReceiverStream::new(rx)),
+        )
+            .into_response()
+    }
+
+    /// Pair an accessory a search reported, and put its reading in service.
+    ///
+    /// `{"serial": "187723572702975"}` — the MAC is accepted too, in any usual notation. `access` defaults
+    /// to `0`, which is what makes the device *use* the reading; passing `1` enrols an accessory that is
+    /// polled and answers while the device's own meter registers stay zero, which is a real thing to want
+    /// and a terrible thing to get by accident.
+    ///
+    /// **The device decides whether the serial means anything.** A pair command with no search behind it
+    /// changes nothing at all, and this does not try to predict that: checking would mean keeping a record
+    /// of every serial ever reported and would still be a guess, since the device's own result register is
+    /// cleared unpredictably. The reply reports what the device did — the entry's state, and whether the
+    /// reading is in use — which is the same answer arrived at without a second opinion.
+    ///
+    /// **`in_use` costs a wait.** The device begins polling within about ten seconds and the reading
+    /// follows on the next telemetry cycle, so this waits for it rather than returning a body whose one
+    /// interesting field is empty. `false` after the wait means "not yet, or never" — re-read
+    /// `GET …/accessories` rather than believe either — and `null` means the accessory is not in the
+    /// device's list, which is what a serial it never found looks like.
+    async fn pair_discovered<D: Catalogue + Enrols>(
+        State(state): State<ApiState<D>>,
+        Session { handle, device }: Session,
+        body: Result<axum::Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+    ) -> Response {
+        const EXPECTED: &str = r#"expected a body like {"serial":"187723572702975","access":0}"#;
+
+        let driver = state.driver.as_ref();
+        let Ok(axum::Json(body)) = body else {
+            return problem(StatusCode::BAD_REQUEST, EXPECTED);
+        };
+        let Some(offered) = body.get("serial").and_then(Self::as_text) else {
+            return problem(StatusCode::BAD_REQUEST, EXPECTED);
+        };
+        let Some(serial) = driver.accessory_serial(&offered) else {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                &format!("{offered:?} is not an accessory serial or MAC"),
+            );
+        };
+        let access = match body.get("access") {
+            None => 0,
+            Some(value) => match value.as_u64().and_then(|value| u16::try_from(value).ok()) {
+                Some(access) => access,
+                None => return problem(StatusCode::BAD_REQUEST, "access must be a small whole number"),
+            },
+        };
+
+        tracing::info!(%device, serial, access, in_service = access == 0, "pairing a network accessory");
+        let command = Command::PairDiscoveredAccessory { serial, access };
+        if handle.carry_out(Action::Send(command)).await.is_err() {
+            return problem(
+                StatusCode::BAD_GATEWAY,
+                "the pair command could not be sent to the device",
+            );
+        }
+
+        let waited = Self::await_in_use(&handle, driver, Self::PAIR_SETTLE).await;
+        let enrolled = Self::read_enrolled(&handle, driver).await;
+        let entry = enrolled.into_iter().find(|entry| entry.serial == Some(serial));
+
+        axum::Json(serde_json::json!({
+            "serial": serial.to_string(),
+            "mac": driver.accessory_mac(serial),
+            "access": access,
+            "state": entry.as_ref().map(|entry| entry.state_label),
+            "state_code": entry.as_ref().map(|entry| entry.state),
+            "address": entry.as_ref().and_then(|entry| entry.address.clone()),
+            // Null rather than false when the accessory is not in the list at all: the reading being in use
+            // is a fact about the device's meter, and reporting it for an accessory the device never
+            // enrolled would answer a different question than the one asked.
+            "in_use": entry.as_ref().map(|_| waited.0),
+            "waited_seconds": waited.1.as_secs(),
+        }))
+        .into_response()
+    }
+
+    /// Remove the **discovered** accessory — the one an mDNS search enrolled.
+    ///
+    /// **Takes nothing, because the device matches on nothing.** Its delete command names neither the
+    /// accessory nor — in any way it reads — the search: a `DEL:` carrying a service that was never browsed
+    /// and a type that was never requested tombstones a paired entry exactly as the right parameters do.
+    /// That is what makes this expressible from `GET …/accessories` alone, which reports no service name
+    /// and no model index because the device's own entry holds neither.
+    ///
+    /// **Scoped to the discovered entry.** Only one has ever been seen, and the vendor's own cloud tracks
+    /// this family with a *flag* where it tracks its plugs with a *count* — so one is what this expects,
+    /// though what the device would do with two is untested. Accessories reached by address are a different
+    /// kind: they are removed by naming their own address and name, not by this, and they appear in
+    /// `GET …/accessories` with `kind` saying so. Nothing here manages them.
+    ///
+    /// The reply is the list as it reads afterwards, so a caller sees what the device did.
+    async fn forget_discovered<D: Catalogue + Enrols>(
+        State(state): State<ApiState<D>>,
+        Session { handle, device }: Session,
+    ) -> Response {
+        let driver = state.driver.as_ref();
+
+        // Taken before the write, so the read-back can tell the new value from the old one.
+        let before = Self::read_enrolled(&handle, driver).await;
+        tracing::info!(%device, "deleting the network accessory");
+        if handle
+            .carry_out(Action::Send(Command::ForgetDiscoveredAccessory))
+            .await
+            .is_err()
+        {
+            return problem(StatusCode::BAD_GATEWAY, "the delete could not be sent to the device");
+        }
+
+        let entries = Self::read_enrolled_after(&handle, driver, &before).await;
+        let in_use = Self::reading_is_set(&handle, driver.accessory_in_use_reading());
+        let reported = handle.accessory.borrow().clone();
+        let accessories = Self::describe_all(driver, Transport::Network, entries, reported.as_ref(), in_use);
+        axum::Json(serde_json::json!({
+            "accessories": accessories,
+            "detail": "a delete tombstones the entry rather than removing it; the next search clears what it \
+                       still holds",
+        }))
+        .into_response()
+    }
+
+    /// The service and type a search body names, or the problem to answer with.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the error is a ready-made HTTP response; boxing it would only move the refusal's own body"
+    )]
+    fn search_target<D: Catalogue + Enrols>(driver: &D, body: &serde_json::Value) -> Result<(String, u16), Response> {
+        let model = body.get("model").and_then(serde_json::Value::as_str);
+        let service = body.get("service").and_then(serde_json::Value::as_str);
+        let accessory = body
+            .get("type")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok());
+
+        match (model, service, accessory) {
+            (Some(model), None, None) => driver.accessory_search(model).ok_or_else(|| {
+                problem(
+                    StatusCode::NOT_FOUND,
+                    &format!(
+                        "{model:?} is not a model this build knows; it knows {}, or name the service and type \
+                         directly",
+                        driver.accessory_models().join(", ")
+                    ),
+                )
+            }),
+            (None, Some(service), Some(accessory)) => Ok((service.to_owned(), accessory)),
+            (Some(_), _, _) => Err(problem(
+                StatusCode::BAD_REQUEST,
+                "name either a model or a service and type, not both",
+            )),
+            _ => Err(problem(
+                StatusCode::BAD_REQUEST,
+                "say what to look for: a model, or a service and type",
+            )),
+        }
+    }
+
+    /// A JSON value as text, accepting a number for a field whose values are digits.
+    ///
+    /// A serial is a decimal, so a caller writing it unquoted is making a reasonable mistake — and one
+    /// large enough to lose precision in some JSON encoders, which is why it is documented as a string.
+    fn as_text(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        }
+    }
+
+    /// One cached config register by name, as the device last reported it.
+    fn cached_config<D: Catalogue>(handle: &SessionHandle, driver: &D, name: &str) -> Option<String> {
+        let register = driver.config_named(name)?.register().number();
+        let report = handle.identity.borrow();
+        report
+            .as_ref()?
+            .entries
+            .iter()
+            .find(|entry| entry.register == register)
+            .map(|entry| entry.value.clone())
+    }
+
+    /// Read the accessory list back from the device, falling back to the cache.
+    ///
+    /// A config write draws no acknowledgement and its effect arrives as a separate report, so a read
+    /// issued immediately after one returns the *previous* value. Everything here that reports what the
+    /// device did goes through this.
+    async fn read_enrolled<D: Catalogue + Enrols>(handle: &SessionHandle, driver: &D) -> Vec<Enrolled> {
+        Self::read_config_back(handle, driver, driver.accessory_list())
+            .await
+            .map(|value| driver.enrolled(&value))
+            .unwrap_or_default()
+    }
+
+    /// Ask the device for one config register and wait for it to report it.
+    ///
+    /// Falls back to the cache: that is what the device last said, and saying nothing at all would be less
+    /// true than saying that.
+    async fn read_config_back<D: Catalogue>(handle: &SessionHandle, driver: &D, name: &str) -> Option<String> {
+        let field = driver.config_named(name)?;
+        let register = field.register();
+        let mut identity = handle.identity.clone();
+        identity.mark_unchanged();
+        drop(
+            handle
+                .carry_out(Action::Send(Command::ReadConfig {
+                    registers: vec![register],
+                }))
+                .await,
+        );
+
+        let deadline = Instant::now().checked_add(Self::READ_BACK);
+        loop {
+            let report = identity.borrow_and_update().clone();
+            if let Some(report) = report
+                && report.reported.contains(&register.number())
+                && let Some(entry) = report.entries.iter().find(|entry| entry.register == register.number())
+            {
+                return Some(entry.value.clone());
+            }
+            let now = Instant::now();
+            let Some(deadline) = deadline.filter(|end| now < *end) else {
+                break;
+            };
+            drop(tokio::time::timeout(deadline.saturating_duration_since(now), identity.changed()).await);
+        }
+
+        Self::cached_config(handle, driver, name)
+    }
+
+    /// Read the accessory list back until it differs from what it was, or the wait runs out.
+    ///
+    /// A config write draws no acknowledgement, and the device answers a read issued straight afterwards
+    /// with the value it held *before* the write — verified: a delete answered `paired` for eight seconds
+    /// and then went to `deleted`. Waiting for a report is therefore not enough; what a caller needs is a
+    /// report that is not the old one. This asks again, paced, until the value moves.
+    ///
+    /// It gives up rather than failing: an unchanged list after the wait is a real possibility — the device
+    /// may have ignored the command — and reporting what it actually says is more use than an error.
+    async fn read_enrolled_after<D: Catalogue + Enrols>(
+        handle: &SessionHandle,
+        driver: &D,
+        before: &[Enrolled],
+    ) -> Vec<Enrolled> {
+        let deadline = Instant::now().checked_add(Self::READ_BACK);
+        let mut latest = Self::read_enrolled(handle, driver).await;
+        while latest == before {
+            let now = Instant::now();
+            if deadline.is_none_or(|end| now >= end) {
+                break;
+            }
+            tokio::time::sleep(Self::READ_BACK_PACE).await;
+            latest = Self::read_enrolled(handle, driver).await;
+        }
+        latest
+    }
+
+    /// Whether a telemetry reading is currently non-zero, or `None` if no frame has carried it.
+    fn reading_is_set(handle: &SessionHandle, name: &str) -> Option<bool> {
+        let telemetry = handle.telemetry.borrow();
+        telemetry
+            .as_ref()?
+            .readings
+            .iter()
+            .find(|reading| reading.name == name)
+            .map(|reading| reading.raw != 0)
+    }
+
+    /// Wait for the device to start using an accessory's reading, and say how long it took.
+    async fn await_in_use<D: Catalogue + Enrols>(
+        handle: &SessionHandle,
+        driver: &D,
+        limit: Duration,
+    ) -> (bool, Duration) {
+        let name = driver.accessory_in_use_reading();
+        let started = Instant::now();
+        let mut telemetry = handle.telemetry.clone();
+        loop {
+            if Self::reading_is_set(handle, name) == Some(true) {
+                return (true, started.elapsed());
+            }
+            let waited = started.elapsed();
+            if waited >= limit {
+                return (false, waited);
+            }
+            drop(tokio::time::timeout(limit.saturating_sub(waited), telemetry.changed()).await);
+        }
     }
 
     /// Serve a cached value, or explain that it has not arrived yet.
@@ -1685,10 +2447,108 @@ fn problem(code: StatusCode, detail: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{Outcome, Registry, SessionHandle, SettingView, StatusView, resolve};
+    use super::{Api, Duration, Outcome, Registry, Searches, SessionHandle, SettingView, StatusView, resolve};
     use crate::driver::catalogue::Catalogue as _;
     use crate::growatt::driver::Growatt;
     use crate::model::{Raw, Register};
+
+    /// The device in these tests, matching the serial used across the documentation.
+    const DEVICE: &str = "0EXAMPLE00000001";
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_search_for_the_same_thing_joins_the_first_rather_than_restarting_it() {
+        // The device's search is one register, so two cannot run independently. Restarting under the first
+        // caller would cut their window short; refusing would be a conflict where there is none, since the
+        // register the second caller wants to read is the one already filling.
+        let searches = Searches::default();
+        let target = ("_http._tcp.".to_owned(), 2);
+        let window = Duration::from_mins(1);
+
+        let first = searches.open(DEVICE, &target, window);
+        assert!(first.started, "nothing was open, so this one starts it");
+
+        let second = searches.open(DEVICE, &target, window);
+        assert!(!second.started, "no second search command may be sent");
+        assert_eq!(
+            second.until, first.until,
+            "and it ends when the first does, not a minute later"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_search_for_something_else_starts_its_own_window() {
+        // Streaming the results of a service the caller did not ask for would be worse than restarting.
+        let searches = Searches::default();
+        let window = Duration::from_mins(1);
+        let first = searches.open(DEVICE, &("_http._tcp.".to_owned(), 2), window);
+        let other = searches.open(DEVICE, &("_everhome._tcp.".to_owned(), 3), window);
+        assert!(other.started);
+        assert!(other.until >= first.until);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_window_that_has_run_out_is_opened_again() {
+        let searches = Searches::default();
+        let target = ("_http._tcp.".to_owned(), 2);
+        let window = Duration::from_mins(1);
+        assert!(searches.open(DEVICE, &target, window).started);
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(
+            searches.open(DEVICE, &target, window).started,
+            "the device stopped searching a second ago, so this is a new one"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_search_that_could_not_be_sent_leaves_no_window_behind() {
+        let searches = Searches::default();
+        let target = ("_http._tcp.".to_owned(), 2);
+        let window = Duration::from_mins(1);
+        assert!(searches.open(DEVICE, &target, window).started);
+        searches.close(DEVICE);
+        assert!(
+            searches.open(DEVICE, &target, window).started,
+            "a window nothing opened on the device must not be joined"
+        );
+    }
+
+    #[test]
+    fn a_search_body_names_a_model_or_the_two_fields_and_not_both() {
+        let by_model = serde_json::json!({"model": "shelly-pro-3em"});
+        assert_eq!(
+            Api::search_target(&Growatt, &by_model).ok(),
+            Some(("_http._tcp.".to_owned(), 2))
+        );
+
+        let direct = serde_json::json!({"service": "_everhome._tcp.", "type": 3});
+        assert_eq!(
+            Api::search_target(&Growatt, &direct).ok(),
+            Some(("_everhome._tcp.".to_owned(), 3))
+        );
+
+        // A model the table does not carry is a refusal, not a guess: the type is the device's own index.
+        assert!(Api::search_target(&Growatt, &serde_json::json!({"model": "homewizard-p1"})).is_err());
+        assert!(Api::search_target(&Growatt, &serde_json::json!({})).is_err());
+        assert!(
+            Api::search_target(&Growatt, &serde_json::json!({"model": "shelly-pro-3em", "type": 2})).is_err(),
+            "naming both leaves it ambiguous which the caller meant"
+        );
+    }
+
+    #[test]
+    fn a_serial_may_be_written_as_a_number_where_a_string_is_documented() {
+        // A serial is all digits, so writing it unquoted is a reasonable mistake to make.
+        assert_eq!(
+            Api::as_text(&serde_json::json!("187723572702975")).as_deref(),
+            Some("187723572702975")
+        );
+        assert_eq!(
+            Api::as_text(&serde_json::json!(187_723_572_702_975_u64)).as_deref(),
+            Some("187723572702975")
+        );
+        assert_eq!(Api::as_text(&serde_json::json!(null)), None);
+    }
 
     /// A handle plus the ends a session would keep, so nothing is dropped mid-test.
     fn handle() -> (
@@ -1708,6 +2568,7 @@ mod tests {
                 identity: identity_rx,
                 telemetry: telemetry_rx,
                 status: status_rx,
+                accessory: tokio::sync::watch::channel(None).1,
             },
             requests_rx,
             settings_tx,
@@ -1772,7 +2633,7 @@ mod tests {
 
     #[test]
     fn devices_reconnect_independently_of_each_other() {
-        // Epochs come from one counter shared by every device, so a device's own epochs are not
+        // Session ids come from one counter shared by every device, so a device's own ids are not
         // contiguous. What must hold is that each entry is owned by the registration that inserted it,
         // whatever numbers the others consumed in between.
         let registry = Registry::new();
@@ -1784,7 +2645,7 @@ mod tests {
         let _b = registry.register("0EXAMPLE0000000B", b1);
         let _a_new = registry.register("0EXAMPLE0000000A", a2);
 
-        // A's replacement took epoch 2, with B's registration holding 1 in between.
+        // A's replacement took session 2, with B's registration holding 1 in between.
         drop(a_old);
         assert_eq!(
             registry.devices(),
@@ -1812,9 +2673,50 @@ mod tests {
     }
 
     #[test]
+    fn a_reconnect_is_announced_although_the_same_devices_are_connected_before_and_after() {
+        // What a subscriber cannot work out for itself. The same one device is connected throughout, so a
+        // set of serials compares equal and nothing is published — while anything holding the replaced
+        // session's channels goes on holding channels nobody writes to. The Home Assistant link did
+        // exactly that, and stayed on the dead session until its socket timed out ten minutes later.
+        let registry = Registry::new();
+        let mut watch = registry.watch();
+
+        let (first, _rx1, _s1) = handle();
+        let _old = registry.register("0EXAMPLE00000001", first);
+        watch.borrow_and_update();
+
+        let (second, _rx2, _s2) = handle();
+        let _new = registry.register("0EXAMPLE00000001", second);
+        assert!(
+            watch.has_changed().expect("the sender outlives this"),
+            "the session behind the serial changed, which is the only thing that did"
+        );
+        let connected = watch.borrow_and_update().clone();
+        assert_eq!(connected.len(), 1);
+        assert_eq!(connected.devices().collect::<Vec<&str>>(), vec!["0EXAMPLE00000001"]);
+    }
+
+    #[test]
+    fn a_session_is_found_with_the_identity_of_the_registration_serving_it() {
+        // Both from one lock, so a caller cannot pair a serial with a session that no longer serves it.
+        let registry = Registry::new();
+        let (first, _rx1, _s1) = handle();
+        let _old = registry.register("0EXAMPLE00000001", first);
+        let (before, _) = registry.session("0EXAMPLE00000001").expect("a session");
+
+        let (second, _rx2, _s2) = handle();
+        let _new = registry.register("0EXAMPLE00000001", second);
+        let (after, _) = registry.session("0EXAMPLE00000001").expect("a session");
+
+        assert_ne!(before, after, "a replacement is a different session");
+        assert!(registry.session("0EXAMPLE00000002").is_none());
+    }
+
+    #[test]
     fn a_replaced_registration_going_away_publishes_nothing() {
-        // A reconnect leaves the connected set unchanged, so a subscriber should not be woken to be told
-        // the same thing twice.
+        // The replacement is announced, and announced once: the old registration owns no entry by then,
+        // so its going away — which can be minutes later, when a half-open socket finally times out —
+        // says nothing about a device that is connected and being served.
         let registry = Registry::new();
         let (first, _rx1, _s1) = handle();
         let old = registry.register("0EXAMPLE00000001", first);
@@ -1824,11 +2726,16 @@ mod tests {
 
         let (second, _rx2, _s2) = handle();
         let _new = registry.register("0EXAMPLE00000001", second);
-        drop(old);
+        assert!(
+            watch.has_changed().expect("the sender outlives this"),
+            "a new session behind the same serial is the change, and this is the only word of it"
+        );
+        watch.borrow_and_update();
 
+        drop(old);
         assert!(
             !watch.has_changed().expect("the sender outlives this"),
-            "the set never changed, so nothing should have been published"
+            "the replaced registration owned no entry, so nothing changed when it went away"
         );
     }
 
