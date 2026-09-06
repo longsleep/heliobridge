@@ -8,7 +8,7 @@ use snafu::OptionExt as _;
 
 use crate::driver::commands::{Command as Asked, Outgoing};
 use crate::growatt::v7::encode::{Command, EncodeError, NotWritableConfigSnafu, WritableConfig};
-use crate::growatt::v7::meter;
+use crate::growatt::v7::{lora, meter, network};
 use crate::mqtt::QoS;
 
 /// Prepare one command for `device_id`.
@@ -28,7 +28,10 @@ pub fn prepare(device_id: &str, asked: &Asked) -> Result<Outgoing, EncodeError> 
         // this program asked, and the PUBACK is how it learns the device took it.
         qos: match command {
             Command::WriteConfig { .. } | Command::ReadSingle { .. } => QoS::AtLeastOnce,
-            Command::WriteSingle { .. } | Command::WriteRange { .. } | Command::ReadConfig { .. } => QoS::AtMostOnce,
+            Command::WriteSingle { .. }
+            | Command::WriteRange { .. }
+            | Command::Trigger { .. }
+            | Command::ReadConfig { .. } => QoS::AtMostOnce,
         },
         acknowledged: command.is_acknowledged(),
         description: frame.message_type().to_string(),
@@ -57,5 +60,24 @@ fn translate(asked: &Asked) -> Result<Command, EncodeError> {
         }
         Asked::PushTime(time) => Command::time_push(*time),
         Asked::MeterReading { watts, valid } => meter::command(*watts, *valid),
+        Asked::PairLoraAccessory => Ok(lora::pair()),
+        Asked::DiscoverAccessories { service, accessory } => Ok(Command::write_accessories(
+            network::Search {
+                service: service.clone(),
+                accessory: *accessory,
+            }
+            .start(),
+        )),
+        Asked::ForgetDiscoveredAccessory => Ok(Command::write_accessories(network::forget())),
+        Asked::PairDiscoveredAccessory { serial, access } => match network::Serial::new(*serial) {
+            Some(serial) => Ok(Command::write_accessories(
+                network::Pairing {
+                    serial,
+                    access: *access,
+                }
+                .command(),
+            )),
+            None => Err(EncodeError::AccessorySerial { serial: *serial }),
+        },
     }
 }

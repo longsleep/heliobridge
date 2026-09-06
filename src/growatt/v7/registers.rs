@@ -36,6 +36,17 @@ use crate::model::{Confidence, Raw, Register, Scaling, Unit, Value};
 
 /// Base offset of the input register block within a telemetry frame.
 pub const INPUT_BASE_OFFSET: usize = 0x4F;
+/// The telemetry reading that is non-zero while the device holds a meter figure it is acting on.
+pub const METER_CONNECTED: &str = "meter_connected";
+
+/// The config register holding accessories reached over the local network.
+pub const ACCESSORY_LIST: &str = "accessory_list";
+
+/// The config register a network accessory search reports its result in.
+pub const ACCESSORY_FOUND: &str = "accessory_found";
+
+/// The config register holding accessories reached over the LoRa radio.
+pub const ACCESSORY_LIST_RF: &str = "accessory_list_rf";
 
 /// The highest config register that exists, making the space `0..=CONFIG_REGISTER_LAST`.
 ///
@@ -950,6 +961,13 @@ pub const CONFIG_REGISTERS: &[ConfigRegister] = {
         // The registered accessories, reported as `DEV:` when empty and as one `&`-separated entry each
         // otherwise. Also the register that adds and removes them; see `WritableConfig::AccessoryList`.
         Entry::new(122, "accessory_list", Dynamic, Observed),
+        // What a discovery found: the accessory's MAC as a decimal integer, or `0`.
+        //
+        // `on_request` because it is absent from the identity report, which is what that flag records — but
+        // it is not only answered when asked. While an accessory scan is open the device volunteers it as a
+        // standalone report every few seconds, and at no other time, so a server watching for a discovery
+        // result waits for it rather than polling.
+        Entry::on_request(123, "accessory_found", Dynamic, Observed),
         // Fifteen slots, each a timestamped connection-event record.
         Entry::on_request(124, "connection_event_00", Dynamic, Observed),
         Entry::on_request(125, "connection_event_01", Dynamic, Observed),

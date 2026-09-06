@@ -120,6 +120,32 @@ pub struct WriteAck {
     pub status: String,
 }
 
+/// What an accessory the device polls is reading.
+///
+/// Generic on purpose: a driver whose device reports something other than a power meter fills in what it
+/// has and leaves the rest. The identity is not optional, because the point of this report is that the
+/// figures are somebody else's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccessoryReading<'a> {
+    /// What the accessory is, in the device's own vocabulary.
+    pub manufacturer: &'a str,
+    /// Its model code, again as the device spells it.
+    pub model: &'a str,
+    /// Its serial, as the device identifies it.
+    pub serial: &'a str,
+    /// What it was enrolled with, which decides whether the device uses the reading rather than merely
+    /// taking it. Reported here and nowhere else.
+    pub access: u16,
+    /// Total active power, watts, where the accessory measures one.
+    pub active_power: Option<f64>,
+    /// Per-phase active power, for an accessory that separates them.
+    pub phase_power: Option<[f64; 3]>,
+    /// Whether the device is managing to read it.
+    pub communicating: bool,
+    /// Whether it is reporting a fault.
+    pub faulted: bool,
+}
+
 /// What a server wants to be told about the frames a device sends.
 ///
 /// Implemented by the server. Every method has a default that does nothing, so a caller interested in
@@ -148,6 +174,15 @@ pub trait Sink {
     /// The device volunteering a range of its settings.
     fn snapshot(&mut self, snapshot: &Snapshot<'_>) {
         let _ = snapshot;
+    }
+
+    /// The device reporting what an accessory of its own reads.
+    ///
+    /// Distinct from [`Self::telemetry`], which is the device measuring itself. This is second-hand: the
+    /// device polled something else and is passing on what it saw, so the fields are that accessory's and
+    /// the identity is worth carrying with them.
+    fn accessory_reading(&mut self, reading: &AccessoryReading<'_>) {
+        let _ = reading;
     }
 
     /// A frame the driver recognises but does not decode, named in the driver's own words.

@@ -58,6 +58,15 @@ pub enum EncodeError {
         register: Register,
     },
 
+    /// The serial is not one this protocol can carry.
+    ///
+    /// An accessory serial here is a MAC as an integer, so anything wider than 48 bits names no accessory.
+    #[snafu(display("{serial} is not an accessory serial: it is wider than a MAC"))]
+    AccessorySerial {
+        /// The value offered.
+        serial: u64,
+    },
+
     /// The register is not one this implementation will write.
     #[snafu(display("register {register} is not writable: it is absent from the holding register map"))]
     NotWritable {
@@ -282,6 +291,25 @@ pub enum Command {
         register: Register,
     },
 
+    /// Write one register with `0x06` to *make something happen*, rather than to store a value.
+    ///
+    /// The same frame as [`Self::WriteSingle`] and a different thing to ask for. A setting is written
+    /// through the allowlist, holds what it was given and can be read back; a trigger is a register the
+    /// device acts on and then clears itself, so there is nothing to store, nothing to verify, and no
+    /// entry in [`HoldingRegister`] for a value it does not hold.
+    ///
+    /// Bypassing the allowlist is the point and the risk. It exists because the vendor's own server uses
+    /// this form — the radio-pairing window of [`crate::growatt::v7::lora`] is the observed instance —
+    /// and because the alternative was to add such a register to the writable map, where it would surface
+    /// as a setting somebody could type a number into. Nothing constructs this except a module that
+    /// documents the register it drives and the evidence for it, in the way `meter` and `lora` do.
+    Trigger {
+        /// The register to write.
+        register: Register,
+        /// The value that carries the action out.
+        value: Raw,
+    },
+
     /// Write a config register with `0x18`.
     ///
     /// The clock push is one instance of this, and was the only one implemented while its body was thought
@@ -325,15 +353,33 @@ pub enum WritableConfig {
     /// parameters are `<address>,<name>`, the address capped at 17 octets; mode 7 is name discovery, and
     /// `CRL:` applies to it alone. See the specification's §9.3.
     ///
-    /// **Registering an accessory does not make the device read it.** An entry starts in a connection
-    /// state the dialler skips, and the routines that promote it are discovery and reconnection — so an
-    /// accessory that has never connected is never dialled, and the address in the list serves
-    /// reconnection rather than introduction. Verified by registering one and watching nothing happen.
-    /// This register is therefore a research instrument, not a way to attach a meter.
+    /// **`ADD:` alone does not attach an accessory** — it starts an mDNS browse, whose results the device
+    /// reports in config register 123, and an entry left at that stage is never dialled. `CRL:` is what
+    /// pairs one, taking the serial the device reported: `CRL:<type>-7-add:sn,<serial>|access,0`. Its
+    /// `access` field decides whether the device *uses* the reading; omitted, it yields `1`, and the
+    /// accessory is polled and answers while the device's own meter fields stay zero. See the
+    /// specification's §9.3.1.
     ///
-    /// Two further consequences: the list is RAM-only and lost on a datalogger restart, and registering
-    /// an accessory makes the device write holding register 313, which it never writes back to zero.
+    /// A paired entry reaches state `3` and survives a datalogger restart; a bare registration at state
+    /// `0` does not. `DEL:` tombstones one at state `5`, taking the same parameters as the `ADD:` rather
+    /// than the entry's own fields.
     AccessoryList,
+    /// Register 143, permission for an operation the datalogger routes to an **external** Modbus unit
+    /// rather than to the sub-MCU **`[O]`**.
+    ///
+    /// Two gates in the firmware require it to read `1`; otherwise the routed operation is declined and
+    /// the accessory dispatcher returns early **`[F]`**. Reads empty on the reference device and the
+    /// firmware's compiled default is `0`, with nothing observed distinguishing empty from `0` at either
+    /// gate.
+    ///
+    /// Writable because it is the one untried lever on why a registered accessory is never dialled — the
+    /// same investigation [`Self::AccessoryList`] serves, and equally a research instrument rather than a
+    /// way to attach a meter.
+    ///
+    /// **Unlike the accessory list, this one persists across a datalogger restart** **`[O]`**: written `1`
+    /// and restarted, register 122 came back empty while 143 still read `1`. So it is put back by writing
+    /// it, not by power-cycling, and a caller that sets it owns undoing it.
+    RoutedModbus,
     /// Register 19, the broker host name. **Retargets the device** — see [`Self::is_retarget`].
     RemoteUrl,
     /// Register 18, the broker port. **Retargets the device.**
@@ -345,11 +391,12 @@ pub enum WritableConfig {
 
 impl WritableConfig {
     /// Every member, for listing what this build can write.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Clock,
         Self::Restart,
         Self::FactoryReset,
         Self::AccessoryList,
+        Self::RoutedModbus,
         Self::RemoteUrl,
         Self::RemotePort,
         Self::ServerAddress,
@@ -362,6 +409,7 @@ impl WritableConfig {
             Self::Restart => 32,
             Self::FactoryReset => 35,
             Self::AccessoryList => 122,
+            Self::RoutedModbus => 143,
             Self::RemoteUrl => 19,
             Self::RemotePort => 18,
             Self::ServerAddress => 17,
@@ -375,6 +423,7 @@ impl WritableConfig {
             Self::Restart => "restart",
             Self::FactoryReset => "factory_reset",
             Self::AccessoryList => "accessory_list",
+            Self::RoutedModbus => "routed_modbus_enabled",
             Self::RemoteUrl => "remote_url",
             Self::RemotePort => "remote_port",
             Self::ServerAddress => "server_address",
@@ -606,6 +655,18 @@ impl Command {
         Ok(Self::WriteConfig { register, value })
     }
 
+    /// Write the accessory list, register 122, with one of its three commands.
+    ///
+    /// The command string is built by [`crate::growatt::v7::network`], which owns the grammar; this only
+    /// puts it on the register. Kept as its own constructor so a caller cannot reach register 122 with an
+    /// arbitrary string by naming [`WritableConfig::AccessoryList`] directly.
+    pub fn write_accessories(command: impl Into<String>) -> Self {
+        Self::WriteConfig {
+            register: WritableConfig::AccessoryList,
+            value: command.into(),
+        }
+    }
+
     /// Restart the datalogger: register 32, value `"1"`.
     ///
     /// Recoverable — the device reboots and reconnects by itself — and the only known way to make it emit a
@@ -687,7 +748,7 @@ impl Command {
     /// The message type this command is carried by.
     pub const fn message_type(&self) -> MessageType {
         match *self {
-            Self::WriteSingle { .. } => MessageType::WriteSingleRegister,
+            Self::WriteSingle { .. } | Self::Trigger { .. } => MessageType::WriteSingleRegister,
             Self::WriteRange { .. } => MessageType::WriteRegisterRange,
             Self::ReadSingle { .. } => MessageType::ReadSingleRegister,
             Self::WriteConfig { .. } => MessageType::ConfigWrite,
@@ -697,9 +758,10 @@ impl Command {
 
     /// Which registers should be read back after this command, and what each was asked to hold.
     ///
-    /// A write is never self-confirming on this device: range writes are acknowledged with the register
-    /// range and nothing else, single-register writes are not acknowledged at all, and out-of-range values
-    /// are silently clamped rather than refused. So the only way to know what was stored is to ask.
+    /// A write is never self-confirming on this device: a range write is acknowledged with its register
+    /// range and nothing else, a single-register write reports a value only ever observed for a write
+    /// accepted verbatim, and out-of-range values are silently clamped rather than refused. So the only way
+    /// to know what was stored is to ask.
     ///
     /// Two cases are not simply "the registers written":
     ///
@@ -729,7 +791,11 @@ impl Command {
             // Nothing to verify. A read has no effect to check, and a config write cannot be checked: it
             // draws no acknowledgement, and its answer — if the device sends one — is an identity report
             // rather than anything this queue understands.
-            Self::ReadSingle { .. } | Self::WriteConfig { .. } | Self::ReadConfig { .. } => Vec::new(),
+            // A trigger holds nothing: the device acts on it and clears it, so a read-back races the
+            // window rather than confirming anything.
+            Self::ReadSingle { .. } | Self::WriteConfig { .. } | Self::ReadConfig { .. } | Self::Trigger { .. } => {
+                Vec::new()
+            }
         };
 
         let touches_power_plus = out.iter().any(|(register, _)| register.number() == POWER_PLUS);
@@ -747,11 +813,18 @@ impl Command {
 
     /// Whether the device acknowledges this command.
     ///
-    /// A range write is echoed back with its register range — and nothing else, so the acknowledgement
-    /// proves receipt and not the stored value. A single-register write is not acknowledged at all.
-    /// Either way the value has to be read back.
+    /// **Both write forms are**, which this said the opposite of until the recordings were counted:
+    /// 6912 single-register acknowledgements sit in one uplink capture, and
+    /// [`crate::growatt::v7::decode::WriteAck`] has always documented the layout of both. What differs is
+    /// how much an acknowledgement says. A range write is echoed with its register range and nothing else,
+    /// so it proves receipt and not the stored value; a single-register write is echoed with a status and
+    /// the value the register now holds, which is more informative but has only been observed for writes
+    /// accepted verbatim. Either way the value has to be read back.
     pub const fn is_acknowledged(&self) -> bool {
-        matches!(*self, Self::WriteRange { .. })
+        matches!(
+            *self,
+            Self::WriteRange { .. } | Self::WriteSingle { .. } | Self::Trigger { .. }
+        )
     }
 
     /// Serialise into a frame for the given device.
@@ -770,6 +843,14 @@ impl Command {
             Self::WriteSingle { register, value } => {
                 let mut body = Vec::with_capacity(4);
                 body.extend_from_slice(&register.register().number().to_be_bytes());
+                body.extend_from_slice(&value.get().to_be_bytes());
+                body
+            }
+
+            // Byte for byte a `WriteSingle`; the difference is what it is asked for, not what goes out.
+            Self::Trigger { register, value } => {
+                let mut body = Vec::with_capacity(4);
+                body.extend_from_slice(&register.number().to_be_bytes());
                 body.extend_from_slice(&value.get().to_be_bytes());
                 body
             }
@@ -1075,8 +1156,11 @@ mod tests {
         assert_eq!(frame.wire_len(), 44);
         // Register 257 = 254 + 3, and 250 W.
         assert_eq!(frame.body(), [0x01, 0x01, 0x00, 0xFA]);
-        // Not acknowledged, so the caller has to read back.
-        assert!(!command.is_acknowledged());
+        // Acknowledged — this is the write the recordings hold thousands of acknowledgements for — and the
+        // caller still has to read back, because the value in one has only ever been seen for a write the
+        // device accepted verbatim.
+        assert!(command.is_acknowledged());
+        assert_eq!(command.registers_to_verify(), vec![(Register(257), Some(Raw(250)))]);
     }
 
     #[test]
@@ -1288,12 +1372,17 @@ mod tests {
 
     #[test]
     fn acknowledgement_expectations_are_explicit() {
-        // A range write is echoed; a single-register write is not. Both still need a read-back,
-        // because neither acknowledgement carries a value.
+        // Both write forms are echoed. This asserted the opposite for the single-register form until the
+        // recordings were counted: one uplink capture holds 6912 of them, every one naming the register it
+        // wrote. A range acknowledgement carries no value at all and a single-register one carries a value
+        // only ever seen for a write accepted verbatim, so both still need a read-back — which is the claim
+        // this test was really making, and it survives.
         let range = Command::write_range(&[(Register(250), 100), (Register(251), 5)]).expect("ok");
         let single = Command::write(Register(326), 1).expect("ok");
         assert!(range.is_acknowledged());
-        assert!(!single.is_acknowledged());
+        assert!(single.is_acknowledged());
+        assert!(!range.registers_to_verify().is_empty());
+        assert!(!single.registers_to_verify().is_empty());
     }
 
     #[test]

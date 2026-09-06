@@ -25,7 +25,11 @@ impl Frame {
     pub fn intent(&self, direction: Direction) -> Intent {
         let to_device = matches!(direction, Direction::ToDevice);
         match self.message_type() {
-            MessageType::Telemetry | MessageType::BufferedTelemetry => Intent::Telemetry,
+            // A meter report joins the telemetry arm: like telemetry it is something the device says
+            // rather than something it was asked, and the uplink carries it whatever the policy.
+            MessageType::Telemetry | MessageType::BufferedTelemetry | MessageType::AccessoryTelemetry => {
+                Intent::Telemetry
+            }
             MessageType::SettingsSnapshot => Intent::SettingsSnapshot,
             MessageType::IdentityReport => Intent::Identity,
 

@@ -70,6 +70,58 @@ pub enum Command {
         /// Whether the reading is to be believed.
         valid: bool,
     },
+
+    /// Open a pairing window on the device's **LoRa radio**, so it adopts an accessory that asks to be
+    /// adopted.
+    ///
+    /// Named for the transport because a device may acquire accessories more than one way and they are not
+    /// interchangeable: an accessory on the local network is *searched for* by service name and then
+    /// polled by address, which needs arguments and returns a list of what was found. That is a different
+    /// command, and this one deliberately leaves the name free for it.
+    ///
+    /// Carries nothing on purpose. The accessory cannot be named in the request: the choice is made by
+    /// whichever one is in its own pairing state, because somebody pressed a button on it. A driver that
+    /// cannot express this refuses it, as with anything else.
+    PairLoraAccessory,
+
+    /// Start an mDNS browse for an accessory on the local network.
+    ///
+    /// The counterpart to [`Self::PairLoraAccessory`], and unlike it this one takes arguments: which mDNS
+    /// service to browse and which accessory type to expect. It only *starts* the search — what the device
+    /// finds it reports separately, and choosing one is [`Self::PairDiscoveredAccessory`].
+    ///
+    /// Named for **how the accessory is acquired** rather than for the transport it arrives over, because
+    /// the transport does not distinguish it: a device of this family also reaches accessories on the same
+    /// network by dialling an address the server supplies, which is a different sub-protocol with different
+    /// commands. A name like "network" would cover both and leave the second one nothing to be called.
+    ///
+    /// ⚠ It also resets the list entry it uses, so an accessory already enrolled loses the address it was
+    /// enrolled with. A caller with one attached should mean it.
+    DiscoverAccessories {
+        /// The mDNS service to browse, as the device expects it.
+        service: String,
+        /// The device's own index for the model expected to answer.
+        accessory: u16,
+    },
+
+    /// Pair an accessory an mDNS search reported, and say whether the device should use what it reads.
+    ///
+    /// Both fields are load-bearing. The serial must be one the device itself reported — the command does
+    /// nothing at all without a search behind it — and `access` decides whether the reading is *used* or
+    /// merely taken, a distinction the device's own accessory list does not record.
+    PairDiscoveredAccessory {
+        /// The serial the device reported, in its own numbering.
+        serial: u64,
+        /// What to enrol it with. Zero puts the reading in service.
+        access: u16,
+    },
+
+    /// Remove the accessory an mDNS search enrolled.
+    ///
+    /// Carries nothing, because the device's own command matches on nothing a caller could supply: it
+    /// names neither the accessory nor, in any way that is read, the search. A driver that needs
+    /// parameters to express this builds them itself.
+    ForgetDiscoveredAccessory,
 }
 
 /// A command, ready to send.

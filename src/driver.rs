@@ -16,7 +16,8 @@
 //! The seam is split by capability — [`Wire`] for framing, [`Report`] for what a frame says, [`Arbiter`]
 //! for what it is trying to do, [`Catalogue`] for what the device holds, [`Commands`] for asking it to do
 //! something, [`Describes`] for what product it is,
-//! [`Firmware`] for update campaigns, [`Upstream`] for the manufacturer's cloud, and more to come — rather than gathered into a single wide trait. A consumer bounds on the capability it uses and
+//! [`Firmware`] for update campaigns, [`Upstream`] for the manufacturer's cloud, [`Enrols`] for
+//! attaching an accessory, and more to come — rather than gathered into a single wide trait. A consumer bounds on the capability it uses and
 //! nothing else, which keeps its requirements legible: `server::firmware` needs [`Firmware`], and the fact
 //! that it needs nothing else is worth being able to see.
 //!
@@ -47,6 +48,7 @@
 //! Each of those is a seam that can be widened when a second driver arrives, by someone who can then see
 //! what it actually needs rather than guessing now.
 
+pub mod accessories;
 pub mod arbiter;
 pub mod catalogue;
 pub mod commands;
@@ -56,6 +58,7 @@ pub mod report;
 pub mod upstream;
 pub mod wire;
 
+pub use accessories::{Enrolled, Enrols};
 pub use arbiter::{Arbiter, Direction, Intent, Policy};
 pub use catalogue::{Catalogue, ConfigField, Measurement, Setting, Shape};
 pub use commands::{Command, Commands, Outgoing};

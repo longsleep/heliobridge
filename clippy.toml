@@ -35,5 +35,11 @@ doc-valid-idents = [
     "EEPROM",
     "Modbus",
     "Growatt",
+    "GroBro",
     "NEXA",
+    "LoRa",
+    "LoRaWAN",
+    "LLCC68",
+    "GFSK",
+    "mDNS",
 ]

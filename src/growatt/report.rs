@@ -5,7 +5,8 @@
 //! telemetry and a `0x19` is the hourly settings snapshot, and a second generation is a second table
 //! rather than an edit to the session.
 
-use crate::driver::report::{Field, Identity, Sink, Snapshot, Telemetry, WriteAck};
+use crate::driver::report::{AccessoryReading, Field, Identity, Sink, Snapshot, Telemetry, WriteAck};
+use crate::growatt::v7::accessory::AccessoryTelemetry;
 use crate::growatt::v7::decode::{FromFrame, ReadResponse, SettingsSnapshot};
 use crate::growatt::v7::decode::{Telemetry as DecodedTelemetry, WriteAck as DecodedAck};
 use crate::growatt::v7::frame::{Frame, MessageType};
@@ -29,6 +30,23 @@ pub fn report(frame: &Frame, to: &mut dyn Sink) {
                 Err(error) => to.unreadable(&kind.to_string(), &error),
             }
         }
+
+        // Second-hand figures: the device polled an accessory over the local network and is passing on
+        // what it read. Nothing acts on them — the inverter is told a single total through its own
+        // registers — so this is reported and not otherwise consumed.
+        MessageType::AccessoryTelemetry => match AccessoryTelemetry::parse(frame.body()) {
+            Ok(meter) => to.accessory_reading(&AccessoryReading {
+                manufacturer: &meter.manu,
+                model: &meter.model,
+                serial: &meter.sn,
+                access: u16::try_from(meter.access).unwrap_or(u16::MAX),
+                active_power: Some(meter.t_act),
+                phase_power: Some([meter.a_act, meter.b_act, meter.c_act]),
+                communicating: meter.communicating(),
+                faulted: meter.faulted(),
+            }),
+            Err(error) => to.unreadable(&kind.to_string(), &error),
+        },
 
         MessageType::ReadSingleRegister => match ReadResponse::from_frame(frame) {
             Ok(response) => to.read_answer(response.register, response.raw),

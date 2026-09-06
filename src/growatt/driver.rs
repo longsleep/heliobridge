@@ -11,6 +11,9 @@
 
 use crate::driver::arbiter::{Arbiter, Direction, Intent};
 use crate::driver::catalogue::Catalogue;
+use core::time::Duration;
+
+use crate::driver::accessories::{Enrolled, Enrols};
 use crate::driver::commands::{Command, Commands, Outgoing};
 use crate::driver::describes::{Describes, Reported};
 use crate::driver::report::{Report, Sink};
@@ -20,7 +23,8 @@ use crate::growatt::cloud::{self, Relay, RelayError};
 use crate::growatt::product::Product;
 use crate::growatt::v7::encode::EncodeError;
 use crate::growatt::v7::frame::Frame;
-use crate::growatt::v7::registers::{CONFIG_REGISTER_LAST, HoldingRegister, InputRegister, SLOT_COUNT};
+use crate::growatt::v7::network;
+use crate::growatt::v7::registers::{self, CONFIG_REGISTER_LAST, HoldingRegister, InputRegister, SLOT_COUNT};
 use crate::growatt::v7::version::FirmwareVersion;
 use crate::growatt::{Codec, peek_version};
 use crate::growatt::{catalogue, commands, firmware, report};
@@ -175,6 +179,65 @@ impl Firmware for Growatt {
             .uri(firmware.url.as_str())
             .header(http::header::USER_AGENT, firmware::DEVICE_USER_AGENT)
             .header(http::header::CACHE_CONTROL, firmware::DEVICE_CACHE_CONTROL)
+    }
+}
+
+impl Enrols for Growatt {
+    fn accessory_serial(&self, text: &str) -> Option<u64> {
+        network::Serial::parse(text).map(network::Serial::get)
+    }
+
+    fn accessory_mac(&self, serial: u64) -> String {
+        network::Serial::new(serial).map_or_else(|| serial.to_string(), network::Serial::mac)
+    }
+
+    fn accessory_search(&self, model: &str) -> Option<(String, u16)> {
+        network::Search::of_model(model).map(|search| (search.service, search.accessory))
+    }
+
+    fn accessory_models(&self) -> Vec<&'static str> {
+        network::Search::models()
+    }
+
+    fn enrolled(&self, value: &str) -> Vec<Enrolled> {
+        network::Entry::parse_list(value)
+            .into_iter()
+            .map(|entry| Enrolled {
+                kind: entry.kind(),
+                accessory: entry.accessory,
+                mode: entry.mode,
+                name: entry.name,
+                state: entry.state.code(),
+                state_label: entry.state.label(),
+                paired: entry.state.is_paired(),
+                serial: entry.serial.map(network::Serial::get),
+                address: entry.address,
+            })
+            .collect()
+    }
+
+    fn accessory_found(&self, value: &str) -> Option<u64> {
+        network::found(value).map(network::Serial::get)
+    }
+
+    fn accessory_list(&self) -> &'static str {
+        registers::ACCESSORY_LIST
+    }
+
+    fn accessory_found_register(&self) -> &'static str {
+        registers::ACCESSORY_FOUND
+    }
+
+    fn accessory_list_radio(&self) -> Option<&'static str> {
+        Some(registers::ACCESSORY_LIST_RF)
+    }
+
+    fn accessory_in_use_reading(&self) -> &'static str {
+        registers::METER_CONNECTED
+    }
+
+    fn accessory_search_window(&self) -> Duration {
+        network::SEARCH_WINDOW
     }
 }
 

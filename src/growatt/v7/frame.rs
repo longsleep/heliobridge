@@ -150,6 +150,11 @@ pub enum MessageType {
     ConfigRead,
     /// `0xFE19` — datalogger identity report, device to server.
     IdentityReport,
+    /// `0x6F64` — what an enrolled meter reads, as JSON, device to server.
+    ///
+    /// Sent once a minute while an accessory is paired. A report and nothing else: publishing one to a
+    /// device has no effect. See [`crate::growatt::v7::accessory`].
+    AccessoryTelemetry,
     /// Anything else. Log it with a hex dump rather than dropping it: that is how the next unknown
     /// message type gets characterised.
     Unrecognised {
@@ -170,6 +175,7 @@ impl MessageType {
             (0x01, 0x06) => Self::WriteSingleRegister,
             (0x01, 0x10) => Self::WriteRegisterRange,
             (0x01, 0x50) => Self::BufferedTelemetry,
+            (0x6F, 0x64) => Self::AccessoryTelemetry,
             // Either address. The vendor's periodic clock push arrives as 0xFE18 and every command issued
             // from its web interface as 0x0118 — same message, same body layout, and dispatching on the pair
             // would silently miss four of the five known config writes.
@@ -195,6 +201,7 @@ impl MessageType {
             | Self::BufferedTelemetry
             // The vendor sends a config read under 0x01, captured at 44 octets.
             | Self::ConfigRead => 0x01,
+            Self::AccessoryTelemetry => 0x6F,
             // The address this program *sends* a config write under. Either is accepted on receipt, and a
             // parsed frame keeps whichever octet it arrived with, since `to_wire` re-obfuscates the stored
             // bytes rather than rebuilding the header. 0xFE is what the vendor's own clock push uses, and the
@@ -214,6 +221,7 @@ impl MessageType {
             Self::WriteRegisterRange => 0x10,
             Self::BufferedTelemetry => 0x50,
             Self::ConfigWrite => 0x18,
+            Self::AccessoryTelemetry => 0x64,
             // One function, two directions: the request downstream, the report back.
             Self::ConfigRead | Self::IdentityReport => 0x19,
             Self::Unrecognised { function, .. } => function,
@@ -238,6 +246,7 @@ impl core::fmt::Display for MessageType {
             Self::ConfigWrite => "config-write",
             Self::ConfigRead => "config-read",
             Self::IdentityReport => "identity",
+            Self::AccessoryTelemetry => "accessory-telemetry",
             Self::Unrecognised { .. } => "unrecognised",
         };
         write!(f, "{name}({:#06x})", self.as_u16())

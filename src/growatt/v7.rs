@@ -5,12 +5,15 @@
 //!
 //! The generation-agnostic header lives in [`crate::growatt::header`].
 
+pub mod accessory;
 pub mod classify;
 pub mod decode;
 pub mod encode;
 pub mod frame;
 pub mod identity;
+pub mod lora;
 pub mod meter;
+pub mod network;
 pub mod registers;
 pub mod version;
 

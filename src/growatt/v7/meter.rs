@@ -5,8 +5,10 @@
 //! holding registers, which is what this module is about. That is the whole of the meter interface as far
 //! as a replacement server is concerned — a server can supply readings without any metering hardware.
 //!
-//! Distinct from [`crate::server::meter`], which is an HTTP server *impersonating* a Shelly for the
-//! device to poll. This is the register path: no discovery, no polling, the value written directly.
+//! Distinct from the two paths where the device reads a meter itself: one found by mDNS and polled over
+//! HTTP ([`crate::growatt::v7::network`]), and one adopted over the radio. This is the register path — no
+//! discovery, no polling, the value written directly — and it is the only one that needs no hardware and no
+//! accessory at all.
 //!
 //! # Nothing here refreshes anything
 //!
