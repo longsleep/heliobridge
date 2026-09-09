@@ -50,17 +50,17 @@ pub fn report(frame: &Frame, to: &mut dyn Sink) {
 
         MessageType::ReadSingleRegister => match ReadResponse::from_frame(frame) {
             Ok(response) => to.read_answer(response.register, response.raw),
-            Err(error) => to.unreadable(&kind.to_string(), &error),
+            // Before calling it undecodable: an acknowledgement wearing the read function code is a thing
+            // this device does when a read and a write are in flight together, and its body is well
+            // formed for what it actually is. Reported as the acknowledgement it is; it answers no read.
+            Err(error) => match DecodedAck::from_read_coded(frame) {
+                Some(ack) => to.write_ack(&ack_report(&ack)),
+                None => to.unreadable(&kind.to_string(), &error),
+            },
         },
 
         MessageType::WriteSingleRegister | MessageType::WriteRegisterRange => match DecodedAck::from_frame(frame) {
-            Ok(ack) => to.write_ack(&WriteAck {
-                first: ack.start,
-                last: ack.end,
-                accepted: ack.accepted(),
-                value: ack.value,
-                status: format!("{:#04x}", ack.status),
-            }),
+            Ok(ack) => to.write_ack(&ack_report(&ack)),
             Err(error) => to.unreadable(&kind.to_string(), &error),
         },
 
@@ -101,5 +101,20 @@ pub fn report(frame: &Frame, to: &mut dyn Sink) {
             &format!("address {address:#04x} function {function:#04x}"),
             frame.wire_len(),
         ),
+    }
+}
+
+/// Express a decoded acknowledgement in the driver-neutral shape the sink takes.
+///
+/// Shared by the two paths that can produce one: the `0x06`/`0x10` frames that are supposed to carry an
+/// acknowledgement, and the `0x05` frame that carries one when the device's function-code slot was won by
+/// a read. Identical either way — what differed was only the label on the envelope.
+fn ack_report(ack: &DecodedAck) -> WriteAck {
+    WriteAck {
+        first: ack.start,
+        last: ack.end,
+        accepted: ack.accepted(),
+        value: ack.value,
+        status: format!("{:#04x}", ack.status),
     }
 }

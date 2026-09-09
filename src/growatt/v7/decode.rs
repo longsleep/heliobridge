@@ -232,12 +232,53 @@ pub struct WriteAck {
 }
 
 impl WriteAck {
+    /// Octets in a single-register acknowledgement body: register, status, value.
+    const SINGLE_BODY_LEN: usize = 5;
+
     /// Whether the device reported accepting the write.
     ///
     /// Not the same as the value having been stored: a range acknowledgement reports acceptance even when
     /// the value was clamped.
     pub const fn accepted(&self) -> bool {
         self.status == 0
+    }
+
+    /// Decode a single-register acknowledgement that arrived wearing the **read** function code.
+    ///
+    /// The device keeps one slot for the function code its next response will carry, written by whichever
+    /// request it handled last, so a read and a write in flight together race for it and an
+    /// acknowledgement can go out stamped `0x05`. Observed ten times in a month, each one byte-for-byte
+    /// identical to the correctly stamped `0x06` that followed it a fraction of a second later.
+    ///
+    /// Only the label is wrong: the body is exactly what a single-register acknowledgement is, and it is
+    /// distinguishable by length, being one octet shorter than the read response it is masquerading as. So
+    /// this reads it as the acknowledgement it is rather than discarding a fact the device stated plainly.
+    /// It is **not** an answer to the outstanding read, which goes unanswered.
+    ///
+    /// Returns `None` for anything else, including a genuinely truncated read response — a read response
+    /// is 6 octets and a truncation is shorter than 5 or longer, so only the exact shape qualifies.
+    pub fn from_read_coded(frame: &Frame) -> Option<Self> {
+        if frame.message_type() != MessageType::ReadSingleRegister {
+            return None;
+        }
+        let body = frame.body();
+        if body.len() != Self::SINGLE_BODY_LEN {
+            return None;
+        }
+
+        let pair = |at: usize| -> Option<u16> {
+            body.get(at..at.checked_add(2)?)
+                .and_then(|pair| <[u8; 2]>::try_from(pair).ok())
+                .map(u16::from_be_bytes)
+        };
+
+        let register = Register(pair(0)?);
+        Some(Self {
+            start: register,
+            end: register,
+            status: *body.get(2)?,
+            value: Some(Raw(pair(3)?)),
+        })
     }
 }
 
@@ -778,6 +819,56 @@ mod tests {
             ReadResponse::from_frame(&frame),
             Err(DecodeError::MismatchedEcho { .. })
         ));
+    }
+
+    /// The captured shape: a `0x06` acknowledgement body under the `0x05` function code.
+    #[test]
+    fn an_acknowledgement_under_the_read_code_is_read_as_one() {
+        use super::WriteAck;
+        use crate::model::Raw;
+
+        // register 257, status 0, value 10 -- byte-for-byte a frame taken off the wire.
+        let body = [0x01, 0x01, 0x00, 0x00, 0x0a];
+        let frame = Frame::new(MessageType::ReadSingleRegister, "0EXAMPLE00000001", &body).expect("build");
+        assert_eq!(frame.wire_len(), 45, "one octet shorter than a read response");
+
+        let ack = WriteAck::from_read_coded(&frame).expect("an acknowledgement, mislabelled");
+        assert_eq!(ack.start, Register(257));
+        assert_eq!(ack.end, Register(257));
+        assert_eq!(ack.status, 0);
+        assert_eq!(ack.value, Some(Raw(10)));
+        assert!(ack.accepted());
+
+        // The same body under the code it should have worn decodes identically, which is the whole claim.
+        let correct = Frame::new(MessageType::WriteSingleRegister, "0EXAMPLE00000001", &body).expect("build");
+        assert_eq!(WriteAck::from_frame(&correct).expect("decode"), ack);
+    }
+
+    /// It must not swallow anything else: a real read response, or a genuinely short body.
+    #[test]
+    fn only_the_acknowledgement_shape_is_taken_for_one() {
+        use super::WriteAck;
+
+        let response = [0x01, 0x42, 0x01, 0x42, 0x03, 0x20];
+        let frame = Frame::new(MessageType::ReadSingleRegister, "0EXAMPLE00000001", &response).expect("b");
+        assert!(
+            WriteAck::from_read_coded(&frame).is_none(),
+            "a six-octet read response is a read response"
+        );
+
+        for len in [0usize, 1, 2, 3, 4, 7, 8] {
+            let body = vec![0u8; len];
+            let frame = Frame::new(MessageType::ReadSingleRegister, "0EXAMPLE00000001", &body).expect("b");
+            assert!(
+                WriteAck::from_read_coded(&frame).is_none(),
+                "a {len}-octet body is not an acknowledgement"
+            );
+        }
+
+        // And the code has to be the read one: this is about a mislabelled frame, not a second decoder.
+        let ack = [0x01, 0x01, 0x00, 0x00, 0x0a];
+        let frame = Frame::new(MessageType::WriteSingleRegister, "0EXAMPLE00000001", &ack).expect("b");
+        assert!(WriteAck::from_read_coded(&frame).is_none());
     }
 
     #[test]
