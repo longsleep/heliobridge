@@ -69,6 +69,11 @@ pub struct Identity<'a> {
     pub declared: u16,
     /// Whether the frame ran out before the declared count was reached.
     pub truncated: bool,
+    /// The register whose entry could not be completed, where the driver can name one.
+    ///
+    /// A truncation is nearly always one register declaring a value length it does not honour, so naming
+    /// it is the difference between a diagnosable log line and a trip to the capture.
+    pub stopped_at: Option<Register>,
     /// Where the device believes it should connect, if the driver can say.
     pub endpoint: Option<String>,
     /// One line naming what matters, composed by the driver.

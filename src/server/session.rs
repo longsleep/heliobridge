@@ -1218,11 +1218,15 @@ where
     /// why neither the log line nor anything published walks the entries directly.
     fn accept_identity(&mut self, report: &crate::driver::report::Identity<'_>) {
         if report.truncated {
-            // Not fatal — the fields that parsed are kept — but it means the layout is not what the driver
-            // expects, and that is worth knowing about before the values are trusted.
-            tracing::warn!(
+            // Not fatal — the fields that parsed are kept. Usually not a layout problem either: one
+            // register answers with a value length it does not honour, so naming the register is what
+            // distinguishes "this device has a known quirk" from "the driver has the layout wrong".
+            tracing::debug!(
                 declared = report.declared,
                 parsed = report.fields.len(),
+                stopped_at = report
+                    .stopped_at
+                    .map_or_else(|| "unknown".to_owned(), |r| r.to_string()),
                 "the identity report ended early; treating the fields that parsed as all there are"
             );
         }

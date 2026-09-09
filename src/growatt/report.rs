@@ -70,6 +70,7 @@ pub fn report(frame: &Frame, to: &mut dyn Sink) {
             Ok(identity) => to.identity(&Identity {
                 declared: identity.declared,
                 truncated: identity.truncated,
+                stopped_at: identity.stopped_at,
                 endpoint: identity.endpoint(),
                 summary: identity.summary(),
                 fields: identity

@@ -80,6 +80,13 @@ pub struct Identity {
     pub entries: Vec<Entry>,
     /// Whether the body ran out before the declared count was reached.
     pub truncated: bool,
+    /// The register whose entry could not be completed, where the header for one was read at all.
+    ///
+    /// Worth carrying because the answer is nearly always the same register and saying so is the whole
+    /// diagnosis: config register 145 declares a 49-octet value and sends none, so a report of one entry
+    /// yields none. Without the number a reader sees only "declared 1, parsed 0" and has to go to the
+    /// capture — which cost two wrong explanations before the bytes were read.
+    pub stopped_at: Option<Register>,
 }
 
 impl Identity {
@@ -196,6 +203,7 @@ impl FromFrame for Identity {
         let mut entries = Vec::new();
         let mut offset = PREAMBLE_LEN;
         let mut truncated = false;
+        let mut stopped_at = None;
 
         while entries.len() < usize::from(declared) {
             let Some(register) = read_u16(offset) else {
@@ -204,12 +212,16 @@ impl FromFrame for Identity {
             };
             let Some(length) = read_u16(offset.saturating_add(2)) else {
                 truncated = true;
+                stopped_at = Some(Register(register));
                 break;
             };
             let start = offset.saturating_add(ENTRY_HEADER_LEN);
             let end = start.saturating_add(usize::from(length));
             let Some(value) = body.get(start..end) else {
+                // The declared length is not honoured, which register 145 does every time. Bounding by
+                // what is present is the only option: the octets do not exist to be read.
                 truncated = true;
+                stopped_at = Some(Register(register));
                 break;
             };
             entries.push(Entry {
@@ -225,6 +237,7 @@ impl FromFrame for Identity {
             declared,
             entries,
             truncated,
+            stopped_at,
         })
     }
 }
@@ -255,6 +268,51 @@ mod tests {
             .to_wire();
         let frame = Frame::parse(&wire).expect("parse");
         Identity::from_frame(&frame).expect("decode")
+    }
+
+    /// Build a body with a raw, possibly dishonest, length field — which is what register 145 sends.
+    fn identity_with_raw_length(count: u16, register: u16, declared_len: u16, value: &[u8]) -> Identity {
+        let mut body = Vec::new();
+        body.extend_from_slice(&count.to_be_bytes());
+        body.push(0);
+        body.extend_from_slice(&register.to_be_bytes());
+        body.extend_from_slice(&declared_len.to_be_bytes());
+        body.extend_from_slice(value);
+        let wire = Frame::new(MessageType::ConfigRead, SERIAL, &body)
+            .expect("build")
+            .to_wire();
+        let frame = Frame::parse(&wire).expect("parse");
+        Identity::from_frame(&frame).expect("decode")
+    }
+
+    /// Register 145 declares 49 octets of value and sends none, every time it is read.
+    #[test]
+    fn a_declared_length_that_is_not_honoured_names_the_register() {
+        let report = identity_with_raw_length(1, 145, 49, &[]);
+
+        assert_eq!(report.declared, 1);
+        assert!(report.entries.is_empty(), "there is no value to keep");
+        assert!(report.truncated);
+        assert_eq!(
+            report.stopped_at,
+            Some(Register(145)),
+            "the register is the diagnosis, so it must be reported"
+        );
+    }
+
+    /// And a length of zero is honest: registers 142 and 143 answer this way and must parse.
+    #[test]
+    fn a_zero_length_value_is_a_value_and_not_a_truncation() {
+        for register in [142u16, 143] {
+            let report = identity_with_raw_length(1, register, 0, &[]);
+
+            assert!(
+                !report.truncated,
+                "register {register} declared nothing and sent nothing"
+            );
+            assert_eq!(report.stopped_at, None);
+            assert_eq!(report.value(Register(register)), Some(""));
+        }
     }
 
     #[test]
