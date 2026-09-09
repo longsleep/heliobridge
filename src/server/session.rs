@@ -165,6 +165,10 @@ where
     /// device clamped, so the read-back still decides. A refusal is worth saying out loud, though — it is
     /// the one case where the device volunteers that it did not do as asked.
     fn write_ack(&mut self, ack: &WriteAck) {
+        // Whatever it says, the write is no longer in flight, so held reads may go. The loop calls
+        // `send_pending_read` after every frame it handles, which is where the held one is actually sent.
+        self.session.awaiting_ack = None;
+
         if ack.accepted {
             tracing::debug!(
                 start = %ack.first,
@@ -280,6 +284,14 @@ pub const TIME_PUSH_DELAY: Duration = Duration::from_millis(4_500);
 /// The device answered a read in about 0.6 s. Ten seconds is generous enough that a busy device is not
 /// skipped, and short enough that a resync of sixty registers cannot stall for minutes if one is ignored.
 pub const READ_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long to wait for a write to be acknowledged before letting reads resume.
+///
+/// Not a correctness deadline — the acknowledgement is informative and the read-back is what decides
+/// whether a write landed. It exists so a lost acknowledgement cannot stall register traffic for the rest
+/// of the session. Acknowledgements have been observed at 120 ms on a healthy session and at a few seconds
+/// on one that was struggling, so five seconds covers both without holding reads long enough to matter.
+pub const ACK_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why a session ended.
 #[derive(Debug, Snafu)]
@@ -401,6 +413,19 @@ pub struct Session<S, D: Driver> {
     /// afterwards. Without this the read would have to be issued from a synchronous context.
     pending_read: Option<Register>,
     read_deadline: Option<Instant>,
+    /// When the acknowledgement for a write in flight stops being waited for.
+    ///
+    /// `Some` means a register write is outstanding and **no read may be sent**. The device holds one slot
+    /// for the function code its next response will carry, written by whichever request it handled last, so
+    /// a read and a write in flight together race for it: the response comes back stamped with the other
+    /// request's code and one of the two is answered to nobody. Observed as a write acknowledgement
+    /// arriving under the read function code while the read it displaced timed out.
+    ///
+    /// Only this program's own writes are gated. A write the cloud relay passes through is republished as
+    /// it arrived rather than going through [`Session::transmit`], so it is not counted here — the race is
+    /// still possible against one, and closing that would mean decoding every relayed frame to find out
+    /// whether it was a register write.
+    awaiting_ack: Option<Instant>,
     settings: BTreeMap<Register, Raw>,
     registry: Option<Registry>,
     /// Which device serials may be served. Empty admits any.
@@ -514,6 +539,7 @@ where
             awaiting: None,
             pending_read: None,
             read_deadline: None,
+            awaiting_ack: None,
             settings: BTreeMap::new(),
             registry: None,
             devices: Devices::default(),
@@ -647,6 +673,18 @@ where
                         }
                     }
                     self.start_next_read();
+                    self.send_pending_read().await?;
+                    continue;
+                }
+                Woke::AckTimedOut => {
+                    // Nothing is wrong with the write: the read-back is what confirms it, and that is
+                    // queued already. This only lifts the hold on reads so a lost acknowledgement cannot
+                    // stall register traffic for the rest of the session.
+                    tracing::debug!(
+                        timeout_s = ACK_REPLY_TIMEOUT.as_secs(),
+                        "a write went unacknowledged; letting reads resume"
+                    );
+                    self.awaiting_ack = None;
                     self.send_pending_read().await?;
                     continue;
                 }
@@ -977,6 +1015,7 @@ where
             () = Self::until_replaced(self.replaced.as_deref()) => Woke::Replaced,
             () = Self::at(self.time_push_due) => Woke::TimePushDue,
             () = Self::at(self.read_deadline) => Woke::ReadTimedOut,
+            () = Self::at(self.awaiting_ack) => Woke::AckTimedOut,
             request = Self::from_control(self.requests.as_mut()) => Woke::Control(request),
             message = Self::from_cloud(self.relay.as_mut()) => Woke::FromCloud(message),
             packet = Self::read(&mut self.stream) => Woke::Packet(packet?),
@@ -1077,7 +1116,15 @@ where
 
     /// Send the queued read request. Separate from [`Session::start_next_read`] because that is called from
     /// places that cannot await.
+    ///
+    /// Holds off while a write of ours is unacknowledged, leaving the read queued rather than dropping it:
+    /// see [`Session::awaiting_ack`] for why the two must not be in flight together. Every path that
+    /// clears that hold calls this again, so a held read is sent as soon as the acknowledgement lands.
     async fn send_pending_read(&mut self) -> Result<(), SessionError> {
+        if self.awaiting_ack.is_some() {
+            return Ok(());
+        }
+
         let Some(register) = self.pending_read.take() else {
             return Ok(());
         };
@@ -1433,6 +1480,23 @@ where
         };
 
         let outgoing = self.prepare(command)?;
+
+        // A write must go out alone. Any read already in flight is stood down and put back at the head of
+        // the queue rather than delayed behind the write, because the write is what a caller is waiting on
+        // and the read has up to an hour of slack. See `awaiting_ack`.
+        if outgoing.acknowledged {
+            if let Some(read) = self.awaiting.take() {
+                tracing::debug!(
+                    register = %read.entry.register(),
+                    name = read.entry.name(),
+                    "standing a read down so a write goes out alone; it will be reissued"
+                );
+                self.reads.push_front(read);
+            }
+            self.pending_read = None;
+            self.read_deadline = None;
+        }
+
         self.record(RecordStream::Inject, &outgoing.payload);
 
         tracing::info!(
@@ -1457,6 +1521,7 @@ where
         };
 
         let verify = outgoing.verify;
+        let acknowledged = outgoing.acknowledged;
         self.send(&Packet::Publish(Publish {
             topic: format!("s/{device_id}"),
             qos: outgoing.qos,
@@ -1466,6 +1531,10 @@ where
             payload: outgoing.payload,
         }))
         .await?;
+
+        if acknowledged {
+            self.awaiting_ack = Instant::now().checked_add(ACK_REPLY_TIMEOUT);
+        }
 
         Ok(verify)
     }
@@ -1891,6 +1960,8 @@ enum Woke {
     TimePushDue,
     /// A read went unanswered for too long.
     ReadTimedOut,
+    /// A write went unacknowledged for too long, so reads may resume.
+    AckTimedOut,
     /// The control API asked for something, or stopped.
     Control(Option<ControlRequest>),
     /// The cloud sent something for the device, or the relay stopped.
@@ -1901,7 +1972,10 @@ enum Woke {
 
 #[cfg(test)]
 mod tests {
-    use super::{CONNACK_NOT_AUTHORISED, Clock, Devices, GRANTED_QOS, Raw, Session, TIME_PUSH_DELAY, Timestamp};
+    use super::{
+        ACK_REPLY_TIMEOUT, CONNACK_NOT_AUTHORISED, Clock, Devices, GRANTED_QOS, Raw, Register, Session,
+        TIME_PUSH_DELAY, Timestamp,
+    };
     use crate::growatt::driver::Growatt;
     use crate::growatt::v7::frame::{Frame, MessageType};
     use crate::mqtt::{Connect, Packet, Publish, QoS, Subscribe};
@@ -2005,6 +2079,45 @@ mod tests {
         let mut replies = Vec::new();
         client.read_to_end(&mut replies).await.expect("read replies");
         packets(&replies)
+    }
+
+    /// A read must not be in flight while a write of ours is unacknowledged: the device keeps one slot for
+    /// the function code its next response carries, and the two race for it.
+    #[tokio::test]
+    async fn a_read_is_held_until_a_write_is_acknowledged() {
+        use core::time::Duration;
+        use tokio::io::AsyncReadExt as _;
+        use tokio::time::Instant;
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut session = Session::new(server, Arc::new(Growatt));
+        session.device_id = Some(SERIAL.to_owned());
+
+        // A read decided on, and a write of ours still unacknowledged.
+        session.pending_read = Some(Register(250));
+        session.awaiting_ack = Instant::now().checked_add(ACK_REPLY_TIMEOUT);
+
+        session.send_pending_read().await.expect("holding off is not an error");
+
+        let mut buf = [0u8; 64];
+        let idle = tokio::time::timeout(Duration::from_millis(50), client.read(&mut buf)).await;
+        assert!(idle.is_err(), "nothing may go out while a write is unacknowledged");
+        assert_eq!(
+            session.pending_read,
+            Some(Register(250)),
+            "the read is held, not dropped -- it has to go out once the acknowledgement lands"
+        );
+
+        // The acknowledgement lands, and the held read goes.
+        session.awaiting_ack = None;
+        session.send_pending_read().await.expect("send");
+        assert_eq!(session.pending_read, None, "sent, so no longer pending");
+
+        let read = tokio::time::timeout(Duration::from_millis(500), client.read(&mut buf))
+            .await
+            .expect("the read should go out now")
+            .expect("bytes");
+        assert!(read > 0, "a read frame was published");
     }
 
     #[tokio::test]
