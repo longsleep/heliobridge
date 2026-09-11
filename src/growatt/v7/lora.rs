@@ -1,10 +1,15 @@
 //! The LoRa radio of protocol generation 7: the register that opens it for pairing.
 //!
-//! The datalogger drives an **LLCC68** in LoRa mode — the vendor's own component, log tag and parameter
-//! block all name it that, and the parameters it takes are a spreading factor and a coding rate, which
-//! belong to no other modulation. "Sub-GHz" is true and weaker: the part covers 150–960 MHz and the
-//! frequency is not compiled into the firmware, so the band is unknown. It is **not** LoRaWAN — none of
-//! that machinery is present.
+//! The radio is the **power controller's**, not the datalogger's. That sub-MCU drives a serial LoRa module
+//! through an SPI-to-UART bridge and speaks Modbus RTU to the meter over it; the datalogger forwards the
+//! register write below and takes no other part. (The datalogger's image does carry a driver for a bare
+//! LLCC68, with a frequency table, but it is never initialised and is reachable only from a debug UART —
+//! nothing read out of it describes the live link.) It is **not** LoRaWAN — none of that machinery is
+//! present — and the radio parameters of the link are inside the module and unknown.
+//!
+//! **No command is missing.** Pairing is the whole of what the register space offers a server here, with
+//! one counterpart this module does not yet expose: register 319 unbinds the paired meter in the same
+//! one-shot way, and has never been observed on the wire.
 //!
 //! The identifiers say `lora` rather than `radio` because this unit has **three** radios — Wi-Fi,
 //! Bluetooth and this one — so `radio` would name none of them.
@@ -65,13 +70,10 @@ use crate::model::{Raw, Register};
 
 /// The register that opens a pairing window on the LoRa radio.
 ///
-/// The sub-MCU's own debug output names this address as a calibration command, in one line naming 319,
-/// 320 and 321 together **`[F]`**. Nothing about the observed behaviour matches that: the vendor's server
-/// writes it in an accessory-pairing flow, the device acknowledges it, and no calibration follows. The most
-/// economical explanation is that the datalogger intercepts this register before forwarding it inward, as
-/// it already does for the meter block, but that is inferred and not established. Register **319** is
-/// deliberately left alone: the two names came from one debug line and only one of them has been cleared
-/// by observation.
+/// Inside the power controller it is the pairing command: while it reads `1` the controller sends the
+/// meter a pairing request three times, about twenty seconds apart, and clears the register after the
+/// third — or as soon as the meter reports itself paired **`[F]`**. Register **319** is the unbind, with the
+/// same one-shot shape, and is deliberately not written by anything here.
 pub const PAIR_REGISTER: Register = Register(320);
 
 /// The value that opens the window. The vendor's server sends `1` and the app's own request carries the

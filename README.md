@@ -418,8 +418,8 @@ Enrolment is not exposed to Home Assistant: it needs a person to choose from a l
 
 ## Pairing an accessory on the LoRa radio
 
-The datalogger carries a LoRa radio alongside its network interfaces. An accessory that arrives over it is
-not given an address — it is adopted, during a window this opens:
+The device has a LoRa radio, on its power controller rather than the datalogger. An accessory that arrives
+over it is not given an address — it is adopted, during a window this opens:
 
 ```console
 $ curl --unix-socket /run/heliobridge.sock -X POST \
