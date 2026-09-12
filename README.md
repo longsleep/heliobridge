@@ -1,5 +1,10 @@
 # Heliobridge
 
+[![CI](https://github.com/longsleep/heliobridge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/longsleep/heliobridge/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/heliobridge?logo=rust)](https://crates.io/crates/heliobridge)
+[![Container](https://img.shields.io/badge/ghcr.io-heliobridge-blue?logo=docker)](https://github.com/longsleep/heliobridge/pkgs/container/heliobridge)
+[![License](https://img.shields.io/github/license/longsleep/heliobridge)](LICENSE)
+
 A local MQTT server for the **Growatt Nexa 2000** balcony storage system: run it instead of the
 vendor cloud, and keep the device working on your own network.
 
