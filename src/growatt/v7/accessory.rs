@@ -77,10 +77,16 @@ use serde::Deserialize;
 use snafu::{OptionExt as _, ResultExt as _, Snafu};
 
 /// Where the JSON's declared length sits in the body.
-const LENGTH_AT: usize = 67;
+///
+/// Relative to [`crate::growatt::v7::frame::Frame::body`], which begins past the 30-octet device ID. These
+/// were once 67 and 71 — the same offsets counted from the device ID instead — so [`declared`] never
+/// matched and every frame fell through to [`found`]. The unit test carried the same mistake in its
+/// fixture, which is why both survived; the fixture is now a body, and one test builds a whole frame so the
+/// convention cannot drift again.
+const LENGTH_AT: usize = 37;
 
 /// Where the JSON itself begins.
-const JSON_AT: usize = 71;
+const JSON_AT: usize = 41;
 
 /// Why an accessory-telemetry document could not be read.
 #[derive(Debug, Snafu)]
@@ -187,11 +193,29 @@ impl AccessoryTelemetry {
     }
 
     /// The JSON located by its braces, for a frame whose length field cannot be trusted.
+    ///
+    /// The *matching* close, not the last one in the body. About 2 % of these frames carry unrelated octets
+    /// after the document — the device measures the payload with `strlen` over a buffer it does not always
+    /// terminate, so what follows is whatever was there before (F150) — and that has been observed to
+    /// contain a `}`. Taking the last one swallows the rubbish and the parse fails on a document that was
+    /// perfectly good.
     fn found(body: &[u8]) -> Option<&[u8]> {
         let start = body.iter().position(|&b| b == b'{')?;
         let document = body.get(start..)?;
-        let end = document.iter().rposition(|&b| b == b'}')?.checked_add(1)?;
-        document.get(..end)
+        let mut depth = 0usize;
+        for (offset, &byte) in document.iter().enumerate() {
+            match byte {
+                b'{' => depth = depth.saturating_add(1),
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return document.get(..offset.checked_add(1)?);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Whether the datalogger is currently managing to read the accessory.
@@ -207,14 +231,13 @@ impl AccessoryTelemetry {
 
 #[cfg(test)]
 mod tests {
-    use super::AccessoryTelemetry;
+    use super::{AccessoryTelemetry, LENGTH_AT};
 
-    /// The body of a real frame, from `captures/accessory-enrolment-2026-09-06.txt`, with the device's own
-    /// serial replaced. The accessory serial is the decimal MAC of the simulated meter.
+    /// The body of a real frame, from `captures/accessory-enrolment-2026-09-06.txt` — **the body**, which
+    /// begins past the 30-octet device ID, because that is what `Frame::body` hands a decoder. The accessory
+    /// serial is the decimal MAC of the simulated meter.
     fn body() -> Vec<u8> {
-        let mut body = b"0EXAMPLE00000001".to_vec();
-        body.extend(std::iter::repeat_n(0u8, 14));
-        body.extend(b"187723572702975");
+        let mut body = b"187723572702975".to_vec();
         body.extend(std::iter::repeat_n(0u8, 15));
         body.extend([0x1a, 0x09, 0x06, 0x11, 0x27, 0x02, 0x01, 0x00, 0x00, 0x01, 0xb7]);
         body.extend(
@@ -222,6 +245,64 @@ mod tests {
         );
         body.push(0);
         body
+    }
+
+    /// Synthetic filler standing in for the stale heap a long frame carries.
+    ///
+    /// **Not captured.** The real tails hold whatever the device last had in that buffer — on the reference
+    /// unit, fragments of its broker's certificate — and a fixture has no business carrying one machine's
+    /// memory. What matters to the parser is reproduced instead: high-bit octets that are not text, and a
+    /// stray `}` among them, which is what made the old brace scan swallow the rubbish.
+    fn synthetic_tail() -> Vec<u8> {
+        let mut tail: Vec<u8> = (0..746u32)
+            .map(|i| {
+                // A trivial deterministic generator: the test must fail for the same reason every run.
+                let x = i.wrapping_mul(2_654_435_761) >> 13;
+                u8::try_from(x & 0xff).unwrap_or(0) | 0x80
+            })
+            .collect();
+        tail[91] = b'}';
+        tail
+    }
+
+    #[test]
+    fn a_report_with_a_tail_decodes_and_the_tail_is_ignored() {
+        // 1.8 % of these frames run long: the document and its length field are correct and the frame
+        // simply continues past them (F150). Both paths must stop at the document.
+        let mut long = body();
+        long.pop();
+        long.extend(synthetic_tail());
+
+        let report = AccessoryTelemetry::parse(&long).expect("the document decodes despite the tail");
+        assert_eq!(report.sn, "187723572702975");
+        assert!((report.t_act - 120.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn the_brace_scan_stops_at_the_matching_close() {
+        // With the length field damaged, the fallback carries the frame — and must not run to the `}` the
+        // tail contains.
+        let mut long = body();
+        long.pop();
+        long.extend(synthetic_tail());
+        long[LENGTH_AT] = 0xff;
+
+        let report = AccessoryTelemetry::parse(&long).expect("the fallback finds the document");
+        assert_eq!(report.sn, "187723572702975");
+    }
+
+    #[test]
+    fn the_offsets_are_those_of_a_frame_body() {
+        // The bug this replaced: constants counted from the device ID rather than from `Frame::body`, so
+        // `declared` never matched anything. Building a real frame is the only way to pin that down.
+        let frame = crate::growatt::v7::frame::Frame::new(
+            crate::growatt::v7::frame::MessageType::AccessoryTelemetry,
+            "0EXAMPLE00000001",
+            &body(),
+        )
+        .expect("a frame carrying the captured body");
+        let report = AccessoryTelemetry::parse(frame.body()).expect("it decodes through a real frame");
+        assert_eq!(report.model, "SPEM-003CEBEU");
     }
 
     #[test]
