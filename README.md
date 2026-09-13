@@ -226,7 +226,9 @@ withdrawn with an empty payload rather than left behind.
 last will, which the broker publishes for us. A *device* going away is something only this program can see,
 so it says so itself — after `HELIOBRIDGE_OFFLINE_AFTER` seconds without a telemetry frame, since the
 device's own MQTT keepalive is 420 s and a half-open connection would otherwise leave stale readings on a
-dashboard for seven minutes.
+dashboard for seven minutes. The commonest reason for a device to go away is that it has powered itself
+down for the night — [docs/sleep.md](docs/sleep.md) has the conditions that decide when, what it costs, and
+how to meet them deliberately.
 
 Nothing publishes a substitute value. No zero, no repeat of the last reading: on a `total_increasing` energy
 sensor a zero reads as a counter reset and the next real value is counted as a day's worth of new energy, and
