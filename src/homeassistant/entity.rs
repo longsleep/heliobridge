@@ -1141,10 +1141,7 @@ const NAMED: &[(&str, &str)] = &[
     ("anti_backflow_enabled", "Export limitation"),
     ("anti_backflow_power_percent", "Export limit"),
     ("grid_power_allowed", "Grid charging allowed"),
-    (
-        "ac_couple_enabled",
-        "AC coupling (charge from surplus, needs grid charging)",
-    ),
+    ("ac_couple_enabled", "AC couple enable"),
     ("always_on", "Always on"),
     ("battery_soc_total", "Battery state of charge"),
     ("battery_soh", "Battery health"),
@@ -1478,11 +1475,10 @@ mod tests {
     }
 
     #[test]
-    fn the_switch_with_a_precondition_names_it() {
-        assert_eq!(
-            setting("ac_couple_enabled").name,
-            "AC coupling (charge from surplus, needs grid charging)"
-        );
+    fn a_switch_with_no_observed_effect_carries_the_vendor_label() {
+        // The vendor's own wording, verbatim, and nothing beyond it. The device behaves identically with
+        // this set and clear (F151), so any name describing an effect would be inventing one.
+        assert_eq!(setting("ac_couple_enabled").name, "AC couple enable");
         assert_eq!(setting("ac_couple_enabled").component, Component::Switch);
     }
 
