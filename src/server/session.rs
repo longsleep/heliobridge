@@ -2388,7 +2388,7 @@ mod tests {
             .collect();
 
         // Three reads issued: the initial one, then one after each answer.
-        assert_eq!(reads, vec![250, 251, 304], "each answer should trigger the next read");
+        assert_eq!(reads, vec![250, 251, 303], "each answer should trigger the next read");
         assert_eq!(stats.reads, 2);
         assert_eq!(stats.rejected, 0);
     }

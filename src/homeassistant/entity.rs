@@ -1141,6 +1141,10 @@ const NAMED: &[(&str, &str)] = &[
     ("anti_backflow_enabled", "Export limitation"),
     ("anti_backflow_power_percent", "Export limit"),
     ("grid_power_allowed", "Grid charging allowed"),
+    (
+        "ac_couple_enabled",
+        "AC coupling (charge from surplus, needs grid charging)",
+    ),
     ("always_on", "Always on"),
     ("battery_soc_total", "Battery state of charge"),
     ("battery_soh", "Battery health"),
@@ -1471,6 +1475,15 @@ mod tests {
         // It sits in a list of otherwise harmless switches, and the device page is where someone decides
         // whether to touch it.
         assert_eq!(setting("off_grid_mode").name, "Off-grid mode (stops AC output)");
+    }
+
+    #[test]
+    fn the_switch_with_a_precondition_names_it() {
+        assert_eq!(
+            setting("ac_couple_enabled").name,
+            "AC coupling (charge from surplus, needs grid charging)"
+        );
+        assert_eq!(setting("ac_couple_enabled").component, Component::Switch);
     }
 
     #[test]

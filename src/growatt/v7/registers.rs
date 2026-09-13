@@ -758,6 +758,7 @@ pub const HOLDING_REGISTERS: &[HoldingRegister] = {
     &[
         Entry::range(250, "charge_limit_upper", 70, 100, Unit::Percent, Verified),
         Entry::range(251, "charge_limit_lower", 0, 30, Unit::Percent, Verified),
+        Entry::flag(303, "ac_couple_enabled", Verified),
         Entry::flag(304, "always_on", Verified),
         Entry::flag(305, "ac_output_always_on", Verified),
         // Ceiling is 800 W unless power_plus (325) is set; the device clamps and re-clamps on its own,
