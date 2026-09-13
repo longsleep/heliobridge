@@ -195,6 +195,11 @@ impl Discovery<'_> {
         if let Some(category) = entity.category {
             config.insert("entity_category".to_owned(), json!(category.as_str()));
         }
+        // Only when false. Home Assistant's own default is true, and writing it out on every entity would
+        // put a line in 70 discovery messages to say what their absence already says.
+        if !entity.enabled {
+            config.insert("enabled_by_default".to_owned(), json!(false));
+        }
         if let Some(unit) = entity.unit {
             config.insert("unit_of_measurement".to_owned(), json!(unit));
         }
@@ -584,6 +589,18 @@ mod tests {
         assert_eq!(config["state_topic"], "heliobridge/0EXAMPLE00000001/state");
         assert_eq!(config["optimistic"], false);
         assert_eq!(config["entity_category"], "config");
+    }
+
+    #[test]
+    fn a_setting_nothing_depends_on_arrives_switched_off() {
+        // Registered so it is there for anyone who wants it, and off so it does not take a place on the
+        // page. Every other setting relies on Home Assistant's own default, which is on.
+        assert_eq!(payload(&entity("ac_couple_enabled"))["enabled_by_default"], false);
+        assert!(
+            payload(&entity("grid_power_allowed"))
+                .get("enabled_by_default")
+                .is_none()
+        );
     }
 
     #[test]

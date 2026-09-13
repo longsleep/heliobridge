@@ -271,6 +271,12 @@ pub struct Entity {
     pub presence: Presence,
     /// A further condition for it to be available, where it has one.
     pub gate: Option<Gate>,
+    /// Whether Home Assistant enables it on discovery.
+    ///
+    /// `false` registers the entity and leaves it switched off, which is where a control belongs when
+    /// nothing is known to depend on it: it stays available to anyone who wants it without occupying a
+    /// place on the page.
+    pub enabled: bool,
 }
 
 impl Entity {
@@ -305,6 +311,7 @@ impl Entity {
             shape,
             source: Some(Source::Settings),
             presence: Presence::Device,
+            enabled: !DISABLED.contains(&setting.name()),
             gate: setting
                 .superseded_by()
                 .map(|(setting, value)| Gate::SettingIsNot { setting, value }),
@@ -360,6 +367,7 @@ impl Entity {
             },
             source: Some(Source::Telemetry),
             presence: Presence::Device,
+            enabled: true,
             gate: reading.gated_by().map(|reading| Gate::ReadingIsSet { reading }),
         })
     }
@@ -384,6 +392,7 @@ impl Entity {
             },
             source: Some(Source::Status),
             presence: Presence::Bridge,
+            enabled: true,
             gate: None,
         }
     }
@@ -406,6 +415,7 @@ impl Entity {
             shape: Shape::Reading(None),
             source: Some(Source::Status),
             presence: Presence::Bridge,
+            enabled: true,
             gate: None,
         }
     }
@@ -433,6 +443,7 @@ impl Entity {
             shape: Shape::Reading(None),
             source: Some(Source::Status),
             presence: Presence::Bridge,
+            enabled: true,
             gate: None,
         }
     }
@@ -454,6 +465,7 @@ impl Entity {
             shape: Shape::Reading(Some(StateClass::Measurement)),
             source: Some(Source::Config),
             presence: Presence::Device,
+            enabled: true,
             gate: None,
         }
     }
@@ -474,6 +486,7 @@ impl Entity {
             shape: Shape::Reading(None),
             source: Some(Source::Config),
             presence: Presence::Device,
+            enabled: true,
             gate: None,
         }
     }
@@ -501,6 +514,7 @@ impl Entity {
             shape: Shape::Action,
             source: Some(Source::Config),
             presence: Presence::Device,
+            enabled: true,
             gate: None,
         }
     }
@@ -534,6 +548,7 @@ impl Entity {
             }),
             source: None,
             presence: Presence::Device,
+            enabled: true,
             // Deliberately ungated. Writing a reading is what *makes* the device hold one, so gating this
             // on the device already holding one would leave the only way in permanently unavailable.
             // Whether a reading is in effect is reported by `meter_connected` beside it.
@@ -562,6 +577,7 @@ impl Entity {
             shape: Shape::Action,
             source: None,
             presence: Presence::Device,
+            enabled: true,
             // Nothing to withdraw when the device holds no reading.
             gate: Some(Gate::ReadingIsSet {
                 reading: METER_CONNECTED,
@@ -599,6 +615,7 @@ impl Entity {
             shape: Shape::Action,
             source: None,
             presence: Presence::Device,
+            enabled: true,
             gate: None,
         }
     }
@@ -623,6 +640,7 @@ impl Entity {
             shape: Shape::Reading(None),
             source: Some(Source::Status),
             presence: Presence::Device,
+            enabled: true,
             gate: None,
         }
     }
@@ -643,6 +661,7 @@ impl Entity {
             shape: Shape::Reading(None),
             source: Some(Source::Config),
             presence: Presence::Device,
+            enabled: true,
             gate: None,
         }
     }
@@ -666,6 +685,7 @@ impl Entity {
             shape: Shape::Reading(Some(StateClass::Measurement)),
             source: Some(Source::Telemetry),
             presence: Presence::Device,
+            enabled: true,
             gate: None,
         }
     }
@@ -691,6 +711,7 @@ impl Entity {
             shape: Shape::Reading(Some(StateClass::Measurement)),
             source: Some(Source::Telemetry),
             presence: Presence::Device,
+            enabled: true,
             gate: None,
         }
     }
@@ -718,6 +739,7 @@ impl Entity {
             shape: Shape::Signal { on: "1", off: "0" },
             source: Some(Source::Telemetry),
             presence: Presence::Device,
+            enabled: true,
             gate: None,
         }
     }
@@ -745,6 +767,7 @@ impl Entity {
             shape: Shape::Reading(None),
             source: Some(Source::Config),
             presence: Presence::Device,
+            enabled: true,
             gate: None,
         }
     }
@@ -1130,6 +1153,12 @@ const ACRONYMS: &[&str] = &["ac", "dc", "pv", "usb", "id", "ip"];
 /// Not in [`ACRONYMS`]: these are written short in the protocol and said long by people, so an entity name
 /// carrying the short form asks the reader to know the field name.
 const SPELLED: &[(&str, &str)] = &[("soc", "state of charge"), ("soh", "state of health")];
+
+/// Settings published switched off, because nothing is known to depend on them.
+///
+/// Not a judgement that the device ignores them, which is rarely provable — only that this project has
+/// measured no effect. Anyone who wants one enables it in Home Assistant.
+const DISABLED: &[&str] = &["ac_couple_enabled"];
 
 /// Fields whose name would read badly or understate what they do.
 ///
