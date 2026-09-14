@@ -250,7 +250,7 @@ jobs:
       - name: Lay out the build context
         run: |
           set -euo pipefail
-          chmod 0755 dist/*/heliobridge
+          find dist -type f -name heliobridge -exec chmod 0755 {} +
           cp LICENSE NOTICE dist/
           test -x dist/linux/amd64/heliobridge
           test -x dist/linux/arm64/heliobridge
