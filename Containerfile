@@ -3,12 +3,12 @@
 #
 # The build context is a directory of finished binaries, one per platform:
 #
-#     linux/amd64/heliobridge
+#     linux/amd64/heliobridge      already mode 0755, since COPY preserves what it is given
 #     linux/arm64/heliobridge
 #
-# so this file only copies. Nothing executes during the build, which is why `--platform
-# linux/amd64,linux/arm64` needs no QEMU. Compiling inside the image would need emulation for the
-# non-native architecture and take an order of magnitude longer.
+# plus LICENSE and NOTICE at its root. So this file only copies. Nothing executes during the build,
+# which is why `--platform linux/amd64,linux/arm64` needs no QEMU. Compiling inside the image would
+# need emulation for the non-native architecture and take an order of magnitude longer.
 FROM scratch
 
 # Provided by buildx. Declared so COPY can use it to pick the matching binary.
@@ -18,6 +18,9 @@ ARG TARGETPLATFORM
 # TLS roots are compiled in, and a private authority is supplied by mounting it and setting SSL_CERT_FILE.
 # So there is nothing here with a CVE feed and nothing to shell into.
 COPY ${TARGETPLATFORM}/heliobridge /heliobridge
+
+# Apache-2.0 requires both to travel with the work.
+COPY LICENSE NOTICE /
 
 # Numeric because there is no /etc/passwd to resolve a name against. 65532 is the conventional "nonroot"
 # uid, so it matches what people already grant on a volume.

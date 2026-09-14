@@ -245,6 +245,16 @@ jobs:
           merge-multiple: true
           path: dist
 
+      # upload-artifact stores a zip, which carries no Unix modes. Without this the image ships a
+      # /heliobridge the runtime refuses to exec -- which only shows when a container starts.
+      - name: Lay out the build context
+        run: |
+          set -euo pipefail
+          chmod 0755 dist/*/heliobridge
+          cp LICENSE NOTICE dist/
+          test -x dist/linux/amd64/heliobridge
+          test -x dist/linux/arm64/heliobridge
+
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
