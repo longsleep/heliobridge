@@ -450,7 +450,7 @@ impl<D: Registers + Describes> Link<D> {
 
         loop {
             // Recomputed each time round, because each frame moves it.
-            let quiet_at = self.arrived.and_then(|at| at.checked_add(self.options.offline_after));
+            let quiet_at = self.quiet_at();
 
             tokio::select! {
                 changed = self.generation.changed() => {
@@ -488,8 +488,8 @@ impl<D: Registers + Describes> Link<D> {
                 () = async move {
                     match quiet_at {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        // Nothing has arrived yet, so there is nothing this timer could change: the device
-                        // is already reported absent.
+                        // Either nothing has arrived yet, or the device has already been reported absent.
+                        // Both mean there is nothing this timer could change.
                         None => core::future::pending().await,
                     }
                 } => {
@@ -562,6 +562,21 @@ impl<D: Registers + Describes> Link<D> {
         self.publish_presence();
         self.publish_telemetry(&view);
         self.publish_gates();
+    }
+
+    /// When this device should be reported absent, if timing that is worth anything.
+    ///
+    /// `None` once it has been reported absent, and that is load-bearing rather than tidy. The link
+    /// recomputes this on every pass round its loop, and [`Self::went_quiet`] deliberately leaves
+    /// [`Self::arrived`] alone — so a deadline kept past the moment it fired would be re-armed on an
+    /// instant already behind us, complete as soon as it was awaited, and spin the link on a core until
+    /// the device came back. It would go unnoticed: every other branch is still served correctly, and
+    /// `went_quiet` is idempotent, so nothing is logged or published the second time.
+    fn quiet_at(&self) -> Option<Instant> {
+        self.present
+            .then_some(self.arrived)
+            .flatten()
+            .and_then(|at| at.checked_add(self.options.offline_after))
     }
 
     /// The device has been quiet too long.
@@ -1025,6 +1040,7 @@ mod tests {
     use core::time::Duration;
     use std::sync::Arc;
     use tokio::sync::{Notify, mpsc, watch};
+    use tokio::time::Instant;
 
     /// The device's own serial in these tests, matching the one used across the documentation.
     const DEVICE: &str = "0EXAMPLE00000001";
@@ -1086,6 +1102,14 @@ mod tests {
 
     /// A link over channels a test controls, already running.
     fn link(generation: Generation, options: PublisherOptions) -> Wire {
+        let (link, wire) = built_link(generation, options);
+        tokio::spawn(link.run());
+        wire
+    }
+
+    /// The same, before it is spawned — for the handful of assertions that are about a link's own state
+    /// rather than about what it publishes.
+    fn built_link(generation: Generation, options: PublisherOptions) -> (Link<Growatt>, Wire) {
         let (publications, published) = Publications::channel(256);
         let (telemetry, telemetry_rx) = watch::channel(None);
         let (settings, settings_rx) = watch::channel(Vec::new());
@@ -1095,41 +1119,38 @@ mod tests {
         let (farewell, farewells) = mpsc::channel(FAREWELL_DEPTH);
         let generation = watch::Sender::new(generation);
 
-        tokio::spawn(
-            Link {
-                driver: Arc::new(Growatt),
-                device: DEVICE.to_owned(),
-                session: SessionHandle {
-                    requests,
-                    settings: settings_rx,
-                    identity: identity_rx,
-                    telemetry: telemetry_rx,
-                    status: status_rx,
-                    accessory: watch::channel(None).1,
-                    stop: Arc::new(Notify::new()),
-                },
-                session_id: SessionId::sole(),
-                publications,
-                topics: Arc::new(Topics {
-                    instance: "attic".to_owned(),
-                    ..Topics::default()
-                }),
-                options,
-                generation: generation.subscribe(),
-                farewell,
-                published_for: None,
-                announced: None,
-                arrived: None,
-                last_update: None,
-                present: false,
-                fields: Fields::default(),
-                gates: HashMap::new(),
-                rest: RestWatch::default(),
-            }
-            .run(),
-        );
+        let link = Link {
+            driver: Arc::new(Growatt),
+            device: DEVICE.to_owned(),
+            session: SessionHandle {
+                requests,
+                settings: settings_rx,
+                identity: identity_rx,
+                telemetry: telemetry_rx,
+                status: status_rx,
+                accessory: watch::channel(None).1,
+                stop: Arc::new(Notify::new()),
+            },
+            session_id: SessionId::sole(),
+            publications,
+            topics: Arc::new(Topics {
+                instance: "attic".to_owned(),
+                ..Topics::default()
+            }),
+            options,
+            generation: generation.subscribe(),
+            farewell,
+            published_for: None,
+            announced: None,
+            arrived: None,
+            last_update: None,
+            present: false,
+            fields: Fields::default(),
+            gates: HashMap::new(),
+            rest: RestWatch::default(),
+        };
 
-        Wire {
+        let wire = Wire {
             published,
             generation,
             farewells,
@@ -1139,7 +1160,8 @@ mod tests {
                 _identity: identity,
                 _requests: requests_rx,
             },
-        }
+        };
+        (link, wire)
     }
 
     /// One session's ends, and the handle a registration would carry.
@@ -1413,6 +1435,41 @@ mod tests {
                 .any(|publication| publication.topic.ends_with("/state")),
             "nothing may be published as the device's current reading"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_device_already_reported_absent_arms_no_further_go_quiet_timer() {
+        // The deadline is recomputed on every pass round the link's loop and `went_quiet` leaves
+        // `arrived` alone, so keeping it armed after it has fired re-arms it on an instant already
+        // behind us -- which completes as soon as it is awaited and spins the link on a core.
+        //
+        // Asserted on the deadline rather than on what is published, because the spin is invisible from
+        // outside: `went_quiet` is idempotent, so the second pass says nothing, and the other branches
+        // are still served correctly. Nor can a test catch it by timing. Tokio's cooperative budget makes
+        // the loop yield every ~128 turns, so the runtime keeps making progress and paused time still
+        // advances; the only symptom is the CPU.
+        let (mut link, _wire) = built_link(Generation::default().next(), PublisherOptions::default());
+
+        assert_eq!(
+            link.quiet_at(),
+            None,
+            "nothing has arrived, so there is nothing to time"
+        );
+
+        link.arrived = Some(Instant::now());
+        link.present = true;
+        assert!(
+            link.quiet_at().is_some(),
+            "a device that is reporting is timed out of presence"
+        );
+
+        link.went_quiet();
+        assert!(!link.present, "the point of the timer firing");
+        assert_eq!(link.quiet_at(), None, "and nothing is armed to fire again");
+
+        link.arrived = Some(Instant::now());
+        link.present = true;
+        assert!(link.quiet_at().is_some(), "a device that comes back is timed again");
     }
 
     #[tokio::test(start_paused = true)]
