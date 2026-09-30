@@ -195,7 +195,7 @@ pub struct Config {
 
     /// How many schedule slots to read back and expose, 1–9.
     ///
-    /// The device has nine, each five registers. Nine would be 45 entities for hardware that in practice
+    /// The device has nine, each six registers. Nine would be 54 entities for hardware that in practice
     /// runs a single all-day slot, so the default keeps things readable while the capability stays
     /// available.
     #[arg(long, env = "HELIOBRIDGE_SLOTS", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=9))]

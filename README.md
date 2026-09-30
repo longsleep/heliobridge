@@ -37,7 +37,7 @@ The device talks to it, and Home Assistant both shows it and drives it.
 - **Optionally relays to the vendor cloud**, so the phone app keeps working — with a policy
   deciding how much authority the cloud keeps.
 - **Records raw frames** for later analysis, including the ones the relay policy refused.
-- **Publishes to Home Assistant** over your own broker, with MQTT autodiscovery. Seventy entities
+- **Publishes to Home Assistant** over your own broker, with MQTT autodiscovery. Eighty-five entities
   per device, derived from the register maps rather than from a second list, and two availability
   topics — this program's own as a last will, the device's own as a telemetry watchdog — so a reading
   goes `unavailable` instead of flat-lining when the device drops off. Nothing publishes a substitute
