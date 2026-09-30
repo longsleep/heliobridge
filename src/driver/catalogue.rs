@@ -24,7 +24,7 @@
 
 use core::fmt;
 
-use crate::model::{Raw, Register, Scaling, Unit, Value};
+use crate::model::{Raw, Register, Repeat, Scaling, Unit, Value};
 
 use super::wire::Wire;
 
@@ -51,6 +51,50 @@ pub enum Shape {
     Weekdays,
     /// Free text.
     Text,
+}
+
+impl Shape {
+    /// The raw register value a piece of text stands for, or `None` if it is not one this shape accepts.
+    ///
+    /// Written once and used twice: Home Assistant sends a setting's value as text on its command topic,
+    /// and the control API accepts the same text in a write body. Both then need the same answer, and the
+    /// shape is the only thing that knows it.
+    ///
+    /// Composition only — whether the composed value is *acceptable* is the driver's domain to say, and it
+    /// says so on the way to the device.
+    ///
+    /// A switch and a number have **no** text form: they are written as JSON numbers, and quoting one is a
+    /// caller's mistake worth reporting rather than coercing, since a register that holds whole watts
+    /// should not silently accept `"100"`.
+    pub fn parse(self, text: &str) -> Option<u16> {
+        match self {
+            Self::Switch | Self::Number { .. } => None,
+            Self::Text => text.trim().parse().ok(),
+            Self::Choice { labels } => {
+                let index = labels.iter().position(|known| *known == text.trim())?;
+                u16::try_from(index).ok()
+            }
+            Self::TimeOfDay => {
+                let (hours, minutes) = text.trim().split_once(':')?;
+                let hour: u16 = hours.parse().ok()?;
+                let minute: u16 = minutes.parse().ok()?;
+                hour.checked_mul(256)?.checked_add(minute)
+            }
+            Self::Weekdays => Repeat::parse(text).map(|repeat| u16::from(repeat.mask())),
+        }
+    }
+
+    /// What this shape accepts, for an error message.
+    pub fn accepts(self) -> String {
+        match self {
+            Self::Switch => "0 or 1".to_owned(),
+            Self::Number { min, max } => format!("a whole number {min}..={max}"),
+            Self::Choice { labels } => format!("one of {}", labels.join(", ")),
+            Self::TimeOfDay => "a time as \"HH:MM\"".to_owned(),
+            Self::Weekdays => "days as \"mon,tue\", or \"daily\" for every day".to_owned(),
+            Self::Text => "text".to_owned(),
+        }
+    }
 }
 
 /// One setting a device holds and can be asked to change.
@@ -269,5 +313,50 @@ impl ConfigField for Undocumented {
 
     fn name(&self) -> &'static str {
         "unknown"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Shape;
+
+    /// The labels a work-mode choice offers, standing in for a driver's own.
+    const MODES: &[&str] = &["load_first", "battery_first", "smart_self_use"];
+
+    #[test]
+    fn a_shape_parses_the_text_a_read_would_render() {
+        assert_eq!(Shape::TimeOfDay.parse("23:59"), Some(0x173B));
+        assert_eq!(Shape::Weekdays.parse("mon,wed"), Some(5));
+        assert_eq!(Shape::Weekdays.parse("daily"), Some(0));
+        assert_eq!(Shape::Choice { labels: MODES }.parse("battery_first"), Some(1));
+    }
+
+    #[test]
+    fn a_switch_and_a_number_have_no_text_form() {
+        // Deliberate: a register holding whole watts should not quietly accept `"100"`, because a quoted
+        // number is a caller confusing a string for a value rather than a shorthand worth supporting.
+        assert_eq!(Shape::Switch.parse("1"), None);
+        assert_eq!(Shape::Number { min: 0, max: 1000 }.parse("100"), None);
+    }
+
+    #[test]
+    fn text_that_names_nothing_is_refused_rather_than_coerced() {
+        assert_eq!(Shape::TimeOfDay.parse("2359"), None);
+        assert_eq!(Shape::Weekdays.parse("mon,funday"), None);
+        assert_eq!(Shape::Choice { labels: MODES }.parse("vpp"), None);
+    }
+
+    #[test]
+    fn every_shape_says_what_it_accepts() {
+        for shape in [
+            Shape::Switch,
+            Shape::Number { min: 0, max: 10 },
+            Shape::Choice { labels: MODES },
+            Shape::TimeOfDay,
+            Shape::Weekdays,
+            Shape::Text,
+        ] {
+            assert!(!shape.accepts().is_empty(), "{shape:?}");
+        }
     }
 }

@@ -99,7 +99,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::driver::accessories::{Enrolled, Enrols};
-use crate::driver::catalogue::{Catalogue, ConfigField, Setting as SettingInfo};
+use crate::driver::catalogue::{Catalogue, ConfigField, Setting as SettingInfo, Shape};
 use crate::driver::commands::Command;
 use crate::model::{Raw, Register};
 
@@ -1042,7 +1042,22 @@ impl Drop for Registration {
 /// A value to write.
 #[derive(Debug, Deserialize)]
 struct WriteBody {
-    value: u16,
+    value: WriteValue,
+}
+
+/// What a write body may carry.
+///
+/// A number is the register as the device holds it. A string is the same rendering a read gives back, so
+/// `{"value": "23:59"}` and `{"value": "mon,wed"}` work, and a caller need not know that a slot boundary
+/// is `HH << 8 | MM`. Which strings mean anything is [`Shape::parse`]'s answer, shared with the Home
+/// Assistant command topic so the two cannot drift.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum WriteValue {
+    /// The raw register value.
+    Raw(u16),
+    /// The value as a read would render it.
+    Text(String),
 }
 
 /// Start serving the control API.
@@ -1091,7 +1106,10 @@ pub fn listen<D: Catalogue + Enrols>(path: &Path, registry: Registry, driver: Ar
         .route("/devices/{device}/telemetry", get(Api::telemetry))
         .route("/devices/{device}/telemetry/{key}", get(Api::reading))
         .route("/devices/{device}/settings", get(Api::settings))
-        .route("/devices/{device}/settings/{key}", get(Api::setting).put(Api::write))
+        .route(
+            "/devices/{device}/settings/{key}",
+            get(Api::setting).put(Api::write::<D>),
+        )
         .route("/devices/{device}/settings/{key}/read", post(Api::refresh))
         .route("/devices/{device}/actions", get(Api::actions::<D>))
         .route("/devices/{device}/actions/{key}", post(Api::act::<D>))
@@ -1482,13 +1500,37 @@ impl Api {
     }
 
     /// Write a setting and report what the device ended up holding.
-    async fn write(
+    async fn write<D: Catalogue>(
+        State(state): State<ApiState<D>>,
         Session { handle, .. }: Session,
         setting: Setting,
         body: Result<axum::Json<WriteBody>, axum::extract::rejection::JsonRejection>,
     ) -> Response {
         let Ok(axum::Json(body)) = body else {
             return problem(StatusCode::BAD_REQUEST, r#"expected a body like {"value":100}"#);
+        };
+
+        // A register addressed by number has no catalogue entry and so no shape; a raw value is the only
+        // thing that could be meant for it anyway.
+        let shape = state
+            .driver
+            .setting(setting.register)
+            .map(|entry| SettingInfo::shape(&entry));
+        let value = match body.value {
+            WriteValue::Raw(raw) => raw,
+            WriteValue::Text(text) => {
+                let Some(raw) = shape.and_then(|shape| shape.parse(&text)) else {
+                    let accepts = shape.map_or_else(
+                        || "a whole number, since this register has no named shape".to_owned(),
+                        Shape::accepts,
+                    );
+                    return problem(
+                        StatusCode::BAD_REQUEST,
+                        &format!("{:?} is not a value for {}: expected {accepts}", text, setting.key),
+                    );
+                };
+                raw
+            }
         };
 
         // `set` rather than `write`, so `default_output_power` goes out as the `321..322` range the vendor
@@ -1499,7 +1541,7 @@ impl Api {
             &handle,
             Action::Apply(Command::Set {
                 register: setting.register,
-                value: body.value,
+                value,
             }),
         )
         .await

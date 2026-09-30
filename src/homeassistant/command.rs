@@ -23,7 +23,7 @@ use snafu::Snafu;
 use crate::driver::catalogue::{Catalogue, ConfigField, Setting, Shape};
 use crate::driver::commands::Command;
 use crate::homeassistant::entity::{METER_READING, PAIR_LORA_ACCESSORY, WITHDRAW_METER_READING};
-use crate::model::{Register, Repeat};
+use crate::model::Register;
 
 /// What a command topic is allowed to change.
 ///
@@ -189,7 +189,7 @@ impl Change {
 
         let raw = raw_value(&setting, value).ok_or_else(|| CommandError::Shape {
             key: key.to_owned(),
-            expected: describe(setting.shape()),
+            expected: setting.shape().accepts(),
             got: rendered(value),
         })?;
 
@@ -331,50 +331,23 @@ impl Change {
 }
 
 /// The raw register value a JSON value means for this setting, or `None` if it is the wrong shape.
+///
+/// Text is handed to [`Shape::parse`], which the control API uses as well, so the two surfaces cannot
+/// come to disagree about what `"mon,wed"` or `"23:59"` means.
 fn raw_value(setting: &impl Setting, value: &Value) -> Option<u16> {
-    match setting.shape() {
+    let shape = setting.shape();
+    match value {
         // A switch's payloads are written out in its discovery message as `{"key": 1}` and `{"key": 0}`. A
         // JSON boolean is accepted too, since a hand-written command is the obvious place for one.
-        Shape::Switch => match value {
-            Value::Bool(flag) => Some(u16::from(*flag)),
-            _ => number(value).filter(|raw| *raw <= 1),
+        Value::Bool(flag) if shape == Shape::Switch => Some(u16::from(*flag)),
+        Value::String(text) => shape.parse(text),
+        // Integers only. A fractional value in a register that holds whole watts is a mistake in the
+        // caller, and truncating it silently would store something they did not ask for.
+        _ => match shape {
+            Shape::Switch => u16::try_from(value.as_u64()?).ok().filter(|raw| *raw <= 1),
+            Shape::Number { .. } => u16::try_from(value.as_u64()?).ok(),
+            Shape::Choice { .. } | Shape::Text | Shape::TimeOfDay | Shape::Weekdays => None,
         },
-        Shape::Number { .. } => number(value),
-        Shape::Choice { labels } => {
-            let label = value.as_str()?;
-            let index = labels.iter().position(|known| *known == label)?;
-            u16::try_from(index).ok()
-        }
-        Shape::Text => value.as_str().and_then(|text| text.parse().ok()),
-        // Composed rather than validated here, as for a time: the domain decides what is acceptable.
-        Shape::Weekdays => Repeat::parse(value.as_str()?).map(|repeat| u16::from(repeat.mask())),
-        Shape::TimeOfDay => {
-            let (hours, minutes) = value.as_str()?.split_once(':')?;
-            let hour: u16 = hours.parse().ok()?;
-            let minute: u16 = minutes.parse().ok()?;
-            // Composed rather than validated here: the domain decides what is acceptable, and it is the
-            // same check the encoder applies.
-            hour.checked_mul(256)?.checked_add(minute)
-        }
-    }
-}
-
-/// A JSON number as a register value.
-fn number(value: &Value) -> Option<u16> {
-    // Integers only. A fractional value in a register that holds whole watts is a mistake in the caller,
-    // and truncating it silently would store something they did not ask for.
-    u16::try_from(value.as_u64()?).ok()
-}
-
-/// What a setting accepts, for an error message.
-fn describe(shape: Shape) -> String {
-    match shape {
-        Shape::Switch => "0 or 1".to_owned(),
-        Shape::Number { min, max } => format!("a whole number {min}..={max}"),
-        Shape::Choice { labels } => format!("one of {}", labels.join(", ")),
-        Shape::TimeOfDay => "a time as \"HH:MM\"".to_owned(),
-        Shape::Weekdays => "days as \"mon,tue\", or \"daily\" for every day".to_owned(),
-        Shape::Text => "text".to_owned(),
     }
 }
 
