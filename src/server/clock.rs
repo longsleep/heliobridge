@@ -22,10 +22,20 @@
 //! TZ=Europe/Berlin heliobridge
 //! ```
 //!
-//! The case that bites is a container: images default to UTC, so an operator who does not set `TZ` sends
-//! UTC to a device on local time. [`Skew::timezone_hint`] recognises that shape and says so, because
-//! "your clock is 7200 s off" is a fact while "this looks like a timezone offset, check TZ" is a
-//! diagnosis.
+//! # Where the zone is looked up
+//!
+//! The host's zone database is preferred, and a copy compiled into this binary stands in when the host
+//! has none. That order matters: the host's is the one the operator maintains, so it wins whenever it
+//! can answer.
+//!
+//! `chrono::Local` cannot report that it failed — with no database to read it returns UTC, which is a
+//! valid answer and an indistinguishable one. So [`Zone::current`] looks for the named zone's file
+//! first and only falls back when it is absent, rather than comparing offsets and guessing.
+//!
+//! An unresolvable zone still leaves the clock on UTC, and a device told UTC runs its schedule a whole
+//! offset out. [`Skew::timezone_hint`] recognises that shape in the device's own reported time and says
+//! so, because "your clock is 7200 s off" is a fact while "this looks like a timezone offset, check TZ"
+//! is a diagnosis.
 
 use core::fmt;
 
@@ -69,11 +79,74 @@ impl fmt::Debug for Clock {
     }
 }
 
-/// Local time from the host's clock and timezone.
+/// Where local time is looked up.
+///
+/// Resolved once, on first use, because it cannot change while the process runs and probing the
+/// filesystem on every clock read would be wasteful.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Zone {
+    /// The host's database, through `chrono::Local`.
+    Host,
+    /// A zone named by `TZ`, from the database compiled into this binary.
+    BuiltIn(chrono_tz::Tz),
+}
+
+impl Zone {
+    /// The zone to render local time in.
+    pub fn current() -> Self {
+        static RESOLVED: std::sync::OnceLock<Zone> = std::sync::OnceLock::new();
+        *RESOLVED.get_or_init(Self::resolve)
+    }
+
+    /// The current time in this zone, as an offset from UTC.
+    pub fn now(self) -> chrono::DateTime<chrono::FixedOffset> {
+        match self {
+            Self::Host => chrono::Local::now().fixed_offset(),
+            Self::BuiltIn(tz) => chrono::Utc::now().with_timezone(&tz).fixed_offset(),
+        }
+    }
+
+    /// Prefer the host's database; fall back to the compiled-in one only when it cannot answer.
+    fn resolve() -> Self {
+        // A leading colon is legal in `TZ` and names the same zone.
+        let Ok(name) = std::env::var("TZ") else {
+            return Self::Host;
+        };
+        let name = name.strip_prefix(':').unwrap_or(&name);
+
+        if Self::host_holds(name) {
+            return Self::Host;
+        }
+        if let Ok(tz) = name.parse::<chrono_tz::Tz>() {
+            tracing::info!(zone = name, "no zone database on this host; using the one compiled in");
+            return Self::BuiltIn(tz);
+        }
+
+        // Neither database knows it. `chrono::Local` will answer UTC, which is the same answer an unset
+        // `TZ` gets, so say which zone was asked for.
+        tracing::warn!(
+            zone = name,
+            "TZ names a zone neither the host nor this binary knows; local time will be UTC, and the \
+             device will be told UTC"
+        );
+        Self::Host
+    }
+
+    /// Whether the host's database holds this zone.
+    fn host_holds(name: &str) -> bool {
+        // The directories the platform searches, in its own order. A zone is a file under one of them,
+        // named exactly as `TZ` spells it.
+        ["/usr/share/zoneinfo", "/usr/share/lib/zoneinfo", "/etc/zoneinfo"]
+            .iter()
+            .any(|root| std::path::Path::new(root).join(name).is_file())
+    }
+}
+
+/// Local time from the host's clock and the resolved zone.
 fn system_local() -> Timestamp {
     use chrono::{Datelike as _, Timelike as _};
 
-    let now = chrono::Local::now();
+    let now = Zone::current().now();
     Timestamp {
         // `year()` is an i32 covering negative years; a value outside `u16` would need a system clock set
         // before year 0 or after 65535, and clamping beats refusing to send a push.
@@ -166,8 +239,39 @@ impl fmt::Display for Skew {
 
 #[cfg(test)]
 mod tests {
-    use super::{Clock, Skew};
+    use super::{Clock, Skew, Zone};
     use crate::model::Timestamp;
+
+    #[test]
+    fn the_compiled_in_database_answers_a_zone_the_host_may_not_have() {
+        // The point of carrying it: a named zone resolves to a real offset with nothing read from disk.
+        let berlin: chrono_tz::Tz = "Europe/Berlin".parse().expect("a zone the database carries");
+        let offset = Zone::BuiltIn(berlin).now().offset().local_minus_utc();
+        assert!(
+            offset == 3600 || offset == 7200,
+            "Berlin is one or two hours ahead depending on the season, got {offset} s"
+        );
+    }
+
+    #[test]
+    fn the_host_database_is_recognised_when_it_holds_the_zone() {
+        // Not asserting which way it goes: a machine without a zone database is a valid machine, and
+        // this test runs on both. Only that the answer agrees with whether the file is there.
+        let present = std::path::Path::new("/usr/share/zoneinfo/Europe/Berlin").is_file();
+        assert_eq!(Zone::host_holds("Europe/Berlin"), present);
+    }
+
+    #[test]
+    fn a_zone_the_host_does_not_hold_is_not_claimed() {
+        assert!(!Zone::host_holds("Nowhere/Invented"));
+    }
+
+    #[test]
+    fn the_host_zone_still_produces_a_reading() {
+        // Whatever the host is configured as, asking it for the time must work rather than panic.
+        let year = Zone::Host.now().format("%Y").to_string();
+        assert_eq!(year.len(), 4, "got {year}");
+    }
 
     fn stamp(hour: u8, minute: u8, second: u8) -> Timestamp {
         Timestamp {

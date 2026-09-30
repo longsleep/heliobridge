@@ -549,7 +549,7 @@ impl<D: Registers + Describes> Link<D> {
         // Arrival here rather than the device's own clock, which is set by whoever pushed it last and has
         // been seen disagreeing. A staleness sensor that jumps because the device is wrong about the time
         // is worse than none.
-        self.last_update = Some(chrono::Local::now().to_rfc3339());
+        self.last_update = Some(crate::server::clock::Zone::current().now().to_rfc3339());
 
         // A pack count that has changed adds or removes per-pack entities, so this comes first.
         self.announce();

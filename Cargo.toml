@@ -27,6 +27,9 @@ clap = { version = "4.6", features = ["derive", "env"] }
 # Local wall-clock time for the server time push. The device is sent *local* time, matching its own
 # clock, so a timezone-aware conversion is needed rather than arithmetic on a Unix timestamp.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# The zone database, compiled in, so `TZ` resolves without one on the host. `chrono::Local` reads the
+# host's database and falls back to UTC when there is none.
+chrono-tz = { version = "0.10", default-features = false }
 tokio-stream = "0.1"    # the Stream trait (re-exported) and ReceiverStream
 async-stream = "0.3"    # authoring a Stream from async code; the config cursor is a generator
 tokio = { version = "1", features = [
