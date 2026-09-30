@@ -278,7 +278,7 @@ impl InputRegister {
 /// `Entry` is a local alias for [`InputRegister`], so that each row of the table fits on one line and
 /// the table stays scannable against the specification's appendix.
 pub const INPUT_REGISTERS: &[InputRegister] = {
-    use Confidence::{Inferred, Observed, Verified};
+    use Confidence::{Inferred, Observed, Vendor, Verified};
     use InputRegister as Entry;
     use Unit::{Ampere, Celsius, KilowattHour, None as NoUnit, Percent, Volt, Watt};
 
@@ -305,6 +305,11 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::float(11, "battery_charge_power", Watt, Scaling::SIGNED, Verified),
         Entry::int(12, "battery_pack_count", Observed),
         Entry::float(13, "battery_soc_total", Percent, Scaling::UNIT, Verified),
+        // 14 and 15 are the BMS's `HeatState` and `APPGuZhangState` — the pack heater and the battery's
+        // app-facing fault word. Named here rather than published: both read zero in every one of the
+        // 408 145 telemetry frames captured from this device, which has no heated pack. A pack that has
+        // one would move 14, and that is the moment to give them entries.
+        //
         // Household draw: the meter reading minus AC power. Two's complement rather than offset-encoded,
         // and negative whenever the house exports more than the device produces. Register 17 excludes load
         // measured through interconnected vendor smart plugs; with none attached the two are equal.
@@ -316,6 +321,10 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
             Scaling::TWOS_COMPLEMENT,
             Inferred,
         ),
+        // The device's own report of whether it is running off-grid, as against `off_grid_mode` (holding
+        // register 327), which is what it was told to do. The sub-MCU copies 327 straight into this, so a
+        // disagreement means the write has not taken effect yet rather than that the device refused.
+        Entry::int(18, "off_grid_mode_active", Observed),
         // A smart meter's own measurement of grid flow, positive on import. Zero whenever no meter is
         // reporting, whatever the real grid current. Register 20 is adjacent and identically shaped but
         // stays at zero even with a meter reading present.
@@ -369,6 +378,12 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::float(81, "unknown_81", NoUnit, Scaling::UNIT, Inferred),
         // 82 is the half that behaves consistently: it advances with AC output and ignores grid import.
         Entry::float(82, "ac_output_energy_today", KilowattHour, Scaling::TENTHS, Observed),
+        // The vendor's interconnected smart plugs, which the sub-MCU calls `APP_SMART_CONNECT_FLAG` and
+        // `APP_SMART_POWER`. 89 is not merely related to `household_load_excl_groplug` — it is the term
+        // that field subtracts: register 17 is register 16 minus this one. Both stay at zero for an
+        // installation with no plugs, which is what makes the two household figures equal there.
+        Entry::int(88, "smart_plug_connected", Vendor),
+        Entry::float(89, "smart_plug_power", Watt, Scaling::UNIT, Vendor),
         Entry::float(90, "charge_limit_upper", Percent, Scaling::UNIT, Verified),
         Entry::float(91, "charge_limit_lower", Percent, Scaling::UNIT, Verified),
         Entry::float(92, "pv1_voltage", Volt, Scaling::HUNDREDTHS, Observed),
@@ -395,13 +410,33 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::float(109, "off_grid_voltage", Volt, Scaling::TENTHS, Verified),
         Entry::float(110, "off_grid_current", Ampere, Scaling::new(0.01, -300.0), Verified),
         Entry::float(111, "off_grid_power", Watt, Scaling::new(0.1, -3000.0), Verified),
-        Entry::float(112, "unknown_112", NoUnit, Scaling::UNIT, Inferred),
+        // The pack voltage, and the other half of the DC-side measurement `battery_current` begins.
+        // Identified against the cells rather than from the firmware, which does not copy the BMS's
+        // `VoltageSum` anywhere: it holds to 16 × the mean cell voltage in 99.85 % of 408 402 frames,
+        // over a 22.0 to 58.3 V span, which no setpoint would do. The median ratio of 0.9964 is the mean
+        // of the highest and lowest cell overstating the true mean, not an error in the scale.
+        Entry::float(112, "battery_voltage", Volt, Scaling::TENTHS, Observed),
+        // The inverter's own temperature, which the sub-MCU calls `INV_TEMP` and biases the same way it
+        // biases the pack temperatures. Distinct from `device_temp`: across the capture this runs
+        // 11.8 to 74.7 °C while `device_temp` sits near 30 °C, which is a heatsink against a board.
+        Entry::float(113, "inverter_temp", Celsius, Scaling::KELVIN_TENTHS, Observed),
         Entry::float(114, "unknown_114", NoUnit, Scaling::UNIT, Inferred),
         Entry::float(115, "grid_voltage", Volt, Scaling::HUNDREDTHS, Observed),
         // The on-grid half: zero while the device runs off-grid, which is what separates it from
         // register 5. Register 5 reports whichever output is live; this one only the grid.
         Entry::float(116, "on_grid_power", Watt, Scaling::new(0.1, -3000.0), Verified),
-        Entry::float(117, "unknown_117", NoUnit, Scaling::SIGNED, Inferred),
+        // Grid current, and the sign is the opposite of `ac_power`'s. Dividing `ac_power` by it gives
+        // 230.4 V against a measured grid voltage of 233.1 V, which is what fixes the hundredth-amp
+        // scale. It carries no information `ac_power` does not — the two correlate at −0.9994 — so it is
+        // here to be correct rather than because a dashboard needs it.
+        Entry::float(117, "grid_current", Ampere, Scaling::new(0.01, -300.0), Observed),
+        // The battery's own current, and with `battery_voltage` the whole of what this device measures on
+        // the DC side: `battery_charge_power` is taken on the AC side of the converter, and
+        // `battery_soc_total` comes from a gauge that drifts. Positive while charging, and ±17.6 A at the
+        // extremes — which at pack voltage is the 800 to 1000 W the hardware is rated for, and is what
+        // settles the scale as tenths of an amp rather than hundredths or units. Multiplied by 112 it
+        // tracks `battery_charge_power` at 0.9989, the two differing by the converter's losses.
+        Entry::float(118, "battery_current", Ampere, Scaling::new(0.1, -3000.0), Observed),
         // Four component versions in two registers, one per octet. Together with the datalogger's own
         // version they make the six-field string the vendor identifies a release by; see
         // `super::version`. Not published as entities in their own right — the assembled version is.
