@@ -2197,20 +2197,27 @@ impl Api {
         let enrolled = Self::read_enrolled(&handle, driver).await;
         let entry = enrolled.into_iter().find(|entry| entry.serial == Some(serial));
 
-        axum::Json(serde_json::json!({
-            "serial": serial.to_string(),
-            "mac": driver.accessory_mac(serial),
-            "access": access,
-            "state": entry.as_ref().map(|entry| entry.state_label),
-            "state_code": entry.as_ref().map(|entry| entry.state),
-            "address": entry.as_ref().and_then(|entry| entry.address.clone()),
-            // Null rather than false when the accessory is not in the list at all: the reading being in use
-            // is a fact about the device's meter, and reporting it for an accessory the device never
-            // enrolled would answer a different question than the one asked.
-            "in_use": entry.as_ref().map(|_| waited.0),
-            "waited_seconds": waited.1.as_secs(),
-        }))
-        .into_response()
+        // Absent from the list means the device never enrolled it, which is a failure however ordinary the
+        // exchange looked. Reported as 409 for the same reason the delete is: the request was carried out
+        // and the device did not do it, and a 200 here would read as success.
+        let code = carried_out(entry.is_some());
+        (
+            code,
+            axum::Json(serde_json::json!({
+                "serial": serial.to_string(),
+                "mac": driver.accessory_mac(serial),
+                "access": access,
+                "state": entry.as_ref().map(|entry| entry.state_label),
+                "state_code": entry.as_ref().map(|entry| entry.state),
+                "address": entry.as_ref().and_then(|entry| entry.address.clone()),
+                // Null rather than false when the accessory is not in the list at all: the reading being in
+                // use is a fact about the device's meter, and reporting it for an accessory the device never
+                // enrolled would answer a different question than the one asked.
+                "in_use": entry.as_ref().map(|_| waited.0),
+                "waited_seconds": waited.1.as_secs(),
+            })),
+        )
+            .into_response()
     }
 
     /// One enrolled accessory, by the number its entry carries.
@@ -2284,15 +2291,29 @@ impl Api {
         }
 
         let entries = Self::read_enrolled_after(&handle, driver, &before).await;
+
+        // The read-back gives up on a deadline and returns what it has, so an unchanged list is how "the
+        // device never acted" looks — indistinguishable from success unless it is checked. Seen for real:
+        // a delete issued into a session that was about to drop was answered 200 with the accessory still
+        // paired, and only took when reissued. `dispatch` settled the convention for the same situation on
+        // a setting write, and this follows it: carried out, not done, is 409 rather than 200.
+        let acted = entries != before;
         let in_use = Self::reading_is_set(&handle, driver.accessory_in_use_reading());
         let reported = handle.accessory.borrow().clone();
         let accessories = Self::describe_all(driver, Transport::Network, entries, reported.as_ref(), in_use);
-        axum::Json(serde_json::json!({
-            "accessories": accessories,
-            "detail": "a delete tombstones the entry rather than removing it; a later search revives it in \
-                       place, keeping its number",
-        }))
-        .into_response()
+        let detail = if acted {
+            "a delete tombstones the entry rather than removing it; a later search revives it in place, \
+             keeping its number"
+        } else {
+            "the delete was sent and the device did not act on it; the entry is unchanged. A session that \
+             drops mid-command does this, and reissuing it against a live session is the remedy"
+        };
+        let code = carried_out(acted);
+        (
+            code,
+            axum::Json(serde_json::json!({ "accessories": accessories, "detail": detail })),
+        )
+            .into_response()
     }
 
     /// The service and type a search body names, or the problem to answer with.
@@ -2475,6 +2496,21 @@ impl Api {
     }
 }
 
+/// The status for a command whose effect is judged by reading the device back.
+///
+/// The read-back gives up on a deadline and returns what it has, so "the device never acted" arrives
+/// looking exactly like success unless it is checked. [`dispatch`] settles the answer for a setting write;
+/// accessory pairing and deletion are the same shape and answer the same way, from here, so the three
+/// cannot drift apart.
+const fn carried_out(acted: bool) -> StatusCode {
+    if acted {
+        StatusCode::OK
+    } else {
+        // Carried out, and not done. 409 says that more precisely than either 200 or 500.
+        StatusCode::CONFLICT
+    }
+}
+
 /// Hand an action to a session and render its outcome as HTTP.
 async fn dispatch(handle: &SessionHandle, action: Action) -> Response {
     match handle.carry_out(action).await {
@@ -2530,7 +2566,10 @@ fn problem(code: StatusCode, detail: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{Api, Duration, Outcome, Registry, Searches, SessionHandle, SettingView, StatusView, resolve};
+    use super::{
+        Api, Duration, Outcome, Registry, Searches, SessionHandle, SettingView, StatusCode, StatusView, carried_out,
+        resolve,
+    };
     use crate::driver::catalogue::Catalogue as _;
     use crate::growatt::driver::Growatt;
     use crate::model::{Raw, Register};
@@ -2907,6 +2946,16 @@ mod tests {
         assert!(outcome.confirmed);
         assert_eq!(outcome.requested, None);
         assert_eq!(outcome.stored, Some(800));
+    }
+
+    #[test]
+    fn a_command_the_device_did_not_act_on_is_a_conflict_not_a_success() {
+        // The read-back cannot distinguish "not yet" from "never" once its deadline passes, so the check is
+        // the only thing standing between a caller and a silent no-op. Observed on a live device: an
+        // accessory delete answered 200 with the accessory still paired, because the session dropped
+        // mid-command. Shared with the setting-write path so the three routes answer alike.
+        assert_eq!(carried_out(true), StatusCode::OK);
+        assert_eq!(carried_out(false), StatusCode::CONFLICT);
     }
 
     #[test]
