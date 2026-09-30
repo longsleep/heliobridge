@@ -180,6 +180,9 @@ pub const SOC_CREDIBLE: &str = "battery_soc_credible";
 /// The reading that says whether the device currently has a meter reporting.
 pub const METER_CONNECTED: &str = "meter_connected";
 
+/// The reading that says whether the device is actually running off-grid, as against told to.
+pub const OFF_GRID_ACTIVE: &str = "off_grid_mode_active";
+
 /// The control that supplies a meter reading to the device.
 pub const METER_READING: &str = "supplied_meter_reading";
 
@@ -346,8 +349,8 @@ impl Entity {
         // A flags word and a label share this much: neither is a quantity, so neither may carry a unit, a
         // device class or a state class. `0` faults is not a measurement of nothing.
         let flags = is_flags(reading.name());
-        let signal = is_signal(reading.name());
-        let numeric = !flags && !signal && matches!(reading.shape(), Control::Number { .. });
+        let signal = signal_class(reading.name());
+        let numeric = !flags && signal.is_none() && matches!(reading.shape(), Control::Number { .. });
         let device_class = numeric
             .then(|| device_class(reading.name(), reading.unit()))
             .flatten()
@@ -356,18 +359,18 @@ impl Entity {
         Some(Self {
             key: reading.name(),
             name: label(reading.name()),
-            component: if signal {
+            component: if signal.is_some() {
                 Component::BinarySensor
             } else {
                 Component::Sensor
             },
-            device_class: if signal { Some("connectivity") } else { device_class },
+            device_class: signal.or(device_class),
             unit: numeric.then(|| symbol(reading.unit())).flatten(),
             category: diagnostic(reading.name()),
             precision: numeric.then(|| precision(reading.scaling())),
             shape: if flags {
                 Shape::Flags
-            } else if signal {
+            } else if signal.is_some() {
                 Shape::Signal { on: "1", off: "0" }
             } else {
                 Shape::Reading(numeric.then(|| state_class(device_class)))
@@ -1040,13 +1043,21 @@ fn is_flags(name: &str) -> bool {
     name.ends_with("_faults")
 }
 
-/// Whether a reading is a 0/1 condition rather than a quantity.
+/// Whether a reading is a 0/1 condition rather than a quantity, and the device class that says which.
 ///
 /// Named rather than derived, for the same reason as [`is_flags`]: the register map says a value is a
 /// 16-bit integer, and only this knows that it is really a yes or no. A binary sensor rather than a sensor
 /// reading `0`, so an automation can ask `is_state(..., 'on')`.
-fn is_signal(name: &str) -> bool {
-    name == METER_CONNECTED
+///
+/// The class carries as much as the shape does, because Home Assistant writes the state in its words:
+/// `connectivity` reads *Connected*, which is what a meter either is, and `running` reads *Running*,
+/// which is what a mode the device has entered either is. Neither sentence fits the other reading.
+fn signal_class(name: &str) -> Option<&'static str> {
+    match name {
+        METER_CONNECTED => Some("connectivity"),
+        OFF_GRID_ACTIVE => Some("running"),
+        _ => None,
+    }
 }
 
 /// How many decimals a reading resolves, from the scaling that produced it.
@@ -1087,7 +1098,13 @@ fn diagnostic(name: &str) -> Option<Category> {
         // Per-cell voltages describe the pack's internals. Useful when investigating one, noise beside a
         // reading of what the house is doing.
         || name.contains("cell")
-        || name.contains("fault");
+        || name.contains("fault")
+        // The vendor's smart plugs, on the same footing as the other accessories: something an
+        // installation either has or has not, and zero throughout for one that has not.
+        || name.starts_with("smart_plug")
+        // A readback of a setting Home Assistant already offers as a switch. It earns a place for the
+        // moment the two disagree, not a place on the dashboard beside the switch itself.
+        || name == OFF_GRID_ACTIVE;
     equipment.then_some(Category::Diagnostic)
 }
 
@@ -1207,13 +1224,18 @@ const NAMED: &[(&str, &str)] = &[
     ("output_faults", "Output fault flags"),
     ("device_temp", "Device temperature"),
     ("battery1_temp", "Battery temperature"),
+    ("inverter_temp", "Inverter temperature"),
     ("wifi_signal", "Wi-Fi signal"),
+    ("off_grid_mode_active", "Off-grid mode active"),
+    ("smart_plug_power", "Smart plug load"),
+    ("smart_plug_connected", "Smart plugs connected"),
 ];
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Catalogue, Category, Component, Entity, Gate, METER_CONNECTED, Shape, Source, StateClass, VERSION_PARTS,
+        Catalogue, Category, Component, Entity, Gate, METER_CONNECTED, OFF_GRID_ACTIVE, Shape, Source, StateClass,
+        VERSION_PARTS,
     };
     use crate::growatt::driver::Growatt;
     use crate::growatt::v7::registers::{
@@ -1565,7 +1587,15 @@ mod tests {
         // Confidence used to decide this, which filed most of the device under diagnostics — every pack's
         // state of charge but the first, every string's voltage, the cycle count. Those are the readings a
         // dashboard is built from.
-        for key in ["internal_faults", "battery_cell_voltage_max"] {
+        for key in [
+            "internal_faults",
+            "battery_cell_voltage_max",
+            // An accessory an installation either has or has not, and the readback of a switch that is
+            // already on the page.
+            "smart_plug_connected",
+            "smart_plug_power",
+            "off_grid_mode_active",
+        ] {
             assert_eq!(reading(key).category, Some(Category::Diagnostic), "{key}");
         }
         for key in [
@@ -1573,7 +1603,10 @@ mod tests {
             "pv1_voltage",
             "pv1_current",
             "device_temp",
+            "inverter_temp",
             "grid_voltage",
+            "grid_current",
+            "battery_current",
             "battery_cycles",
             "battery_soh",
             "battery_charge_status",
@@ -1584,6 +1617,48 @@ mod tests {
         ] {
             assert_eq!(reading(key).category, None, "{key} belongs on the dashboard");
         }
+    }
+
+    #[test]
+    fn the_battery_current_is_the_only_reading_taken_on_the_dc_side() {
+        // Its point is that it is not `battery_charge_power`, which is measured past the converter, nor
+        // the state of charge, which comes from a gauge that drifts. Tenths of an amp, signed on 30 000,
+        // and it has to survive as a current rather than picking up the percentage or power treatment.
+        let current = reading("battery_current");
+        assert_eq!(current.device_class, Some("current"));
+        assert_eq!(current.unit, Some("A"));
+        assert_eq!(current.precision, Some(1));
+        assert_eq!(current.shape, Shape::Reading(Some(StateClass::Measurement)));
+
+        // Its other half, which makes DC power a multiplication rather than a guess at the cell count.
+        let volts = reading("battery_voltage");
+        assert_eq!(volts.device_class, Some("voltage"));
+        assert_eq!(volts.unit, Some("V"));
+        assert_eq!(volts.precision, Some(1));
+        assert_eq!(volts.category, None, "the pack voltage belongs on the dashboard");
+
+        // The inverter's temperature is a second temperature, not a rename of the device's.
+        assert_eq!(reading("inverter_temp").device_class, Some("temperature"));
+        assert_eq!(reading("inverter_temp").precision, Some(1));
+        assert_ne!(reading("inverter_temp").name, reading("device_temp").name);
+    }
+
+    #[test]
+    fn running_off_grid_is_reported_as_a_condition_not_as_a_number() {
+        // The device's own answer, beside the `off_grid_mode` switch that asks for it. A sensor reading
+        // `0` would make `is_state(..., 'on')` wrong in an automation, which is the whole reason
+        // `meter_connected` is a binary sensor too.
+        let active = reading(OFF_GRID_ACTIVE);
+        assert_eq!(active.component, Component::BinarySensor);
+        assert_eq!(active.unit, None);
+        assert!(matches!(active.shape, Shape::Signal { .. }), "{:?}", active.shape);
+        // Home Assistant writes the state in the class's words, and the device is not a connection:
+        // `running` reads "Running", `connectivity` would read "Connected".
+        assert_eq!(active.device_class, Some("running"));
+        assert_eq!(reading(METER_CONNECTED).device_class, Some("connectivity"));
+
+        // And it is not the switch: that one is a setting, and writing to the reading is not a thing.
+        assert_eq!(setting("off_grid_mode").component, Component::Switch);
     }
 
     #[test]
