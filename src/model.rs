@@ -371,6 +371,132 @@ pub enum Value {
         /// Minute, 0–59.
         minute: u8,
     },
+    /// The days a schedule slot repeats on.
+    Weekdays(Repeat),
+}
+
+/// One day of the week, valued as the bit it occupies in a repeat mask.
+///
+/// The discriminants are the device's own flag values rather than an ordinal to be shifted, so the enum
+/// carries both halves of what a day is here: what it is called and what it is worth.
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Weekday {
+    /// The lowest bit, and the start of the device's week.
+    Monday = 0x01,
+    /// Tuesday.
+    Tuesday = 0x02,
+    /// Wednesday.
+    Wednesday = 0x04,
+    /// Thursday.
+    Thursday = 0x08,
+    /// Friday.
+    Friday = 0x10,
+    /// Saturday.
+    Saturday = 0x20,
+    /// The seventh bit — last, not first, which is the trap in reading this mask.
+    Sunday = 0x40,
+}
+
+impl Weekday {
+    /// Every day, in week order. That is both the device's bit order and the order a person writes them.
+    pub const ALL: [Self; 7] = [
+        Self::Monday,
+        Self::Tuesday,
+        Self::Wednesday,
+        Self::Thursday,
+        Self::Friday,
+        Self::Saturday,
+        Self::Sunday,
+    ];
+
+    /// The bit this day occupies in a repeat mask.
+    pub const fn bit(self) -> u8 {
+        self as u8
+    }
+
+    /// The short name this renders as and parses from.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Monday => "mon",
+            Self::Tuesday => "tue",
+            Self::Wednesday => "wed",
+            Self::Thursday => "thu",
+            Self::Friday => "fri",
+            Self::Saturday => "sat",
+            Self::Sunday => "sun",
+        }
+    }
+
+    /// The day a short name stands for, whatever its case, or `None` for anything else.
+    pub fn from_name(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|day| day.name().eq_ignore_ascii_case(text))
+    }
+}
+
+/// The days a schedule slot repeats on, as the device holds them: a bit per day.
+///
+/// An empty mask means **every day** rather than no days, which is why this is a type rather than a bare
+/// integer — the reading is the opposite of what the bits suggest, and it should be stated once.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Repeat(u8);
+
+impl Repeat {
+    /// Every day, which the device spells as an empty mask.
+    pub const DAILY: Self = Self(0);
+
+    /// How every day renders and parses, since it is a word rather than a list.
+    const DAILY_TEXT: &'static str = "daily";
+
+    /// From the device's mask, ignoring anything above the seven days.
+    pub const fn from_mask(mask: u8) -> Self {
+        Self(mask & 0x7F)
+    }
+
+    /// The mask, as the device holds it.
+    pub const fn mask(self) -> u8 {
+        self.0
+    }
+
+    /// Whether the slot runs on this day. Always true when it runs daily.
+    pub const fn contains(self, day: Weekday) -> bool {
+        self.0 == 0 || self.0 & day.bit() != 0
+    }
+
+    /// The days named, in week order. Empty when it runs daily.
+    pub fn days(self) -> impl Iterator<Item = Weekday> {
+        Weekday::ALL.into_iter().filter(move |day| self.0 & day.bit() != 0)
+    }
+
+    /// What [`Display`](fmt::Display) writes, read back. `None` for anything that names no day.
+    ///
+    /// Forgiving about spacing and case, because this parses what a person typed into a text field.
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.is_empty() || text.eq_ignore_ascii_case(Self::DAILY_TEXT) {
+            return Some(Self::DAILY);
+        }
+        let mut mask = 0_u8;
+        for part in text.split(',') {
+            mask |= Weekday::from_name(part.trim())?.bit();
+        }
+        Some(Self(mask))
+    }
+}
+
+impl fmt::Display for Repeat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if *self == Self::DAILY {
+            return f.write_str(Self::DAILY_TEXT);
+        }
+        for (index, day) in self.days().enumerate() {
+            if index > 0 {
+                f.write_str(",")?;
+            }
+            f.write_str(day.name())?;
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for Value {
@@ -391,6 +517,7 @@ impl fmt::Display for Value {
             },
             Self::Text(s) => f.write_str(s),
             Self::TimeOfDay { hour, minute } => write!(f, "{hour:02}:{minute:02}"),
+            Self::Weekdays(repeat) => write!(f, "{repeat}"),
         }
     }
 }
@@ -426,14 +553,14 @@ impl Reading {
         match self.value {
             Value::Float(v) => Some(v),
             Value::Int(v) | Value::Enum { raw: v, .. } => Some(f64::from(v)),
-            Value::Text(_) | Value::TimeOfDay { .. } => None,
+            Value::Text(_) | Value::TimeOfDay { .. } | Value::Weekdays(_) => None,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Raw, Reading, Register, Scaling, Unit, Value};
+    use super::{Raw, Reading, Register, Repeat, Scaling, Unit, Value, Weekday};
     use crate::model::Confidence;
 
     #[test]
@@ -497,6 +624,44 @@ mod tests {
         };
         assert!(reading("unknown_110").is_unknown());
         assert!(!reading("ac_power").is_unknown());
+    }
+
+    #[test]
+    fn a_repeat_reads_as_the_days_it_names() {
+        assert_eq!(Repeat::DAILY.to_string(), "daily");
+        assert_eq!(Repeat::from_mask(0b0000_0101).to_string(), "mon,wed");
+        // Week order, not the order the bits were set or the order a caller wrote them.
+        assert_eq!(Repeat::from_mask(0b0100_0001).to_string(), "mon,sun");
+        assert_eq!(Repeat::from_mask(0x7F).to_string(), "mon,tue,wed,thu,fri,sat,sun");
+    }
+
+    #[test]
+    fn a_repeat_parses_what_it_writes() {
+        for mask in 0..=0x7F_u8 {
+            let repeat = Repeat::from_mask(mask);
+            assert_eq!(Repeat::parse(&repeat.to_string()), Some(repeat), "mask {mask:#04x}");
+        }
+    }
+
+    #[test]
+    fn parsing_a_repeat_forgives_spacing_and_case_but_not_a_non_day() {
+        assert_eq!(Repeat::parse(" Mon , TUE "), Some(Repeat::from_mask(0b0000_0011)));
+        assert_eq!(Repeat::parse("DAILY"), Some(Repeat::DAILY));
+        // An empty field is how a text entity says "cleared", and every day is the device's own reading
+        // of an empty mask.
+        assert_eq!(Repeat::parse(""), Some(Repeat::DAILY));
+        assert_eq!(Repeat::parse("mon,funday"), None);
+        assert_eq!(Repeat::parse("1"), None);
+    }
+
+    #[test]
+    fn an_empty_mask_contains_every_day() {
+        // The trap this type exists for: no bits set means every day, not no days.
+        assert!(Weekday::ALL.into_iter().all(|day| Repeat::DAILY.contains(day)));
+        assert_eq!(Repeat::DAILY.days().count(), 0);
+        let weekend = Repeat::from_mask(Weekday::Saturday.bit() | Weekday::Sunday.bit());
+        assert!(weekend.contains(Weekday::Saturday));
+        assert!(!weekend.contains(Weekday::Monday));
     }
 
     #[test]

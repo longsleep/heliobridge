@@ -234,6 +234,12 @@ pub enum Shape {
     Choice(&'static [&'static str]),
     /// A time of day, `HH:MM`.
     TimeOfDay,
+    /// The days a schedule slot repeats on, as a list or the word for every day.
+    ///
+    /// Its own shape rather than sharing [`Shape::TimeOfDay`]: that one publishes a `HH:MM` pattern and a
+    /// fixed length of five, which Home Assistant validates against — so a weekday list rendered through
+    /// it is rejected and the entity never leaves `unknown`.
+    Weekdays,
     /// A momentary action.
     Action,
 }
@@ -295,6 +301,7 @@ impl Entity {
             ),
             Control::Switch => (Component::Switch, Shape::Toggle),
             Control::TimeOfDay | Control::Text => (Component::Text, Shape::TimeOfDay),
+            Control::Weekdays => (Component::Text, Shape::Weekdays),
             Control::Choice { labels } => (Component::Select, Shape::Choice(labels)),
         };
 
@@ -816,14 +823,16 @@ impl Entity {
     ///   a resync takes;
     /// - [`LAST_UPDATE`], which does not exist until a frame has arrived.
     pub fn published_alone(&self) -> bool {
-        matches!(self.shape, Shape::TimeOfDay) || self.key == LAST_UPDATE || self.key == FIRMWARE_VERSION
+        matches!(self.shape, Shape::TimeOfDay | Shape::Weekdays)
+            || self.key == LAST_UPDATE
+            || self.key == FIRMWARE_VERSION
     }
 
     /// Whether this entity accepts commands.
     pub const fn is_writable(&self) -> bool {
         matches!(
             self.shape,
-            Shape::Numeric(_) | Shape::Toggle | Shape::Choice(_) | Shape::TimeOfDay | Shape::Action
+            Shape::Numeric(_) | Shape::Toggle | Shape::Choice(_) | Shape::TimeOfDay | Shape::Weekdays | Shape::Action
         )
     }
 }
@@ -1509,6 +1518,17 @@ mod tests {
         // this set and clear (F151), so any name describing an effect would be inventing one.
         assert_eq!(setting("ac_couple_enabled").name, "AC couple enable");
         assert_eq!(setting("ac_couple_enabled").component, Component::Switch);
+    }
+
+    #[test]
+    fn a_slots_repeat_is_a_text_entity_named_after_the_vendors_own_field() {
+        // The register lives in a block of its own, away from the five contiguous slot registers, so the
+        // thing worth pinning is that a slot still yields it and that it lands where a person can type
+        // into it. `repeat` is the vendor application's name for the same field.
+        let repeat = setting("slot1_repeat");
+        assert_eq!(repeat.name, "Slot 1 repeat");
+        assert_eq!(repeat.component, Component::Text);
+        assert_eq!(setting("slot9_repeat").name, "Slot 9 repeat");
     }
 
     #[test]

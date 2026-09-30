@@ -28,6 +28,7 @@ impl Setting for HoldingRegister {
             Domain::Flag => Shape::Switch,
             Domain::TimeOfDay => Shape::TimeOfDay,
             Domain::Enum(labels) => Shape::Choice { labels },
+            Domain::Weekdays => Shape::Weekdays,
         }
     }
 

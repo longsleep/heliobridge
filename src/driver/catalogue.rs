@@ -47,6 +47,8 @@ pub enum Shape {
     },
     /// A time of day.
     TimeOfDay,
+    /// The days a schedule slot repeats on.
+    Weekdays,
     /// Free text.
     Text,
 }

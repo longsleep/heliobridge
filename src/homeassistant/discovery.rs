@@ -30,6 +30,20 @@ use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
 /// component.
 pub const TIME_PATTERN: &str = r"^([01]\d|2[0-3]):[0-5]\d$";
 
+/// What a weekday list may say: every day, or days in week order, comma separated.
+///
+/// Home Assistant validates the state it receives against this as well as what a person types, so it must
+/// accept everything published here — sharing the slot boundary's `HH:MM` pattern once left the entity
+/// stuck at `unknown` for exactly that reason. Lower case and no spaces, which is what [`Repeat`] renders;
+/// the API's parser is the forgiving one.
+pub const WEEKDAYS_PATTERN: &str = "^(daily|(mon|tue|wed|thu|fri|sat|sun)(,(mon|tue|wed|thu|fri|sat|sun))*)$";
+
+/// Shortest a weekday list renders: one day, `mon`.
+const WEEKDAYS_MIN: usize = 3;
+
+/// Longest a weekday list renders: all seven, `mon,tue,wed,thu,fri,sat,sun`.
+const WEEKDAYS_MAX: usize = 27;
+
 /// What Home Assistant groups the entities under.
 ///
 /// Assembled from the identity report rather than stored, so it says what the device says. Everything but
@@ -267,6 +281,13 @@ impl Discovery<'_> {
                 config.insert("min".to_owned(), json!(5));
                 config.insert("max".to_owned(), json!(5));
             }
+            // A pattern as well as bounds, so Home Assistant refuses a typo in the box rather than
+            // handing the device something it would store and never act on.
+            Shape::Weekdays => {
+                config.insert("pattern".to_owned(), json!(WEEKDAYS_PATTERN));
+                config.insert("min".to_owned(), json!(WEEKDAYS_MIN));
+                config.insert("max".to_owned(), json!(WEEKDAYS_MAX));
+            }
             // A button has no state at all, so it must not claim a state topic: Home Assistant would show
             // it as unavailable until something published one.
             Shape::Action => {
@@ -312,7 +333,7 @@ impl Discovery<'_> {
                     config.insert("optimistic".to_owned(), json!(false));
                 }
             }
-            Shape::Choice(_) | Shape::TimeOfDay => {
+            Shape::Choice(_) | Shape::TimeOfDay | Shape::Weekdays => {
                 config.insert(
                     "command_template".to_owned(),
                     json!(format!(r#"{{"{key}": "{{{{ value }}}}"}}"#)),
@@ -344,12 +365,14 @@ pub const fn is_control(component: Component) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceBlock, Discovery, TIME_PATTERN, is_control};
+    use super::{DeviceBlock, Discovery, TIME_PATTERN, WEEKDAYS_MAX, WEEKDAYS_MIN, WEEKDAYS_PATTERN, is_control};
     use crate::control::{ConfigView, IdentityView};
     use crate::growatt::driver::Growatt;
     use crate::homeassistant::command::Permitted;
     use crate::homeassistant::entity::{Catalogue, Component, Entity, Presence};
     use crate::homeassistant::topics::Topics;
+    use crate::model::Repeat;
+    use regex::Regex;
     use serde_json::Value;
 
     /// The device as it looks before its identity report has arrived.
@@ -626,6 +649,44 @@ mod tests {
     }
 
     #[test]
+    fn a_slots_repeat_carries_no_time_pattern() {
+        // The bug this pins: sharing the slot boundary's shape gave the repeat field a HH:MM pattern and a
+        // fixed length of five. Home Assistant validates against both, so "daily" was rejected and the
+        // entity sat at `unknown` while the value was on the broker all along.
+        let config = payload(&entity("slot1_repeat"));
+        assert_ne!(config["pattern"], TIME_PATTERN, "a weekday list is not a time");
+        assert_eq!(config["pattern"], WEEKDAYS_PATTERN);
+        assert_eq!(config["min"], 3);
+        assert_eq!(config["max"], 27);
+        assert_eq!(config["command_template"], r#"{"slot1_repeat": "{{ value }}"}"#);
+    }
+
+    #[test]
+    fn the_weekday_pattern_accepts_everything_that_is_published() {
+        // The rule the earlier bug broke: Home Assistant validates incoming state against the pattern, so
+        // anything renderable must match it, or the entity sits at `unknown` with the value on the broker.
+        let pattern = Regex::new(WEEKDAYS_PATTERN).expect("a valid pattern");
+
+        for mask in 0..=0x7F_u8 {
+            let rendered = Repeat::from_mask(mask).to_string();
+            assert!(
+                pattern.is_match(&rendered),
+                "{rendered} is published but would not match"
+            );
+            assert!(
+                rendered.len() >= WEEKDAYS_MIN && rendered.len() <= WEEKDAYS_MAX,
+                "{rendered} is {} characters, outside the bounds published",
+                rendered.len()
+            );
+        }
+
+        // And it refuses what the device would not take.
+        for value in ["", "mon,funday", "1", "mon,", "Mon", "mon tue", "dailly"] {
+            assert!(!pattern.is_match(value), "{value:?} should be refused");
+        }
+    }
+
+    #[test]
     fn a_slot_boundary_is_a_text_entity_with_a_pattern() {
         // Home Assistant has no MQTT `time` component, so the pattern is what keeps a nonsense value out.
         let config = payload(&entity("slot1_start_time"));
@@ -637,21 +698,14 @@ mod tests {
 
     #[test]
     fn the_pattern_accepts_a_time_and_refuses_what_is_not_one() {
-        // Checked here rather than trusted, since the only thing that reads it is Home Assistant.
-        let matches = |value: &str| {
-            let (hours, minutes) = value.split_once(':').expect("a colon");
-            hours.len() == 2 && minutes.len() == 2 && {
-                let hour: u32 = hours.parse().unwrap_or(99);
-                let minute: u32 = minutes.parse().unwrap_or(99);
-                hour < 24 && minute < 60
-            }
-        };
-        assert!(TIME_PATTERN.starts_with('^') && TIME_PATTERN.ends_with('$'));
+        // Matched with the same engine Home Assistant uses, rather than a reimplementation that could
+        // agree with the test and disagree with Home Assistant.
+        let pattern = Regex::new(TIME_PATTERN).expect("a valid pattern");
         for value in ["00:00", "23:59", "07:05"] {
-            assert!(matches(value), "{value}");
+            assert!(pattern.is_match(value), "{value} should be accepted");
         }
-        for value in ["24:00", "07:60"] {
-            assert!(!matches(value), "{value}");
+        for value in ["24:00", "07:60", "7:05", "0705", "", "daily"] {
+            assert!(!pattern.is_match(value), "{value:?} should be refused");
         }
     }
 

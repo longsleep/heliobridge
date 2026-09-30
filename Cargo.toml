@@ -84,6 +84,10 @@ sha2 = "0.10"               # a digest of what was downloaded, so it can be comp
 # `test-util` gives the paused clock, so a test can prove the 4.5-second time push fires without
 # waiting 4.5 seconds. Only enabled for tests.
 tokio = { version = "1", features = ["test-util"] }
+# The discovery patterns are read by Home Assistant's regex engine, not by this crate, so a test that
+# reimplements them by hand only ever checks the reimplementation. Matching them for real is what makes
+# the assertion mean something, and as a dev-dependency none of it reaches the shipped binary.
+regex = "1"
 
 [profile.release]
 lto = "thin"

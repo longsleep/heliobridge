@@ -32,7 +32,7 @@
 //! matters is that a malformed table cannot compile, and a `const` slice with a `const` check already
 //! has it, without a build script or a parser.
 
-use crate::model::{Confidence, Raw, Register, Scaling, Unit, Value};
+use crate::model::{Confidence, Raw, Register, Repeat, Scaling, Unit, Value};
 
 /// Base offset of the input register block within a telemetry frame.
 pub const INPUT_BASE_OFFSET: usize = 0x4F;
@@ -449,6 +449,15 @@ pub const SLOT_STRIDE: u16 = 5;
 /// How many schedule slots the device provides.
 pub const SLOT_COUNT: u16 = 9;
 
+/// First register of the first slot's repeat mask.
+///
+/// A second block, away from the five contiguous slot registers: the sub-MCU holds the masks in their own
+/// array, and the register numbers follow that rather than the slot layout.
+pub const SLOT_REPEAT_BASE: u16 = 342;
+
+/// Registers between one slot's repeat mask and the next.
+pub const SLOT_REPEAT_STRIDE: u16 = 2;
+
 /// What values a holding register accepts.
 ///
 /// The device silently clamps out-of-range writes rather than rejecting them, so a write that looks
@@ -469,6 +478,8 @@ pub enum Domain {
     TimeOfDay,
     /// An index into a set of labels.
     Enum(&'static [&'static str]),
+    /// The days a schedule slot repeats on: a bit per day, empty meaning every day.
+    Weekdays,
 }
 
 impl Domain {
@@ -482,6 +493,9 @@ impl Domain {
                 hour < 24 && minute < 60
             }
             Self::Enum(labels) => usize::from(value) < labels.len(),
+            // Seven bits and nothing above them. The device ignores the rest, but accepting them would
+            // let a caller write something it could never read back.
+            Self::Weekdays => value <= 0x7F,
         }
     }
 
@@ -492,6 +506,9 @@ impl Domain {
             Self::Flag => "0 or 1".to_owned(),
             Self::TimeOfDay => "HH<<8|MM with HH<24 and MM<60".to_owned(),
             Self::Enum(labels) => format!("0..={}", labels.len().saturating_sub(1)),
+            Self::Weekdays => "a weekday mask, Monday in the lowest bit through Sunday in the seventh; \
+                 an empty mask means every day"
+                .to_owned(),
         }
     }
 }
@@ -561,6 +578,18 @@ impl HoldingRegister {
         }
     }
 
+    /// A weekday-mask setting.
+    pub const fn weekdays(register: u16, name: &'static str, confidence: Confidence) -> Self {
+        Self {
+            register: Register(register),
+            name,
+            domain: Domain::Weekdays,
+            unit: Unit::None,
+            confidence,
+            superseded_by: None,
+        }
+    }
+
     /// A time-of-day setting.
     pub const fn time(register: u16, name: &'static str, confidence: Confidence) -> Self {
         Self {
@@ -609,6 +638,15 @@ impl HoldingRegister {
 
     /// The slot entry covering a register, if it falls inside the schedule block.
     fn slot_field(register: Register) -> Option<Self> {
+        // The repeat masks sit in a block of their own, above the contiguous slot registers.
+        if let Some(offset) = register.number().checked_sub(SLOT_REPEAT_BASE) {
+            if offset.checked_rem(SLOT_REPEAT_STRIDE)? != 0 {
+                return None;
+            }
+            let slot = offset.checked_div(SLOT_REPEAT_STRIDE)?;
+            return Self::slot_repeat(slot.checked_add(1)?);
+        }
+
         let offset = register.number().checked_sub(SLOT_BASE)?;
         // Integer division is the intent here: the slot index and the field within it.
         let slot = offset.checked_div(SLOT_STRIDE)?;
@@ -651,6 +689,7 @@ impl HoldingRegister {
                 label: labels.get(usize::from(raw.get())).copied(),
             },
             Domain::Range { .. } => Value::Int(raw.get()),
+            Domain::Weekdays => Value::Weekdays(Repeat::from_mask(u8::try_from(raw.get() & 0x7F).unwrap_or(0))),
         }
     }
 
@@ -673,17 +712,27 @@ impl HoldingRegister {
     }
 
     /// The registers of one schedule slot, `slot` counted from 1.
-    pub fn slot(slot: u16) -> Option<[Self; 5]> {
+    pub fn slot(slot: u16) -> Option<[Self; 6]> {
         if slot == 0 || slot > SLOT_COUNT {
             return None;
         }
         let base = SLOT_BASE.checked_add(slot.checked_sub(1)?.checked_mul(SLOT_STRIDE)?)?;
-        let mut out = [Self::flag(0, "", Confidence::Inferred); 5];
-        for (index, entry) in out.iter_mut().enumerate() {
+        let mut out = [Self::flag(0, "", Confidence::Inferred); 6];
+        for (index, entry) in out.iter_mut().take(usize::from(SLOT_STRIDE)).enumerate() {
             let number = base.checked_add(u16::try_from(index).ok()?)?;
             *entry = Self::slot_field(Register(number))?;
         }
+        // The repeat mask lives in its own block, so it is addressed separately and appended last rather
+        // than walked with the other five.
+        *out.last_mut()? = Self::slot_repeat(slot)?;
         Some(out)
+    }
+
+    /// The repeat-mask register of one schedule slot, `slot` counted from 1.
+    fn slot_repeat(slot: u16) -> Option<Self> {
+        let number = SLOT_REPEAT_BASE.checked_add(slot.checked_sub(1)?.checked_mul(SLOT_REPEAT_STRIDE)?)?;
+        let name = *SLOT_REPEAT_NAMES.get(usize::from(slot.checked_sub(1)?))?;
+        Some(Self::weekdays(number, name, Confidence::Observed))
     }
 }
 
@@ -691,6 +740,19 @@ impl HoldingRegister {
 ///
 /// Written out rather than composed, because a name has to be `&'static str` to travel in a reading
 /// and there is no way to concatenate one at compile time.
+/// The repeat-mask field of each slot, named as the vendor application names it.
+const SLOT_REPEAT_NAMES: [&str; 9] = [
+    "slot1_repeat",
+    "slot2_repeat",
+    "slot3_repeat",
+    "slot4_repeat",
+    "slot5_repeat",
+    "slot6_repeat",
+    "slot7_repeat",
+    "slot8_repeat",
+    "slot9_repeat",
+];
+
 const SLOT_FIELD_NAMES: [[&str; 5]; 9] = [
     [
         "slot1_start_time",
@@ -1110,11 +1172,12 @@ mod tests {
     fn the_resync_set_covers_the_settings_plus_the_exposed_slots() {
         use super::HoldingRegister;
 
-        // Ten documented settings, then five registers per exposed slot.
+        // The documented settings, then six per exposed slot: the five contiguous registers and the
+        // repeat mask, which lives in a block of its own.
         let one = HoldingRegister::resync_set(1);
-        assert_eq!(one.len(), super::HOLDING_REGISTERS.len() + 5);
+        assert_eq!(one.len(), super::HOLDING_REGISTERS.len() + 6);
         let nine = HoldingRegister::resync_set(9);
-        assert_eq!(nine.len(), super::HOLDING_REGISTERS.len() + 45);
+        assert_eq!(nine.len(), super::HOLDING_REGISTERS.len() + 54);
 
         // Fixed settings come first, so the interesting values arrive early if the sequence is cut short.
         assert_eq!(one.first().map(|e| e.register), Some(Register(250)));

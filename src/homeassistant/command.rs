@@ -23,7 +23,7 @@ use snafu::Snafu;
 use crate::driver::catalogue::{Catalogue, ConfigField, Setting, Shape};
 use crate::driver::commands::Command;
 use crate::homeassistant::entity::{METER_READING, PAIR_LORA_ACCESSORY, WITHDRAW_METER_READING};
-use crate::model::Register;
+use crate::model::{Register, Repeat};
 
 /// What a command topic is allowed to change.
 ///
@@ -346,6 +346,8 @@ fn raw_value(setting: &impl Setting, value: &Value) -> Option<u16> {
             u16::try_from(index).ok()
         }
         Shape::Text => value.as_str().and_then(|text| text.parse().ok()),
+        // Composed rather than validated here, as for a time: the domain decides what is acceptable.
+        Shape::Weekdays => Repeat::parse(value.as_str()?).map(|repeat| u16::from(repeat.mask())),
         Shape::TimeOfDay => {
             let (hours, minutes) = value.as_str()?.split_once(':')?;
             let hour: u16 = hours.parse().ok()?;
@@ -371,6 +373,7 @@ fn describe(shape: Shape) -> String {
         Shape::Number { min, max } => format!("a whole number {min}..={max}"),
         Shape::Choice { labels } => format!("one of {}", labels.join(", ")),
         Shape::TimeOfDay => "a time as \"HH:MM\"".to_owned(),
+        Shape::Weekdays => "days as \"mon,tue\", or \"daily\" for every day".to_owned(),
         Shape::Text => "text".to_owned(),
     }
 }

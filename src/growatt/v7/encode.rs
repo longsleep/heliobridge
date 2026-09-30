@@ -1012,9 +1012,10 @@ mod tests {
 
     #[test]
     fn unknown_registers_are_not_writable() {
-        // 321, 341 and 342 are written by the vendor but have no known meaning. None may be written
-        // through the general API, and 341/342 not at all.
-        for register in [321, 341, 342, 999] {
+        // 321 is the global work mode and 341 is whatever sits beside each repeat mask; both are written
+        // by the vendor and neither is in the map, so neither may be written through the general API.
+        // 342 no longer belongs here: it is `slot1_repeat`, and its own test covers it.
+        for register in [321, 341, 999] {
             assert!(
                 matches!(
                     Command::write(Register(register), 0),

@@ -585,6 +585,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "rcgen",
+ "regex",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
