@@ -398,8 +398,8 @@ struct Announcement {
 struct Indexed {
     /// Settings published on a topic of their own. The entity key and the setting name are the same string.
     unshared: HashSet<&'static str>,
-    /// Entities gated on a setting: the deciding name, then each entity and the value that makes it inert.
-    gated_by_setting: HashMap<&'static str, Vec<(&'static str, u16)>>,
+    /// Entities gated on a setting: the deciding name, then each entity and the values that make it inert.
+    gated_by_setting: HashMap<&'static str, Vec<(&'static str, &'static [u16])>>,
     /// Entities gated on a reading: the deciding name, then each entity.
     gated_by_reading: HashMap<&'static str, Vec<&'static str>>,
 }
@@ -413,11 +413,11 @@ impl Indexed {
                 indexed.unshared.insert(entity.key);
             }
             match entity.gate {
-                Some(Gate::SettingIsNot { setting, value }) => indexed
+                Some(Gate::SettingIsNot { setting, values }) => indexed
                     .gated_by_setting
                     .entry(setting)
                     .or_default()
-                    .push((entity.key, value)),
+                    .push((entity.key, values)),
                 Some(Gate::ReadingIsSet { reading }) => {
                     indexed.gated_by_reading.entry(reading).or_default().push(entity.key);
                 }
@@ -903,7 +903,7 @@ impl<D: Registers + Describes> Link<D> {
                 continue;
             };
             for (key, inert) in dependents {
-                say(key, setting.raw != *inert);
+                say(key, !inert.contains(&setting.raw));
             }
         }
 
@@ -1033,7 +1033,7 @@ mod tests {
     use crate::homeassistant::rest::RestWatch;
     use std::collections::HashMap;
 
-    use crate::growatt::v7::registers::{SMART_SELF_USE, WORK_MODE_LABELS};
+    use crate::growatt::v7::registers::{BATTERY_FIRST, SMART_SELF_USE, WORK_MODE_LABELS};
     use crate::homeassistant::broker::{Broker, Event, Publication, Publications};
     use crate::homeassistant::entity::LAST_UPDATE;
     use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
@@ -1694,6 +1694,22 @@ mod tests {
             "a subscriber joining later must still learn it is inert"
         );
         assert_eq!(published.payload, OFFLINE);
+    }
+
+    #[tokio::test]
+    async fn a_slot_in_battery_first_takes_its_power_setting_unavailable() {
+        // The same reasoning as smart self-use, and for the same line of sub-MCU code: the slot's own
+        // power is passed onward only in `load_first`. Battery first was missed when the gate was first
+        // written, so a dashboard offered a live control that the device discards.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.settings.send_replace(slot1(BATTERY_FIRST));
+        settle().await;
+
+        let gate = wire.on("heliobridge/0EXAMPLE00000001/availability/slot1_output_power");
+        assert_eq!(gate.last().expect("a gate message").payload, OFFLINE);
     }
 
     #[tokio::test]

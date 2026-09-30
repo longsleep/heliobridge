@@ -141,12 +141,12 @@ pub enum Presence {
 /// that it is inert, and going unavailable is the only way to say so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gate {
-    /// Available only while another *setting* holds something other than `value`.
+    /// Available only while another *setting* holds none of `values`.
     SettingIsNot {
         /// The setting that decides.
         setting: &'static str,
-        /// The value under which this entity is inert.
-        value: u16,
+        /// The values under which this entity is inert.
+        values: &'static [u16],
     },
     /// Available only while a *telemetry* reading is non-zero.
     ReadingIsSet {
@@ -314,7 +314,7 @@ impl Entity {
             enabled: !DISABLED.contains(&setting.name()),
             gate: setting
                 .superseded_by()
-                .map(|(setting, value)| Gate::SettingIsNot { setting, value }),
+                .map(|(setting, values)| Gate::SettingIsNot { setting, values }),
         }
     }
 

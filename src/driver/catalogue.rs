@@ -74,11 +74,11 @@ pub trait Setting: fmt::Debug + Clone + Send + Sync + 'static {
     /// What it does accept, for an error message a person reads.
     fn accepted(&self) -> String;
 
-    /// Another setting whose value makes this one inoperative, and at which value.
+    /// Another setting whose value makes this one inoperative, and at which values.
     ///
     /// A control that has no effect is worse than one that is missing: the operator changes it and nothing
     /// happens. Naming the setting responsible is what lets a surface hide or disable it instead.
-    fn superseded_by(&self) -> Option<(&'static str, u16)> {
+    fn superseded_by(&self) -> Option<(&'static str, &'static [u16])> {
         None
     }
 }

@@ -47,7 +47,7 @@ impl Setting for HoldingRegister {
         self.domain.describe()
     }
 
-    fn superseded_by(&self) -> Option<(&'static str, u16)> {
+    fn superseded_by(&self) -> Option<(&'static str, &'static [u16])> {
         self.superseded_by.map(|by| (by.setting, by.when))
     }
 }

@@ -102,6 +102,15 @@ pub const WORK_MODE_LABELS: &[&str] = &["load_first", "battery_first", "smart_se
 /// The `work_mode` value that regulates from a meter reading.
 pub const SMART_SELF_USE: u16 = 2;
 
+/// The `work_mode` value that charges the battery before serving the load.
+pub const BATTERY_FIRST: u16 = 1;
+
+/// The work modes in which a slot's own output power is not used.
+///
+/// The sub-MCU passes the slot's figure onward only in `load_first`; under the other two it passes zero,
+/// so the register keeps whatever was written to it and decides nothing.
+pub const OUTPUT_POWER_IGNORED_IN: &[u16] = &[BATTERY_FIRST, SMART_SELF_USE];
+
 /// Labels for `battery_charge_status`, input register 10.
 pub const BATTERY_STATUS_LABELS: &[&str] = &["idle", "charging", "discharging"];
 
@@ -513,8 +522,11 @@ pub struct HoldingRegister {
 pub struct Supersession {
     /// The setting whose value decides.
     pub setting: &'static str,
-    /// The raw value of that setting under which the superseded one has no effect.
-    pub when: u16,
+    /// The raw values of that setting under which the superseded one has no effect.
+    ///
+    /// A list because one setting can be inert under several modes, and naming each is more honest than
+    /// inverting the test: the device's own condition is "the deciding value is one of these".
+    pub when: &'static [u16],
 }
 
 impl HoldingRegister {
@@ -609,13 +621,14 @@ impl HoldingRegister {
         Some(match field {
             0 | 1 => Self::time(register.number(), name, Confidence::Verified),
             2 => Self::enumerated(register.number(), name, WORK_MODE_LABELS, Confidence::Verified),
-            // Smart self-use regulates from a meter reading and does not read this register. The slot's
-            // own work mode names the setting that decides, so the pairing follows the slot rather than
-            // being fixed to slot 1.
+            // Only `load_first` uses this register: the sub-MCU passes the slot's figure onward in that
+            // mode and passes zero in the other two — smart self-use regulates from the meter instead,
+            // and battery first serves the battery. The slot's own work mode names the setting that
+            // decides, so the pairing follows the slot rather than being fixed to slot 1.
             3 => Self::range(register.number(), name, 0, 1000, Unit::Watt, Confidence::Verified).superseded(
                 Supersession {
                     setting: names.get(2)?,
-                    when: SMART_SELF_USE,
+                    when: OUTPUT_POWER_IGNORED_IN,
                 },
             ),
             _ => Self::flag(register.number(), name, Confidence::Verified),
