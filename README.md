@@ -463,8 +463,8 @@ With a relay, the advertisement is logged in full whether or not anything is kep
 
 ```
 the cloud advertised a firmware update source="configuration register 80"
-  url=http://cdn.growatt.com/update/device/GB/manualUpgrade/…/WIFI/4.0.2.6.bin
-  file=WIFI-4.0.2.6.bin refused=true fetch=false
+  url=https://cdn.growatt.com/update/device/GB/autoUpgrade/…/PCGU-41-00-4026-000.bin
+  file=PCGU15121414xxxxxxxxxx90004026-PCGU-41-00-4026-000.bin refused=true fetch=false
 ```
 
 `HELIOBRIDGE_FIRMWARE_DIR` keeps the image as well, and `HELIOBRIDGE_FETCH_FIRMWARE=true` downloads it.
@@ -474,7 +474,10 @@ transfer is capped, is written under a temporary name and renamed once complete,
 so the file can be compared with an image already held.
 
 The request presents the same user agent and cache directive the datalogger's own firmware sends, and
-nothing else — this program does not announce itself to the vendor's CDN.
+nothing else — this program does not announce itself to the vendor's CDN. Both `http` and `https` sources
+are fetched (the vendor moved to `https` in October 2026). The CDN's certificate is checked against the same
+trust anchors as the cloud relay — the built-in roots, or `SSL_CERT_FILE`/`SSL_CERT_DIR` — so a source they
+do not vouch for is refused rather than downloaded.
 
 **Nothing installs firmware.** The image is stored and that is all.
 

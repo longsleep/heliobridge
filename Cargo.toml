@@ -77,6 +77,10 @@ http = "1"          # the request type, so the vendor-shaped request lives with 
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
+# TLS for that client. The vendor moved its update URLs from `http://` to `https://` in October 2026. No
+# default features: the connector is built from the program's own `ClientTls`, so it brings neither a trust
+# store nor a crypto provider of its own, and the CDN is checked against the same anchors as the relay.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12"] }
 sanitize-filename = "0.6"   # a vendor URL decides a file name; this keeps it a file name
 sha2 = "0.10"               # a digest of what was downloaded, so it can be compared with a known image
 

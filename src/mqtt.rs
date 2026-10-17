@@ -250,6 +250,11 @@ impl ClientTls {
         TlsConnector::from(Arc::clone(&self.config))
     }
 
+    /// The shared configuration itself, for a client that builds its own connector from one.
+    pub fn config(&self) -> Arc<ClientConfig> {
+        Arc::clone(&self.config)
+    }
+
     /// Where these anchors came from.
     pub const fn trust(&self) -> Trust {
         self.trust

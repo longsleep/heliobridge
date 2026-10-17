@@ -26,6 +26,11 @@
 //! convenience one that would seed an `Accept` header behind its back. Header *order* is not reproduced,
 //! which no HTTP implementation is entitled to care about.
 //!
+//! Both `http` and `https` are fetched. The vendor's advertisements were plain HTTP until October 2026 and
+//! have been HTTPS since. The CDN's certificate is verified with the configuration the store is given —
+//! the program's own [`ClientTls`](crate::mqtt::ClientTls), so the same trust anchors as the cloud relay —
+//! unlike the device, which verifies nothing.
+//!
 //! # Three properties of storing it
 //!
 //! - **Already held means done.** A file present under its name is left alone, so an advertisement repeated
@@ -38,12 +43,14 @@
 //! Nothing here installs anything, and nothing hands a URL to the device.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use rustls::ClientConfig;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
@@ -73,8 +80,8 @@ pub enum FetchError {
     #[error("no firmware directory is configured")]
     NothingKept,
 
-    /// Only plain HTTP is implemented. The advertised channel uses it; the automatic one does not.
-    #[error("scheme {scheme:?} is not supported; only http is")]
+    /// Neither `http` nor `https`.
+    #[error("scheme {scheme:?} is not supported; only http and https are")]
     UnsupportedScheme {
         /// The scheme asked for.
         scheme: String,
@@ -145,7 +152,7 @@ pub struct Stored {
 /// whereas fetching reaches out to a vendor host.
 #[derive(Debug)]
 pub struct FirmwareStore<D: Firmware> {
-    driver: std::sync::Arc<D>,
+    driver: Arc<D>,
     keep: Option<Keep>,
 }
 
@@ -154,28 +161,30 @@ pub struct FirmwareStore<D: Firmware> {
 impl<D: Firmware> Clone for FirmwareStore<D> {
     fn clone(&self) -> Self {
         Self {
-            driver: std::sync::Arc::clone(&self.driver),
+            driver: Arc::clone(&self.driver),
             keep: self.keep.clone(),
         }
     }
 }
 
 /// Where images are kept, once somewhere has been named.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct Keep {
     dir: PathBuf,
     fetch: bool,
     max_bytes: u64,
+    /// What an `https` transfer trusts.
+    tls: Arc<ClientConfig>,
 }
 
 impl<D: Firmware> FirmwareStore<D> {
     /// Read advertisements the way `vendor` says, and only log them.
-    pub fn new(driver: std::sync::Arc<D>) -> Self {
+    pub fn new(driver: Arc<D>) -> Self {
         Self { driver, keep: None }
     }
 
     /// Also keep images under `dir`, refusing any single transfer over `max_bytes`, downloading only if
-    /// `fetch`.
+    /// `fetch`, and verifying an `https` source against `tls`.
     ///
     /// The directory is created here, not at the first advertisement — which may be an hour away, on a
     /// path nobody is watching by then. It also means an operator can see that the setting took effect
@@ -185,12 +194,23 @@ impl<D: Firmware> FirmwareStore<D> {
     ///
     /// [`FetchError::Directory`] if the directory cannot be created. Later write failures are reported per
     /// transfer instead; this is the one that means nothing would ever be kept.
-    pub fn keeping(mut self, dir: PathBuf, fetch: bool, max_bytes: u64) -> Result<Self, FetchError> {
+    pub fn keeping(
+        mut self,
+        dir: PathBuf,
+        fetch: bool,
+        max_bytes: u64,
+        tls: Arc<ClientConfig>,
+    ) -> Result<Self, FetchError> {
         std::fs::create_dir_all(&dir).map_err(|source| FetchError::Directory {
             dir: dir.clone(),
             source,
         })?;
-        self.keep = Some(Keep { dir, fetch, max_bytes });
+        self.keep = Some(Keep {
+            dir,
+            fetch,
+            max_bytes,
+            tls,
+        });
         Ok(self)
     }
 
@@ -285,16 +305,23 @@ impl<D: Firmware> FirmwareStore<D> {
             return Ok(None);
         }
 
-        if firmware.url.scheme() != "http" {
+        let scheme = firmware.url.scheme();
+        if scheme != "http" && scheme != "https" {
             return Err(FetchError::UnsupportedScheme {
-                scheme: firmware.url.scheme().to_owned(),
+                scheme: scheme.to_owned(),
             });
         }
 
         // Built per fetch rather than kept: transfers are an hour apart at most, so there is nothing to
         // reuse. The request itself comes from `growatt::firmware`, headers and all, so nothing here can
-        // add a header the device would not send -- which a higher-level client would do on its own.
-        let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+        // add a header the device would not send -- which a higher-level client would do on its own. The
+        // connector speaks both schemes; TLS adds nothing to the request either.
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(keep.tls.as_ref().clone())
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build(connector);
         let request = self.driver.request(firmware).body(Empty::new())?;
         let response = match tokio::time::timeout(TRANSFER_TIMEOUT, client.request(request)).await {
             Ok(result) => result?,
@@ -374,8 +401,11 @@ impl<D: Firmware> FirmwareStore<D> {
 mod tests {
     use super::{FetchError, FirmwareStore};
     use crate::driver::{AdvertisedFirmware, Firmware, Wire};
+    use crate::mqtt::Trust;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::{ClientConfig, RootCertStore};
     use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::TcpListener;
     use url::Url;
 
@@ -417,10 +447,39 @@ mod tests {
         }
     }
 
+    /// The trust the program ships with: Mozilla's roots, which vouch for no test certificate.
+    fn shipped_trust() -> Arc<ClientConfig> {
+        Trust::BuiltIn.client_tls().expect("the shipped roots load").config()
+    }
+
     fn store(dir: &std::path::Path, fetch: bool, max_bytes: u64) -> FirmwareStore<Fake> {
+        store_trusting(dir, fetch, max_bytes, shipped_trust())
+    }
+
+    fn store_trusting(
+        dir: &std::path::Path,
+        fetch: bool,
+        max_bytes: u64,
+        tls: Arc<ClientConfig>,
+    ) -> FirmwareStore<Fake> {
         FirmwareStore::new(Arc::new(Fake { agent: "esp-07s" }))
-            .keeping(dir.to_path_buf(), fetch, max_bytes)
+            .keeping(dir.to_path_buf(), fetch, max_bytes, tls)
             .expect("a temporary directory can be created")
+    }
+
+    /// Read a request head off `stream`, answer with `response`, and return the head.
+    async fn answer<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, response: &[u8]) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while stream.read_exact(&mut byte).await.is_ok() {
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        stream.write_all(response).await.expect("write");
+        stream.flush().await.expect("flush");
+        String::from_utf8_lossy(&head).into_owned()
     }
 
     /// A one-shot HTTP server: answers once, and hands back the request head it saw.
@@ -431,20 +490,50 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address").to_string();
         let handle = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut head = Vec::new();
-            let mut byte = [0u8; 1];
-            while stream.read_exact(&mut byte).await.is_ok() {
-                head.push(byte[0]);
-                if head.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-            }
-            stream.write_all(&response).await.expect("write");
-            stream.flush().await.expect("flush");
-            String::from_utf8_lossy(&head).into_owned()
+            let (stream, _) = listener.accept().await.expect("accept");
+            answer(stream, &response).await
         });
         (address, handle)
+    }
+
+    /// The same over TLS, with a self-signed certificate for `127.0.0.1`.
+    ///
+    /// Returns that certificate, so a test decides whether the client trusts it. The handle yields the
+    /// request head, or `None` when the client abandoned the handshake — which is what an untrusted
+    /// certificate has to cause.
+    async fn serve_tls_once(
+        response: Vec<u8>,
+    ) -> (String, CertificateDer<'static>, tokio::task::JoinHandle<Option<String>>) {
+        let key = rcgen::KeyPair::generate().expect("a key");
+        let certificate = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()])
+            .expect("parameters")
+            .self_signed(&key)
+            .expect("a self-signed certificate");
+        let der = certificate.der().clone();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![der.clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            )
+            .expect("a server configuration");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address").to_string();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let stream = acceptor.accept(stream).await.ok()?;
+            Some(answer(stream, &response).await)
+        });
+        (address, der, handle)
+    }
+
+    fn advertised_over_https(address: &str) -> AdvertisedFirmware {
+        AdvertisedFirmware {
+            url: Url::parse(&format!("https://{address}/x/PCGU-41-00-4026-000.bin")).expect("a URL"),
+            file: "PCGU-41-00-4026-000.bin".to_owned(),
+            source: "the test".to_owned(),
+        }
     }
 
     fn advertised(address: &str) -> AdvertisedFirmware {
@@ -557,17 +646,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn https_is_refused_rather_than_attempted() {
-        // The client is plain HTTP; the advertised channel uses it, and pretending otherwise would fail
-        // somewhere less legible than here.
+    async fn a_scheme_other_than_http_and_https_is_refused() {
         let dir = tempdir("scheme");
         let advertised = AdvertisedFirmware {
-            url: Url::parse("https://cdn.invalid/x/WIFI-1.bin").expect("a URL"),
+            url: Url::parse("ftp://cdn.invalid/x/WIFI-1.bin").expect("a URL"),
             file: "WIFI-1.bin".to_owned(),
             source: "the test".to_owned(),
         };
         let error = store(&dir, true, 1024).fetch(&advertised).await.expect_err("refused");
         assert!(matches!(error, FetchError::UnsupportedScheme { .. }), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_https_image_is_fetched_with_the_vendor_s_request_and_nothing_else() {
+        // The vendor's advertisements have been https since October 2026.
+        let (address, certificate, server) = serve_tls_once(ok_response("firmware")).await;
+        let mut roots = RootCertStore::empty();
+        roots.add(certificate).expect("the test certificate is a usable anchor");
+        let tls = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let dir = tempdir("https");
+
+        let stored = store_trusting(&dir, true, 1024, tls)
+            .fetch(&advertised_over_https(&address))
+            .await
+            .expect("fetched")
+            .expect("a file");
+        assert_eq!(std::fs::read_to_string(&stored.path).expect("readable"), "firmware");
+
+        let head = server.await.expect("server").expect("the handshake completed");
+        let lower = head.to_ascii_lowercase();
+        assert!(lower.contains("user-agent: esp-07s"), "{head}");
+        assert!(
+            !lower.contains("accept"),
+            "TLS must not bring headers of its own: {head}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_https_source_the_trust_anchors_do_not_vouch_for_is_refused() {
+        // The device verifies nothing; this program does. A CDN with a certificate no anchor vouches for is
+        // refused rather than downloaded from.
+        let (address, _, server) = serve_tls_once(ok_response("firmware")).await;
+        let dir = tempdir("https-untrusted");
+        let store = store(&dir, true, 1024);
+
+        let error = store
+            .fetch(&advertised_over_https(&address))
+            .await
+            .expect_err("refused");
+        assert!(matches!(error, FetchError::Transfer { .. }), "{error}");
+        assert!(
+            server.await.expect("server").is_none(),
+            "the handshake should not have completed"
+        );
+        assert!(
+            !store.holds("PCGU-41-00-4026-000.bin").await,
+            "nothing should be stored"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -601,7 +742,7 @@ mod tests {
         std::fs::create_dir_all(dir.parent().expect("a parent")).expect("the parent exists");
         std::fs::write(&dir, b"in the way").expect("the file is written");
         let error = FirmwareStore::new(Arc::new(Fake { agent: "esp-07s" }))
-            .keeping(dir.clone(), true, 1024)
+            .keeping(dir.clone(), true, 1024, shipped_trust())
             .expect_err("refused");
         assert!(matches!(error, FetchError::Directory { .. }), "{error}");
         std::fs::remove_file(&dir).ok();

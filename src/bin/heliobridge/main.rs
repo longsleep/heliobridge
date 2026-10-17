@@ -307,7 +307,12 @@ impl<'a, D: Driver + Enrols> Bridge<'a, D> {
                     if settings.fetch { ", downloading it" } else { " once fetching is enabled" }
                 );
                 FirmwareStore::new(Arc::clone(&self.driver))
-                    .keeping(settings.dir, settings.fetch, settings.max_bytes)
+                    .keeping(
+                        settings.dir,
+                        settings.fetch,
+                        settings.max_bytes,
+                        self.client_tls.config(),
+                    )
                     .map_err(|error| format!("firmware directory unusable: {}", chain(&error)))?
             }
             None => FirmwareStore::new(Arc::clone(&self.driver)),
