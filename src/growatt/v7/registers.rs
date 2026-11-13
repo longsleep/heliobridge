@@ -386,23 +386,26 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::float(89, "smart_plug_power", Watt, Scaling::UNIT, Vendor),
         Entry::float(90, "charge_limit_upper", Percent, Scaling::UNIT, Verified),
         Entry::float(91, "charge_limit_lower", Percent, Scaling::UNIT, Verified),
+        // The PV and device temperatures use the same tenths-of-a-kelvin encoding as every other
+        // temperature here. Read as hundredths they sat at 28.5 to 32.9 °C day and night; in tenths of a
+        // kelvin the same raw values span 12.0 to 56.3 °C.
         Entry::float(92, "pv1_voltage", Volt, Scaling::HUNDREDTHS, Observed),
         Entry::float(93, "pv1_current", Ampere, Scaling::HUNDREDTHS, Observed),
-        Entry::float(94, "pv1_temp", Celsius, Scaling::HUNDREDTHS, Observed),
+        Entry::float(94, "pv1_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
         Entry::float(95, "pv2_voltage", Volt, Scaling::HUNDREDTHS, Observed),
         Entry::float(96, "pv2_current", Ampere, Scaling::HUNDREDTHS, Observed),
-        Entry::float(97, "pv2_temp", Celsius, Scaling::HUNDREDTHS, Observed),
-        Entry::float(98, "device_temp", Celsius, Scaling::HUNDREDTHS, Observed),
+        Entry::float(97, "pv2_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
+        Entry::float(98, "device_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
         Entry::float(99, "battery_cell_voltage_max", Volt, Scaling::THOUSANDTHS, Observed),
         Entry::float(100, "battery_cell_voltage_min", Volt, Scaling::THOUSANDTHS, Observed),
         Entry::int(101, "battery_cycles", Observed),
         Entry::float(102, "battery_soh", Percent, Scaling::UNIT, Observed),
         Entry::float(103, "pv3_voltage", Volt, Scaling::HUNDREDTHS, Observed),
         Entry::float(104, "pv3_current", Ampere, Scaling::HUNDREDTHS, Observed),
-        Entry::float(105, "pv3_temp", Celsius, Scaling::HUNDREDTHS, Observed),
+        Entry::float(105, "pv3_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
         Entry::float(106, "pv4_voltage", Volt, Scaling::HUNDREDTHS, Observed),
         Entry::float(107, "pv4_current", Ampere, Scaling::HUNDREDTHS, Observed),
-        Entry::float(108, "pv4_temp", Celsius, Scaling::HUNDREDTHS, Observed),
+        Entry::float(108, "pv4_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
         // 110, 111 and 117 use the signed-power encoding, so they are probably power values.
         // The off-grid output: what the device's own socket delivers, and zero in every frame until the
         // device is put into off-grid mode. Established by connecting a lamp, then two: voltage held
@@ -418,7 +421,7 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::float(112, "battery_voltage", Volt, Scaling::TENTHS, Observed),
         // The inverter's own temperature, which the sub-MCU calls `INV_TEMP` and biases the same way it
         // biases the pack temperatures. Distinct from `device_temp`: across the capture this runs
-        // 11.8 to 74.7 °C while `device_temp` sits near 30 °C, which is a heatsink against a board.
+        // 11.8 to 74.7 °C while `device_temp` peaks at 51.1 °C, which is a heatsink against a board.
         Entry::float(113, "inverter_temp", Celsius, Scaling::KELVIN_TENTHS, Observed),
         Entry::float(114, "unknown_114", NoUnit, Scaling::UNIT, Inferred),
         Entry::float(115, "grid_voltage", Volt, Scaling::HUNDREDTHS, Observed),
@@ -1113,7 +1116,7 @@ mod tests {
         BATTERY_STATUS_LABELS, CONFIG_REGISTER_LAST, CONFIG_REGISTERS, ConfigRegister, INPUT_BASE_OFFSET,
         INPUT_REGISTERS, InputRegister, Kind, Role, WORK_MODE_LABELS,
     };
-    use crate::model::{Confidence, Raw, Register, Unit, Value};
+    use crate::model::{Confidence, Raw, Register, Scaling, Unit, Value};
 
     #[test]
     fn offsets_match_the_specified_formula() {
@@ -1190,6 +1193,15 @@ mod tests {
                 "{} is unknown but not marked inferred",
                 entry.name
             );
+        }
+    }
+
+    #[test]
+    fn every_temperature_is_tenths_of_a_kelvin() {
+        // Hundredths of a degree fit the same raw range plausibly enough to look right — 3058 reads
+        // 30.58 °C — while squeezing a 12 to 56 °C day into 28 to 33 °C.
+        for entry in INPUT_REGISTERS.iter().filter(|e| e.unit == Unit::Celsius) {
+            assert_eq!(entry.scaling, Scaling::KELVIN_TENTHS, "{}", entry.name);
         }
     }
 
