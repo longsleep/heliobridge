@@ -247,11 +247,11 @@ impl<'a, D: Driver + Enrols> Bridge<'a, D> {
         // Each is worth its own line: a setting that silently will not move is the kind of thing someone
         // spends an afternoon on before checking the configuration.
         if !options.permitted.writes {
-            tracing::info!("writes are refused: every setting is published as a read-only sensor");
+            tracing::info!("writes are refused: every setting is published read-only");
         } else if !options.permitted.power_plus {
             tracing::info!(
                 setting = command::POWER_PLUS,
-                "this setting is published as a read-only sensor and commands naming it are refused"
+                "this setting is published read-only and commands naming it are refused"
             );
         }
 

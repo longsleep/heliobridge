@@ -235,6 +235,9 @@ pub enum Shape {
     Toggle,
     /// A setting chosen from labels.
     Choice(&'static [&'static str]),
+    /// A reading that is always one of a fixed set of labels — what a [`Shape::Choice`] becomes where it may
+    /// not be written. Home Assistant shows it as an `enum` sensor, which knows the set in advance.
+    Labelled(&'static [&'static str]),
     /// A time of day, `HH:MM`.
     TimeOfDay,
     /// The days a schedule slot repeats on, as a list or the word for every day.
@@ -797,10 +800,20 @@ impl Entity {
         if !self.is_writable() {
             return self;
         }
-        Self {
-            component: Component::Sensor,
+        let (component, shape, device_class, unit) = match self.shape {
+            // A switch reads 0 or 1, which as a sensor is a bare digit; as a binary sensor it is on or off.
+            Shape::Toggle => (Component::BinarySensor, Shape::Signal { on: "1", off: "0" }, None, None),
+            // The state is already the label, so the set is all Home Assistant needs. An `enum` sensor may
+            // not carry a unit.
+            Shape::Choice(labels) => (Component::Sensor, Shape::Labelled(labels), Some("enum"), None),
             // Nothing here accumulates: these are positions and limits, not counters.
-            shape: Shape::Reading(None),
+            _ => (Component::Sensor, Shape::Reading(None), self.device_class, self.unit),
+        };
+        Self {
+            component,
+            shape,
+            device_class,
+            unit,
             category: Some(Category::Diagnostic),
             ..self
         }
@@ -968,12 +981,30 @@ impl Catalogue {
         (Component::Sensor, "sw_version_part_2"),
     ];
 
+    /// Every `(component, key)` a reconciliation has to retract if it finds it, on top of what
+    /// [`Self::everything`] can describe: [`Self::RETIRED`], and the form a read-only switch took up to
+    /// 0.8.x.
+    ///
+    /// That form was a `sensor`, and is a `binary_sensor` now, so its retained discovery message sits on a
+    /// topic nothing produces any more. Home Assistant never added those sensors — they carried
+    /// `entity_category: config`, which it refuses on a sensor — but it re-reads the retained message and
+    /// logs the refusal on every start until something empties it. Derived from the register map rather
+    /// than listed, because every schedule slot has a switch of its own.
+    pub fn retired<D: Registers>(driver: &D) -> Vec<(Component, &'static str)> {
+        let switches = driver
+            .settings(driver.slots())
+            .into_iter()
+            .filter(|setting| setting.shape() == Control::Switch)
+            .map(|setting| (Component::Sensor, setting.name()));
+        Self::RETIRED.iter().copied().chain(switches).collect()
+    }
+
     /// Every entity any configuration of this device could produce.
     ///
     /// What a reconciliation has to compare against when there is no record of what was announced before —
     /// after a restart, where the broker may still hold retained discovery from a run configured
     /// differently. Both forms of every setting are included: refusing writes changes an entity's
-    /// *component*, and therefore its discovery topic, so a `switch` that became a `sensor` leaves a
+    /// *component*, and therefore its discovery topic, so a `switch` that became a `binary_sensor` leaves a
     /// retained message behind under its old name.
     pub fn everything<D: Registers>(driver: &D) -> Vec<Entity> {
         let widest = Self {
@@ -982,7 +1013,7 @@ impl Catalogue {
             packs: BATTERY_PACKS,
         };
         // Two passes cover every component a setting can be published as: with writes refused, each control
-        // becomes a sensor, and that includes the one setting whose reachability is configurable on its own.
+        // becomes a reading, and that includes the one setting whose reachability is configurable on its own.
         let mut all = widest.entities(driver);
         all.extend(
             Self {

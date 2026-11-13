@@ -254,16 +254,16 @@ pub struct Config {
     #[arg(long, env = "HELIOBRIDGE_MQTT_INSTANCE")]
     pub mqtt_instance: Option<String>,
 
-    /// Offer settings as Home Assistant controls rather than as read-only sensors.
+    /// Offer settings as Home Assistant controls rather than as read-only readings.
     ///
-    /// `false` publishes every setting as a plain sensor and accepts no commands, which is what to run
+    /// `false` publishes every setting as a read-only reading and accepts no commands, which is what to run
     /// alongside another controller so two writers are not fighting over the same registers.
     #[arg(long, env = "HELIOBRIDGE_ALLOW_WRITES", default_value_t = true, action = clap::ArgAction::Set)]
     pub allow_writes: bool,
 
     /// Allow `power_plus` to be written from Home Assistant.
     ///
-    /// `false` publishes it as a read-only sensor and refuses any command naming it, in either direction. It
+    /// `false` publishes it read-only and refuses any command naming it, in either direction. It
     /// stays visible: whether it is on is worth seeing even where this bridge may not set it, since the
     /// vendor app still can.
     ///

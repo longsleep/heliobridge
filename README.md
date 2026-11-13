@@ -103,7 +103,7 @@ regenerated when missing. Point `HELIOBRIDGE_STATE_DIR` somewhere durable to kee
 | `HELIOBRIDGE_MQTT_BASE` | `heliobridge` | Root of this program's own topics |
 | `HELIOBRIDGE_MQTT_DISCOVERY_PREFIX` | `homeassistant` | Root Home Assistant watches for discovery |
 | `HELIOBRIDGE_MQTT_INSTANCE` | the host name | Distinguishes this bridge from another on the same broker |
-| `HELIOBRIDGE_ALLOW_WRITES` | `true` | `false` publishes every setting as a read-only sensor and refuses every command |
+| `HELIOBRIDGE_ALLOW_WRITES` | `true` | `false` publishes every setting read-only and refuses every command |
 | `HELIOBRIDGE_ALLOW_POWER_PLUS` | `true` | `false` does the same for `power_plus` alone |
 | `HELIOBRIDGE_OFFLINE_AFTER` | `30` | Seconds without telemetry before the device is reported absent |
 | `HELIOBRIDGE_CLOUD_RELAY` | off | Relay to the vendor cloud |
@@ -254,10 +254,15 @@ rejecting, so asking for more than a setting's ceiling shows up as the lower fig
 register's documented range is refused before anything is sent, and a payload naming something unknown is
 logged with the reason rather than being coerced into a register. One bad field refuses the whole payload.
 
-`HELIOBRIDGE_ALLOW_WRITES=false` publishes every setting as a read-only sensor and refuses every command;
-`HELIOBRIDGE_ALLOW_POWER_PLUS=false` does the same for that one setting, which stays visible as a sensor.
-Both close the entity and the command topic together, so a retained or hand-published command cannot reach
-a control that was not offered.
+`HELIOBRIDGE_ALLOW_WRITES=false` publishes every setting as a read-only diagnostic entity and refuses every
+command; `HELIOBRIDGE_ALLOW_POWER_PLUS=false` does the same for that one setting, which stays visible. A switch
+becomes a binary sensor, a choice an `enum` sensor, and everything else a sensor. Both close the entity and the
+command topic together, so a retained or hand-published command cannot reach a control that was not offered.
+
+Changing either replaces the setting entities rather than converting them: Home Assistant keeps
+`number.…_charge_limit_upper` and `sensor.…_charge_limit_upper` apart, so history starts again under the new
+entity, and automations naming the old one need updating. Treat it as a deployment decision rather than a
+switch to flip back and forth.
 
 For the Energy dashboard: `pv_energy_total` as solar production, `battery_charge_energy_today` and
 `battery_discharge_energy_today` as the battery pair. The grid slots need a meter at the boundary, which this

@@ -273,7 +273,8 @@ impl Discovery<'_> {
                 config.insert("state_on".to_owned(), json!(1));
                 config.insert("state_off".to_owned(), json!(0));
             }
-            Shape::Choice(labels) => {
+            // A select and an `enum` sensor both take the set as `options`.
+            Shape::Choice(labels) | Shape::Labelled(labels) => {
                 config.insert("options".to_owned(), json!(labels));
             }
             Shape::TimeOfDay => {
@@ -347,7 +348,7 @@ impl Discovery<'_> {
                 // Rebooting hardware is not something to offer by accident.
                 config.insert("enabled_by_default".to_owned(), json!(false));
             }
-            Shape::Reading(_) | Shape::Signal { .. } | Shape::Flags => {}
+            Shape::Reading(_) | Shape::Signal { .. } | Shape::Flags | Shape::Labelled(_) => {}
         }
     }
 }
@@ -840,6 +841,43 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_switch_reads_on_or_off_and_a_choice_reads_its_label() {
+        let writable = Catalogue::default().entities(&Growatt);
+        let read_only = (Catalogue {
+            permitted: Permitted {
+                writes: false,
+                ..Permitted::default()
+            },
+            ..Catalogue::default()
+        })
+        .entities(&Growatt);
+        let find = |entities: &[Entity], key: &str| {
+            entities
+                .iter()
+                .find(|entity| entity.key == key)
+                .cloned()
+                .unwrap_or_else(|| panic!("{key} missing"))
+        };
+
+        // The settings object carries a switch as 0 or 1.
+        let switch = find(&read_only, "always_on");
+        assert_eq!(switch.component, Component::BinarySensor);
+        let config = payload(&switch);
+        assert_eq!(config["payload_on"], "1");
+        assert_eq!(config["payload_off"], "0");
+
+        // The settings object carries a choice as its label, so the sensor needs the same set the select
+        // offered — and no unit, which Home Assistant refuses on an `enum` sensor.
+        let choice = payload(&find(&read_only, "slot1_work_mode"));
+        assert_eq!(choice["device_class"], "enum");
+        assert_eq!(
+            choice["options"],
+            payload(&find(&writable, "slot1_work_mode"))["options"]
+        );
+        assert!(choice.get("unit_of_measurement").is_none());
+    }
+
+    #[test]
     fn one_setting_can_be_left_as_a_reading_while_the_rest_stay_writable() {
         // The control is not offered, and the command topic it would have written to is not named — so
         // Home Assistant has nothing to send even before the command handler refuses it.
@@ -856,7 +894,7 @@ mod tests {
             .iter()
             .find(|entity| entity.key == "power_plus")
             .expect("still published");
-        assert_eq!(power_plus.component, Component::Sensor);
+        assert_eq!(power_plus.component, Component::BinarySensor);
         assert!(payload(power_plus).get("command_topic").is_none());
         // Visible, so whether it is on can still be read.
         assert_eq!(

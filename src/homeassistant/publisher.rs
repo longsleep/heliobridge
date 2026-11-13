@@ -675,8 +675,12 @@ impl<D: Registers + Describes> Link<D> {
             None => Catalogue::everything(self.driver.as_ref()),
         };
 
-        let retired = if first { Catalogue::RETIRED } else { &[] };
-        let gone = Self::retractions(&previous, keeping, retired);
+        let retired = if first {
+            Catalogue::retired(self.driver.as_ref())
+        } else {
+            Vec::new()
+        };
+        let gone = Self::retractions(&previous, keeping, &retired);
 
         for (component, key) in &gone {
             let topic = self.topics.discovery(*component, &self.device, key);
@@ -687,9 +691,9 @@ impl<D: Registers + Describes> Link<D> {
 
     /// Which discovery topics need an empty retained payload.
     ///
-    /// Pure, and separated from the publishing for one reason: [`Catalogue::RETIRED`] is empty in every
-    /// build that has shipped, so the branch that sweeps it would otherwise never execute and could rot
-    /// unnoticed until the day it mattered. A test passes a synthetic entry through here instead.
+    /// Pure, and separated from the publishing so the sweep of [`Catalogue::retired`] can be driven with a
+    /// synthetic entry: the real list only matters on a broker that still holds an old release's messages,
+    /// which no test here has.
     fn retractions(
         previous: &[Entity],
         keeping: &[Entity],
@@ -2023,15 +2027,32 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_switch_left_as_a_sensor_by_an_older_release_is_withdrawn() {
+        // Up to 0.8.x a switch that could not be written was announced as a sensor, which Home Assistant
+        // refused; it is a binary sensor now, so its old topic is one nothing produces any more. Every
+        // slot's switch included, not only the slots this run exposes.
+        let keeping = Catalogue::everything(&Growatt);
+        let gone = Link::<Growatt>::retractions(&[], &keeping, &Catalogue::retired(&Growatt));
+        for key in ["always_on", "power_plus", "slot1_enabled", "slot9_enabled"] {
+            assert!(
+                gone.contains(&(Component::Sensor, key)),
+                "sensor/{key} is left behind: {gone:?}"
+            );
+        }
+        // The sensors that are still sensors stay.
+        assert!(!gone.contains(&(Component::Sensor, "slot1_output_power")), "{gone:?}");
+    }
+
+    #[test]
     fn the_shipped_retired_list_names_nothing_still_published() {
-        // A guard for the future rather than for today, since the list is empty: an entry left in place
-        // after its key was reintroduced would silently retract a live entity on every reconnect.
+        // An entry left in place after its key was reintroduced would silently retract a live entity on
+        // every reconnect.
         let live = Catalogue::everything(&Growatt);
-        for (component, key) in Catalogue::RETIRED {
+        for (component, key) in Catalogue::retired(&Growatt) {
             assert!(
                 !live
                     .iter()
-                    .any(|entity| entity.key == *key && entity.component == *component),
+                    .any(|entity| entity.key == key && entity.component == component),
                 "{component}/{key} is both retired and published"
             );
         }
