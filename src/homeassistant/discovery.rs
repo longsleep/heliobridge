@@ -823,6 +823,23 @@ mod tests {
     }
 
     #[test]
+    fn only_a_control_is_filed_under_config() {
+        // Home Assistant refuses to add a sensor carrying `entity_category: config`, and the refusal is
+        // only a log line: the entity sits unavailable. Every form of every setting is checked, read-only
+        // ones included, since that is where it went wrong.
+        for entity in Catalogue::everything(&Growatt) {
+            if payload(&entity).get("entity_category") == Some(&Value::from("config")) {
+                assert!(
+                    is_control(entity.component),
+                    "{} {} is filed under config",
+                    entity.component,
+                    entity.key
+                );
+            }
+        }
+    }
+
+    #[test]
     fn one_setting_can_be_left_as_a_reading_while_the_rest_stay_writable() {
         // The control is not offered, and the command topic it would have written to is not named — so
         // Home Assistant has nothing to send even before the command handler refuses it.

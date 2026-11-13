@@ -787,6 +787,11 @@ impl Entity {
     /// What `HELIOBRIDGE_ALLOW_WRITES=false` produces: a setting still worth seeing, published as a plain
     /// reading so Home Assistant offers no control that would be refused. A read-only `number` would still
     /// draw a spinbox.
+    ///
+    /// **Diagnostic, not config.** Home Assistant reserves `config` for entities that change something and
+    /// refuses to add a sensor carrying it — every read-only setting was rejected that way, and sat
+    /// unavailable, until this said otherwise. `diagnostic` is its category for configuration that can be
+    /// seen but not changed, which is exactly this.
     #[must_use]
     pub fn into_read_only(self) -> Self {
         if !self.is_writable() {
@@ -796,6 +801,7 @@ impl Entity {
             component: Component::Sensor,
             // Nothing here accumulates: these are positions and limits, not counters.
             shape: Shape::Reading(None),
+            category: Some(Category::Diagnostic),
             ..self
         }
     }
