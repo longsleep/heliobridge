@@ -305,10 +305,12 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::float(11, "battery_charge_power", Watt, Scaling::SIGNED, Verified),
         Entry::int(12, "battery_pack_count", Observed),
         Entry::float(13, "battery_soc_total", Percent, Scaling::UNIT, Verified),
-        // 14 and 15 are the BMS's `HeatState` and `APPGuZhangState` — the pack heater and the battery's
-        // app-facing fault word. Named here rather than published: both read zero in every one of the
-        // 408 145 telemetry frames captured from this device, which has no heated pack. A pack that has
-        // one would move 14, and that is the moment to give them entries.
+        // The BMS's `HeatState`, relayed unchanged: bit n is set while pack n+1's heater relay is on, read
+        // out of the BMS's reply builder. The BMS heats below 3 or 5 °C, so this reading zero through a
+        // summer of captures says nothing against it. Not yet seen non-zero, hence inferred.
+        Entry::int(14, "battery_heater_state", Inferred),
+        // 15 is the BMS's `APPGuZhangState`, the battery's app-facing fault word. Named here rather than
+        // published: it read zero in every one of the 408 145 telemetry frames captured from this device.
         //
         // Household draw: the meter reading minus AC power. Two's complement rather than offset-encoded,
         // and negative whenever the house exports more than the device produces. Register 17 excludes load
@@ -1140,9 +1142,9 @@ mod tests {
         assert_eq!(ac.unit, Unit::Watt);
         assert!(ac.scaling.is_signed());
 
-        // 9 and 14 are gaps in the map, not registers with unknown meaning.
+        // 9 and 15 are gaps in the map, not registers with unknown meaning.
         assert!(InputRegister::lookup(Register(9)).is_none());
-        assert!(InputRegister::lookup(Register(14)).is_none());
+        assert!(InputRegister::lookup(Register(15)).is_none());
     }
 
     #[test]

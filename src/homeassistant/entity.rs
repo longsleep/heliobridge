@@ -183,6 +183,9 @@ pub const METER_CONNECTED: &str = "meter_connected";
 /// The reading that says whether the device is actually running off-grid, as against told to.
 pub const OFF_GRID_ACTIVE: &str = "off_grid_mode_active";
 
+/// The BMS's heater state: one bit per pack, set while that pack's heater is energised.
+pub const HEATER_STATE: &str = "battery_heater_state";
+
 /// The control that supplies a meter reading to the device.
 pub const METER_READING: &str = "supplied_meter_reading";
 
@@ -1077,7 +1080,8 @@ fn state_class(device_class: Option<&'static str>) -> StateClass {
 /// By name, as the diagnostics rule is. The register map calls these `*_faults` and the specification
 /// documents them as flags words with a bit table each; nothing else in either map is a bitfield.
 fn is_flags(name: &str) -> bool {
-    name.ends_with("_faults")
+    // The heater state too: a word with one bit per pack, which reads at a glance in hexadecimal.
+    name.ends_with("_faults") || name == HEATER_STATE
 }
 
 /// Whether a reading is a 0/1 condition rather than a quantity, and the device class that says which.
@@ -1141,7 +1145,8 @@ fn diagnostic(name: &str) -> Option<Category> {
         || name.starts_with("smart_plug")
         // A readback of a setting Home Assistant already offers as a switch. It earns a place for the
         // moment the two disagree, not a place on the dashboard beside the switch itself.
-        || name == OFF_GRID_ACTIVE;
+        || name == OFF_GRID_ACTIVE
+        || name == HEATER_STATE;
     equipment.then_some(Category::Diagnostic)
 }
 
@@ -1264,6 +1269,7 @@ const NAMED: &[(&str, &str)] = &[
     ("inverter_temp", "Inverter temperature"),
     ("wifi_signal", "Wi-Fi signal"),
     ("off_grid_mode_active", "Off-grid mode active"),
+    ("battery_heater_state", "Battery heater state"),
     ("smart_plug_power", "Smart plug load"),
     ("smart_plug_connected", "Smart plugs connected"),
 ];
@@ -1271,8 +1277,8 @@ const NAMED: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        Catalogue, Category, Component, Entity, Gate, METER_CONNECTED, OFF_GRID_ACTIVE, Shape, Source, StateClass,
-        VERSION_PARTS,
+        Catalogue, Category, Component, Entity, Gate, HEATER_STATE, METER_CONNECTED, OFF_GRID_ACTIVE, Shape, Source,
+        StateClass, VERSION_PARTS,
     };
     use crate::growatt::driver::Growatt;
     use crate::growatt::v7::registers::{
@@ -1678,6 +1684,17 @@ mod tests {
         assert_eq!(reading("inverter_temp").device_class, Some("temperature"));
         assert_eq!(reading("inverter_temp").precision, Some(1));
         assert_ne!(reading("inverter_temp").name, reading("device_temp").name);
+    }
+
+    #[test]
+    fn the_heater_state_is_shown_as_the_word_the_battery_sends() {
+        // One bit per pack, so which packs are heating reads at a glance in hexadecimal.
+        let heater = reading(HEATER_STATE);
+        assert_eq!(heater.component, Component::Sensor);
+        assert_eq!(heater.shape, Shape::Flags);
+        assert_eq!(heater.unit, None);
+        assert_eq!(heater.device_class, None);
+        assert_eq!(heater.category, Some(Category::Diagnostic));
     }
 
     #[test]
