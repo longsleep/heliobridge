@@ -1262,6 +1262,7 @@ const NAMED: &[(&str, &str)] = &[
     ("default_output_power", "Default output power"),
     // "Grid faults: 0" reads as a count of faults. These are words of flags, and the label has to say so.
     ("internal_faults", "Internal fault flags"),
+    ("battery_faults", "Battery fault flags"),
     ("grid_faults", "Grid fault flags"),
     ("output_faults", "Output fault flags"),
     ("device_temp", "Device temperature"),
@@ -1429,10 +1430,10 @@ mod tests {
 
     #[test]
     fn the_fault_words_are_diagnostics_and_never_look_like_measurements() {
-        // Bitfields with two of forty-eight bits identified: worth exposing so a fault is visible at all,
+        // Bitfields, most of whose bits nobody has seen set: worth exposing so a fault is visible at all,
         // but not on the dashboard, and with nothing about them that suggests a quantity. `Grid faults: 0`
         // reads as a count of faults, and `1024` is not more of anything than `512`.
-        for key in ["internal_faults", "grid_faults", "output_faults"] {
+        for key in ["internal_faults", "grid_faults", "output_faults", "battery_faults"] {
             let entity = reading(key);
             assert_eq!(entity.category, Some(Category::Diagnostic), "{key}");
             assert_eq!(entity.unit, None, "{key}");

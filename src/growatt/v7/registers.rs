@@ -310,8 +310,11 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         // on the hardware variant. Seen 0 → 1 → 0 across a heating cycle that started at 0 °C, in step with
         // a 120 W drop in what reached the cells.
         Entry::int(14, "battery_heater_state", Observed),
-        // 15 is the BMS's `APPGuZhangState`, the battery's app-facing fault word. Named here rather than
-        // published: it read zero in every one of the 408 145 telemetry frames captured from this device.
+        // The BMS's `APPGuZhangState`, relayed unchanged: bit n is set while pack n+1's protection word
+        // carries a fault — cell or pack under- and overvoltage, over-temperature, overcurrent and its
+        // lockouts, short circuit, or a failed MOSFET or collapsed cell. Not cold, not imbalance. Read out of
+        // the BMS; zero in every frame seen, which is what a healthy pack sends.
+        Entry::int(15, "battery_faults", Vendor),
         //
         // Household draw: the meter reading minus AC power. Two's complement rather than offset-encoded,
         // and negative whenever the house exports more than the device produces. Register 17 excludes load
@@ -1143,9 +1146,9 @@ mod tests {
         assert_eq!(ac.unit, Unit::Watt);
         assert!(ac.scaling.is_signed());
 
-        // 9 and 15 are gaps in the map, not registers with unknown meaning.
+        // 9 and 31 are gaps in the map, not registers with unknown meaning.
         assert!(InputRegister::lookup(Register(9)).is_none());
-        assert!(InputRegister::lookup(Register(15)).is_none());
+        assert!(InputRegister::lookup(Register(31)).is_none());
     }
 
     #[test]
