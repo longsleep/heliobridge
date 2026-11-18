@@ -572,8 +572,13 @@ podman run -d --name heliobridge \
 `docker run` takes the same arguments. Under rootless Podman add `--userns=keep-id` if the volume is a
 host path rather than a named volume, so the uid inside matches the owner outside.
 
-The volume must be writable by uid **65532**, which the image runs as. A named volume inherits that on
-first use; a host path needs `chown 65532:65532`.
+The volume must be writable by uid **65532**, which the image runs as. A new named volume takes that
+owner from the image's `/state` on first use; a host path needs `chown 65532:65532`, and so does a named
+volume first used with an image up to 0.9.0, which Docker left owned by root:
+
+```sh
+docker run --rm -v heliobridge-state:/state busybox chown 65532:65532 /state
+```
 
 ### Compose
 
