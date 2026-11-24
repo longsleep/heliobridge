@@ -220,7 +220,9 @@ homeassistant/<component>/heliobridge/<serial>_<field>/config   discovery, retai
 Each entity reads one field out of the shared object with a `value_template`, so a telemetry cycle is one
 publish rather than sixty. Discovery is retained and republished on every broker connection, which makes a
 broker restart, a network blip and a first start the same case; an entity that leaves the catalogue is
-withdrawn with an empty payload rather than left behind.
+withdrawn with an empty payload rather than left behind. While the broker is away, retained messages wait
+for it, the latest per topic, and telemetry is dropped. A broker that stops answering pings is given up on
+within about 40 seconds and reconnected to, rather than left until the kernel notices.
 
 **Two availability topics, listed by every reading with `availability_mode: all`.** This program dying is a
 last will, which the broker publishes for us. A *device* going away is something only this program can see,
