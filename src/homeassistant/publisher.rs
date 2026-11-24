@@ -1038,7 +1038,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::growatt::v7::registers::{BATTERY_FIRST, SMART_SELF_USE, WORK_MODE_LABELS};
-    use crate::homeassistant::broker::{Broker, Event, Publication, Publications};
+    use crate::homeassistant::broker::{Broker, Event, Outbox, Publication, Publications};
     use crate::homeassistant::entity::LAST_UPDATE;
     use crate::homeassistant::topics::{OFFLINE, ONLINE, Topics};
     use core::time::Duration;
@@ -1062,7 +1062,7 @@ mod tests {
 
     /// Everything the link publishes into, drained by the test.
     struct Wire {
-        published: mpsc::Receiver<Publication>,
+        published: Outbox,
         generation: watch::Sender<Generation>,
         farewells: mpsc::Receiver<(String, SessionId)>,
         session: Session,
@@ -1084,9 +1084,13 @@ mod tests {
     }
 
     /// Every message published so far, in order.
-    fn drained(published: &mut mpsc::Receiver<Publication>) -> Vec<Publication> {
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "draining empties the queue; the signature says so even though the outbox locks inside"
+    )]
+    fn drained(published: &mut Outbox) -> Vec<Publication> {
         let mut out = Vec::new();
-        while let Ok(publication) = published.try_recv() {
+        while let Some(publication) = published.try_recv() {
             out.push(publication);
         }
         out
@@ -1096,7 +1100,7 @@ mod tests {
     ///
     /// Draining consumes the queue, so this answers one question per call by design: two questions about
     /// the same batch of messages are asked of a [`drained`] vector instead.
-    fn latest(published: &mut mpsc::Receiver<Publication>, topic: &str) -> Option<Vec<u8>> {
+    fn latest(published: &mut Outbox, topic: &str) -> Option<Vec<u8>> {
         let messages = drained(published);
         messages
             .iter()
@@ -1211,7 +1215,7 @@ mod tests {
     /// Built by hand rather than through [`Publisher::start`], which wants a broker to connect to. What
     /// these tests drive is the reconciliation between the registry and the links, so the broker only has
     /// to hold a queue.
-    fn publisher() -> (Publisher<Growatt>, Registry, mpsc::Receiver<Publication>) {
+    fn publisher() -> (Publisher<Growatt>, Registry, Outbox) {
         let (broker, queue) = Broker::detached();
         let (farewell, ended) = mpsc::channel(FAREWELL_DEPTH);
         let registry = Registry::new();
