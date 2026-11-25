@@ -342,15 +342,26 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::text(27, "serial_number_part_4", 2, Observed),
         Entry::float(29, "battery1_soc", Percent, Scaling::UNIT, Verified),
         Entry::float(30, "battery1_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
+        // Each pack's block carries two condition words beside its charge and temperature, read out of the PD
+        // and BMS firmware (F190): the pack's AlarmEvent, 1 while any of its alarm bits is set, and its
+        // ProtectEvent, the protection word folded to one bit per class — the PD's own debug output calls
+        // these PACK1..4_FAULT. Both read 0 on a healthy three-pack stack.
+        Entry::int(31, "battery1_alarm", Vendor),
+        Entry::int(32, "battery1_protection", Vendor),
         Entry::float(41, "battery2_soc", Percent, Scaling::UNIT, Observed),
         // The per-pack block repeats every 12 registers, so the temperature of pack n sits one past its
-        // state of charge. Inferred from that symmetry alone: the reference device has one pack, which
-        // leaves 42, 54 and 66 reading zero exactly as the unused state-of-charge registers do.
-        Entry::float(42, "battery2_temp", Celsius, Scaling::KELVIN_TENTHS, Inferred),
+        // state of charge. Seen on a three-pack unit for packs 2 and 3; pack 4's follows the pattern.
+        Entry::float(42, "battery2_temp", Celsius, Scaling::KELVIN_TENTHS, Observed),
+        Entry::int(43, "battery2_alarm", Vendor),
+        Entry::int(44, "battery2_protection", Vendor),
         Entry::float(53, "battery3_soc", Percent, Scaling::UNIT, Observed),
-        Entry::float(54, "battery3_temp", Celsius, Scaling::KELVIN_TENTHS, Inferred),
+        Entry::float(54, "battery3_temp", Celsius, Scaling::KELVIN_TENTHS, Observed),
+        Entry::int(55, "battery3_alarm", Vendor),
+        Entry::int(56, "battery3_protection", Vendor),
         Entry::float(65, "battery4_soc", Percent, Scaling::UNIT, Observed),
         Entry::float(66, "battery4_temp", Celsius, Scaling::KELVIN_TENTHS, Inferred),
+        Entry::int(67, "battery4_alarm", Vendor),
+        Entry::int(68, "battery4_protection", Vendor),
         // Four 32-bit counters, each high half first. The high halves read zero throughout the capture,
         // so a 16-bit read of the low half alone gives the same answer today and a wrong one past
         // 6553.5 kWh. Named for what they count: another implementation calls these PV energy, and the
@@ -1146,9 +1157,9 @@ mod tests {
         assert_eq!(ac.unit, Unit::Watt);
         assert!(ac.scaling.is_signed());
 
-        // 9 and 31 are gaps in the map, not registers with unknown meaning.
+        // 9 and 69 are gaps in the map, not registers with unknown meaning.
         assert!(InputRegister::lookup(Register(9)).is_none());
-        assert!(InputRegister::lookup(Register(31)).is_none());
+        assert!(InputRegister::lookup(Register(69)).is_none());
     }
 
     #[test]
