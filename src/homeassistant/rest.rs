@@ -85,6 +85,10 @@ impl RestWatch {
     /// best independent read available, and dropping it the moment a load appears would leave the
     /// diagnostic empty almost always. It is replaced by the next resting measurement.
     ///
+    /// **Pack 1's, throughout.** The cell voltages the device reports are the first pack's alone (F190), so
+    /// they are compared against pack 1's own state of charge — on a stack the total differs, and a pack
+    /// resting at 5 % beside two at 50 % is not a drifted counter.
+    ///
     /// **Rest is decided on measured power where the product measures it.** The controller's own battery
     /// figure reads zero for anything under 24 W either way (F188), so it would take a pack discharging at
     /// 20 W for one at rest.
@@ -106,7 +110,7 @@ impl RestWatch {
         match watts {
             Some(watts) if watts.abs() <= IDLE_WATTS => {
                 let since = *self.since.get_or_insert(now);
-                if let (Some(low), Some(soc)) = (reading("battery_cell_voltage_min"), reading("battery_soc_total"))
+                if let (Some(low), Some(soc)) = (reading("battery_cell_voltage_min"), reading("battery1_soc"))
                     && now.saturating_duration_since(since) >= SETTLE
                 {
                     self.sample = Some(Resting {
@@ -144,7 +148,45 @@ fn credible(millivolts: u16, soc: f64) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CLAIMS_EMPTY, HIGH_PLATEAU, LOW_KNEE, credible};
+    use super::{CLAIMS_EMPTY, HIGH_PLATEAU, LOW_KNEE, RestWatch, SETTLE, credible};
+    use crate::control::{ReadingView, TelemetryView};
+    use crate::driver::catalogue::PowerFlows;
+    use tokio::time::Instant;
+
+    fn reading(name: &'static str, raw: u16, value: &str) -> ReadingView {
+        ReadingView {
+            register: 0,
+            name,
+            raw,
+            value: value.to_owned(),
+            unit: "",
+            confidence: "observed",
+        }
+    }
+
+    #[test]
+    fn a_stack_judges_pack_1s_cells_against_pack_1s_own_state_of_charge() {
+        // Pack 1 at 25 % beside two empty packs: the stack reads 8 %. The cells reported are pack 1's, and
+        // at 3290 mV they are exactly what 25 % rests at — judged against the stack's 8 % they would raise
+        // a drift alarm about a counter that is fine.
+        let view = TelemetryView {
+            timestamp: None,
+            readings: vec![
+                reading("battery_charge_power", 30_000, "0"),
+                reading("battery_cell_voltage_min", 3290, "3.290"),
+                reading("battery_soc_total", 8, "8"),
+                reading("battery1_soc", 25, "25"),
+            ],
+        };
+        let mut watch = RestWatch::default();
+        let start = Instant::now();
+        assert_eq!(watch.observe(&view, start, PowerFlows::default()), None);
+        let rested = watch
+            .observe(&view, start + SETTLE, PowerFlows::default())
+            .expect("a sample once the pack has rested");
+        assert_eq!(rested.millivolts, 3290);
+        assert_eq!(rested.credible, Some(true), "pack 1 at 25 % may rest above the knee");
+    }
 
     #[test]
     fn a_low_percentage_is_only_credible_at_the_knee() {
