@@ -16,9 +16,12 @@ use std::collections::HashSet;
 use serde_json::{Map, Number, Value, json};
 
 use crate::control::{ConfigView, SettingView, TelemetryView};
+use crate::driver::catalogue::PowerFlows;
 use crate::homeassistant::broker::Publication;
 use crate::homeassistant::entity::Entity;
-use crate::homeassistant::entity::{CELL_SPREAD, FIRMWARE_VERSION, LAST_UPDATE, RESTING_VOLTAGE, SOC_CREDIBLE};
+use crate::homeassistant::entity::{
+    CELL_SPREAD, CONVERSION_LOSS, FIRMWARE_VERSION, LAST_UPDATE, RESTING_VOLTAGE, SOC_CREDIBLE,
+};
 use crate::homeassistant::rest::Resting;
 use crate::homeassistant::topics::{OFFLINE, ONLINE};
 
@@ -54,13 +57,17 @@ pub struct StatePayload(Map<String, Value>);
 
 impl StatePayload {
     /// The readings of one telemetry frame.
-    pub fn telemetry(view: &TelemetryView, fields: &Fields, resting: Option<Resting>) -> Self {
+    ///
+    /// Where the product measures a power flow, the measurement is published under the name of the
+    /// reading the controller presents for it, and that reading under its reported name.
+    pub fn telemetry(view: &TelemetryView, fields: &Fields, resting: Option<Resting>, flows: PowerFlows) -> Self {
         let mut object: Map<String, Value> = view
             .readings
             .iter()
             .filter(|reading| fields.contains(reading.name))
             .map(|reading| (reading.name.to_owned(), quantity(&reading.value)))
             .collect();
+        measured(&mut object, view, fields, flows);
         if let Some(spread) = cell_spread(view).filter(|_| fields.contains(CELL_SPREAD)) {
             object.insert(CELL_SPREAD.to_owned(), json!(spread));
         }
@@ -194,6 +201,47 @@ impl StatePayload {
     }
 }
 
+/// Put each measured flow in place of the reading it displaces, and that reading under its reported name.
+///
+/// The presented reading moves whether or not this frame measured anything: a flow whose inputs the frame
+/// lacks is left out rather than filled in with the controller's figure, which is the very thing the
+/// measured value replaces.
+fn measured(object: &mut Map<String, Value>, view: &TelemetryView, fields: &Fields, flows: PowerFlows) {
+    let value = |name: &str| {
+        view.readings
+            .iter()
+            .find(|reading| reading.name == name)
+            .and_then(|reading| reading.value.parse::<f64>().ok())
+    };
+    let measured = flows.measure(value);
+
+    let mut displace = |presented: &'static str, reported: &'static str, inverted: bool, watts: Option<f64>| {
+        if let Some(figure) = object.remove(presented)
+            && fields.contains(reported)
+        {
+            object.insert(reported.to_owned(), figure);
+        }
+        if let Some(watts) = watts.filter(|_| fields.contains(presented)) {
+            // Subtracted from zero rather than negated, so nothing measured is published as `-0.0`.
+            let watts = if inverted { 0.0 - watts } else { watts };
+            object.insert(presented.to_owned(), json!(watts));
+        }
+    };
+    if let Some(flow) = flows.pv {
+        displace(flow.presented, flow.reported, flow.inverted, measured.pv);
+    }
+    if let Some(flow) = flows.battery {
+        displace(flow.presented, flow.reported, flow.inverted, measured.battery);
+    }
+    if let Some(flow) = flows.ac_output {
+        displace(flow.presented, flow.reported, flow.inverted, measured.ac_output);
+    }
+
+    if let Some(loss) = measured.conversion_loss().filter(|_| fields.contains(CONVERSION_LOSS)) {
+        object.insert(CONVERSION_LOSS.to_owned(), json!(loss));
+    }
+}
+
 /// The spread between the highest and lowest cell, in millivolts.
 ///
 /// Derived rather than reported: the device sends the two extremes and not the difference. It earns its
@@ -266,6 +314,8 @@ fn quantity(rendered: &str) -> Value {
 mod tests {
     use super::{CELL_SPREAD, Fields, StatePayload, cell_spread, quantity};
     use crate::control::{ReadingView, SettingView, TelemetryView};
+    use crate::driver::catalogue::Catalogue as _;
+    use crate::driver::catalogue::PowerFlows;
     use crate::growatt::driver::Growatt;
     use crate::homeassistant::entity::Catalogue;
     use crate::homeassistant::entity::LAST_UPDATE;
@@ -348,7 +398,7 @@ mod tests {
         };
         assert_eq!(cell_spread(&half), None);
         assert!(
-            StatePayload::telemetry(&half, &fields(), None)
+            StatePayload::telemetry(&half, &fields(), None, PowerFlows::default())
                 .get(CELL_SPREAD)
                 .is_none()
         );
@@ -365,11 +415,98 @@ mod tests {
                 reading("battery_soc_total", "88"),
             ],
         };
-        let payload = StatePayload::telemetry(&view, &fields(), None);
+        let payload = StatePayload::telemetry(&view, &fields(), None, PowerFlows::default());
         assert_eq!(payload.get("ac_power"), Some(&json!(-100)));
         assert_eq!(payload.get("battery_soc_total"), Some(&json!(88)));
         assert_eq!(payload.get("unknown_81"), None, "nothing can interpret it");
         assert_eq!(payload.len(), 2);
+    }
+
+    /// A frame as a NEXA sent it at 800 W of output with PV just above it: the controller presents 160 W of
+    /// charging, the pack takes 21 W.
+    fn exporting() -> TelemetryView {
+        TelemetryView {
+            timestamp: None,
+            readings: vec![
+                reading("pv_power_total", "959"),
+                reading("battery_charge_power", "160"),
+                reading("ac_power", "-799"),
+                reading("pv1_voltage", "49.00"),
+                reading("pv1_current", "5.00"),
+                reading("pv2_voltage", "51.00"),
+                reading("pv2_current", "4.80"),
+                reading("pv3_voltage", "37.00"),
+                reading("pv3_current", "6.50"),
+                reading("pv4_voltage", "34.00"),
+                reading("pv4_current", "7.00"),
+                reading("battery_voltage", "53.4"),
+                reading("battery_current", "0.4"),
+                reading("on_grid_power", "799.6"),
+                reading("off_grid_power", "0.0"),
+            ],
+        }
+    }
+
+    /// The state object a product would publish for a frame.
+    fn published(device_type: &str, view: &TelemetryView) -> StatePayload {
+        let flows = Growatt.power_flows(Some(device_type));
+        let catalogue = Catalogue {
+            flows,
+            ..Catalogue::default()
+        };
+        StatePayload::telemetry(view, &Fields::of(&catalogue.entities(&Growatt)), None, flows)
+    }
+
+    #[test]
+    fn a_nexa_publishes_what_was_measured_under_the_names_people_read() {
+        let payload = published("72", &exporting());
+
+        // 245.0 + 244.8 + 240.5 + 238.0, the strings rather than the controller's 959.
+        assert_eq!(payload.get("pv_power_total"), Some(&json!(968.3)));
+        assert_eq!(payload.get("battery_charge_power"), Some(&json!(21.4)));
+        // Negative on export, as the presented reading always was.
+        assert_eq!(payload.get("ac_power"), Some(&json!(-799.6)));
+        // What came in and went neither into the battery nor out: the 140-odd watts the controller's
+        // 160 W of "charging" was mostly made of.
+        assert_eq!(payload.get("conversion_loss"), Some(&json!(147.3)));
+
+        assert_eq!(payload.get("pv_power_total_reported"), Some(&json!(959)));
+        assert_eq!(payload.get("battery_charge_power_reported"), Some(&json!(160)));
+        assert_eq!(payload.get("ac_power_reported"), Some(&json!(-799)));
+    }
+
+    #[test]
+    fn a_noah_keeps_its_battery_figure_and_measures_only_its_two_strings() {
+        let payload = published("61", &exporting());
+
+        // Its third and fourth inputs do not exist, so whatever those registers hold is not PV.
+        assert_eq!(payload.get("pv_power_total"), Some(&json!(489.8)));
+        assert_eq!(payload.get("pv_power_total_reported"), Some(&json!(959)));
+        // No battery measurement in its telemetry: register 11 stands, under its own name.
+        assert_eq!(payload.get("battery_charge_power"), Some(&json!(160)));
+        assert_eq!(payload.get("battery_charge_power_reported"), None);
+        assert_eq!(payload.get("ac_power_reported"), None);
+        assert_eq!(payload.get("conversion_loss"), None);
+    }
+
+    #[test]
+    fn a_string_without_panel_voltage_delivers_nothing_whatever_its_current_reads() {
+        // A NEXA at night, as read live: the inputs sit at their own bias of a few volts, and one shows a
+        // third of an amp that no panel is producing.
+        let view = TelemetryView {
+            timestamp: None,
+            readings: vec![
+                reading("pv1_voltage", "6.53"),
+                reading("pv1_current", "0.08"),
+                reading("pv2_voltage", "6.6"),
+                reading("pv2_current", "0.03"),
+                reading("pv3_voltage", "6.81"),
+                reading("pv3_current", "0"),
+                reading("pv4_voltage", "6.86"),
+                reading("pv4_current", "0.34"),
+            ],
+        };
+        assert_eq!(published("72", &view).get("pv_power_total"), Some(&json!(0.0)));
     }
 
     #[test]
@@ -385,7 +522,7 @@ mod tests {
             timestamp: None,
             readings: vec![reading("battery1_temp", "30.4"), reading("battery2_temp", "-273.1")],
         };
-        let payload = StatePayload::telemetry(&view, &one_pack, None);
+        let payload = StatePayload::telemetry(&view, &one_pack, None, PowerFlows::default());
         assert_eq!(payload.get("battery1_temp"), Some(&json!(30.4)));
         assert_eq!(payload.get("battery2_temp"), None);
     }
@@ -483,7 +620,7 @@ mod tests {
             timestamp: None,
             readings: vec![reading("ac_power", "-100")],
         };
-        let bytes = StatePayload::telemetry(&view, &fields(), None).into_bytes();
+        let bytes = StatePayload::telemetry(&view, &fields(), None, PowerFlows::default()).into_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(parsed["ac_power"], json!(-100));
     }

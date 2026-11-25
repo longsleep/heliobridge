@@ -238,6 +238,19 @@ a repeated value is a flat line indistinguishable from a real one. The entity go
 Assistant records a gap. Two entities carry only *this program's* availability, so they keep working through
 an outage and say how stale everything else is: **Device connected** and **Last update**.
 
+**Power is published as measured, not as the device presents it.** The device's own figures for solar,
+battery and AC power are a summary for its app: balanced so they add up, which counts the inverter's
+conversion loss as battery charge, and with small values shown as zero — so a frame can read 0 W of solar
+beside four strings delivering 190 W. **PV power**, **Battery power** and **AC power** carry what
+was measured instead: the strings' voltage times current, the pack's voltage times current, and the
+inverter's own output at a tenth of a watt. **Conversion loss** is what the unit consumed itself — solar
+in, less battery and AC out. The device's figures stay available as **… (reported)**, switched off: they are
+what the vendor's app shows. What is measured depends on the product: a NOAH 2000 reports no battery
+measurement, so its Battery power stays the device's own figure and it has no Conversion loss. For the
+Energy dashboard, use the device's energy counters (PV energy today, Battery charge energy today, Battery
+discharge energy today), which agree with the measured side. Telemetry is published once the device has
+said which product it is, a few seconds into each session.
+
 **Commands** arrive as a JSON object on `heliobridge/<serial>/set`, naming a setting and a value — which is
 what the discovery messages tell Home Assistant to send, and what `mosquitto_pub` can send by hand:
 

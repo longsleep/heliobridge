@@ -106,17 +106,6 @@ impl Telemetry {
         self.get(name)?.as_f64()
     }
 
-    /// Battery charge power as the vendor cloud computes it: `pv_power_total − |ac_power|`.
-    ///
-    /// Some quantities are derived rather than transmitted. This one is also reported directly in
-    /// register 11, and the two agree on every captured frame — so this exists to cross-check the
-    /// decode, and as the fallback if a firmware revision stops populating the register.
-    pub fn derived_battery_charge_power(&self) -> Option<f64> {
-        let pv = self.value("pv_power_total")?;
-        let ac = self.value("ac_power")?;
-        Some(pv - ac.abs())
-    }
-
     /// The device serial as reported inside the register block, reassembled from its four parts.
     ///
     /// A frame carries the serial three times: twice in the header area and once here. They agree,

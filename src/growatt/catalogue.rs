@@ -6,7 +6,9 @@
 //! no counterpart on the other side — how sure anybody is that register 89 is a temperature — stays here,
 //! unasked and unlost.
 
-use crate::driver::catalogue::{ConfigField as ConfigFieldInfo, Measurement, Setting, Shape};
+use crate::driver::catalogue::{
+    ConfigField as ConfigFieldInfo, Flow, Measurement, PowerFlows, Setting, Shape, Strings, VoltAmps,
+};
 use crate::growatt::v7::encode::WritableConfig;
 use crate::growatt::v7::registers::{
     CONFIG_REGISTERS, ConfigRegister, Domain, HoldingRegister, INPUT_REGISTERS, InputRegister, Kind, Role,
@@ -190,3 +192,81 @@ pub fn config_fields() -> Vec<ConfigField> {
         .filter_map(|entry| ConfigField::lookup(entry.register))
         .collect()
 }
+
+/// One PV string, as the MPPT measures it.
+const fn string(volts: &'static str, amps: &'static str) -> VoltAmps {
+    VoltAmps { volts, amps }
+}
+
+/// The NEXA 2000's four PV inputs.
+const NEXA_STRINGS: &[VoltAmps] = &[
+    string("pv1_voltage", "pv1_current"),
+    string("pv2_voltage", "pv2_current"),
+    string("pv3_voltage", "pv3_current"),
+    string("pv4_voltage", "pv4_current"),
+];
+
+/// The NOAH 2000's two PV inputs, at the same registers as the NEXA's first two.
+const NOAH_STRINGS: &[VoltAmps] = &[
+    string("pv1_voltage", "pv1_current"),
+    string("pv2_voltage", "pv2_current"),
+];
+
+/// The voltage from which a string is taken to be delivering.
+///
+/// In the dark the MPPT inputs read 6–7 V with currents up to 0.34 A, about 3 W across the four that no
+/// panel produced. Across three months of one unit's frames, strings under 10 V never exceeded 2.7 W and
+/// real production starts in the 20s.
+const LIVE_VOLTS: u16 = 10;
+
+/// PV, measured on a product's strings rather than taken from register 7.
+///
+/// The power controller builds register 7 for its app (F188): from the MPPT's own total, zeroed below 25 W
+/// and whenever its output rule fires. The strings carry what the panels deliver, from a string's first watt.
+const fn pv(inputs: &'static [VoltAmps]) -> Flow<Strings> {
+    Flow {
+        measured: Strings {
+            inputs,
+            live_volts: LIVE_VOLTS,
+        },
+        presented: "pv_power_total",
+        reported: "pv_power_total_reported",
+        inverted: false,
+    }
+}
+
+/// What the NEXA 2000 measures: every flow.
+///
+/// The battery is the pack's own voltage times the BMS's current, registers 112 and 118 — where register 11
+/// is PV − output, counting the conversion loss as charge and zeroed whenever the BMS sees under 24 W or
+/// disagrees on direction. The AC output is the inverter's own figure, registers 116 and 111 at a tenth of
+/// a watt, where register 5 reads zero below 20 W.
+pub const NEXA_FLOWS: PowerFlows = PowerFlows {
+    pv: Some(pv(NEXA_STRINGS)),
+    battery: Some(Flow {
+        measured: VoltAmps {
+            volts: "battery_voltage",
+            amps: "battery_current",
+        },
+        presented: "battery_charge_power",
+        reported: "battery_charge_power_reported",
+        inverted: false,
+    }),
+    ac_output: Some(Flow {
+        measured: &["on_grid_power", "off_grid_power"],
+        presented: "ac_power",
+        reported: "ac_power_reported",
+        inverted: true,
+    }),
+};
+
+/// What the NOAH 2000 measures in its telemetry: PV alone.
+///
+/// Its two strings are measured as on the NEXA. It carries neither a pack voltage nor a battery current —
+/// registers 112 and 118 read zero — so register 11, which on the NOAH is mostly the BMS's own reading,
+/// stands. It has no AC output at all.
+pub const NOAH_FLOWS: PowerFlows = PowerFlows {
+    pv: Some(pv(NOAH_STRINGS)),
+    battery: None,
+    ac_output: None,
+};

@@ -619,6 +619,7 @@ impl<D: Registers + Describes> Link<D> {
             slots: self.options.slots,
             permitted: self.options.permitted,
             packs: self.packs(),
+            flows: self.driver.power_flows(self.device_type().as_deref()),
         };
         if self
             .announced
@@ -803,14 +804,38 @@ impl<D: Registers + Describes> Link<D> {
     }
 
     /// Publish one telemetry frame.
+    ///
+    /// **Not before the identity report.** Which flows are measured depends on the product, and the first
+    /// frame of a session usually arrives a few seconds ahead of the report that says what the product is.
+    /// Published without it, that frame would carry the controller's presented figure under the name of
+    /// the measured one. The next frame, five seconds on, is published in its place.
     fn publish_telemetry(&mut self, view: &TelemetryView) {
-        let resting = self.rest.observe(view, Instant::now());
-        let payload = StatePayload::telemetry(view, &self.fields, resting);
+        let flows = self
+            .announced
+            .as_ref()
+            .map(|announced| announced.catalogue.flows)
+            .unwrap_or_default();
+        let resting = self.rest.observe(view, Instant::now(), flows);
+        if self.session.identity.borrow().is_none() {
+            return;
+        }
+        let payload = StatePayload::telemetry(view, &self.fields, resting, flows);
         if payload.is_empty() {
             return;
         }
         let publication = payload.publication(self.topics.state(&self.device));
         self.publish(publication);
+    }
+
+    /// The product code the device reported in its identity, once it has.
+    fn device_type(&self) -> Option<String> {
+        self.session.identity.borrow().as_ref().and_then(|identity| {
+            identity
+                .entries
+                .iter()
+                .find(|entry| entry.name.as_deref() == Some("device_type"))
+                .map(|entry| entry.value.clone())
+        })
     }
 
     /// Publish the settings a session has read back.
@@ -1031,7 +1056,8 @@ mod tests {
         reading,
     };
     use crate::control::{
-        IdentityView, ReadingView, Registry, SessionHandle, SessionId, SettingView, StatusView, TelemetryView,
+        ConfigView, IdentityView, ReadingView, Registry, SessionHandle, SessionId, SettingView, StatusView,
+        TelemetryView,
     };
     use crate::growatt::driver::Growatt;
     use crate::homeassistant::rest::RestWatch;
@@ -1056,7 +1082,7 @@ mod tests {
     struct Session {
         telemetry: watch::Sender<Option<TelemetryView>>,
         settings: watch::Sender<Vec<SettingView>>,
-        _identity: watch::Sender<Option<IdentityView>>,
+        identity: watch::Sender<Option<IdentityView>>,
         _requests: mpsc::Receiver<crate::control::Request>,
     }
 
@@ -1165,7 +1191,7 @@ mod tests {
             session: Session {
                 telemetry,
                 settings,
-                _identity: identity,
+                identity,
                 _requests: requests_rx,
             },
         };
@@ -1270,6 +1296,25 @@ mod tests {
                     confidence: "observed",
                 },
             ],
+        }
+    }
+
+    /// An identity report naming the product by its type code, or naming none.
+    fn identity(device_type: Option<&str>) -> IdentityView {
+        IdentityView {
+            declared: 1,
+            truncated: false,
+            endpoint: None,
+            entries: device_type
+                .map(|code| ConfigView {
+                    register: 13,
+                    name: Some("device_type".to_owned()),
+                    role: None,
+                    value: code.to_owned(),
+                })
+                .into_iter()
+                .collect(),
+            reported: Vec::new(),
         }
     }
 
@@ -1403,6 +1448,7 @@ mod tests {
         settle().await;
         wire.drain();
 
+        wire.session.identity.send_replace(Some(identity(None)));
         wire.session.telemetry.send_replace(Some(frame("-100")));
         settle().await;
 
@@ -1411,6 +1457,27 @@ mod tests {
         assert!(!published.retain, "state is replaced within seconds");
         let object: serde_json::Value = serde_json::from_slice(&published.payload).expect("valid JSON");
         assert_eq!(object["ac_power"], serde_json::json!(-100));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_frame_is_published_before_the_device_has_said_what_it_is() {
+        // Which figures are measured depends on the product, and a session's first frame usually comes before
+        // the identity report. Published then, a NEXA's presented battery figure would go out under the name
+        // of the measured one.
+        let mut wire = link(Generation::default().next(), PublisherOptions::default());
+        settle().await;
+        wire.drain();
+
+        wire.session.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        assert!(wire.on("heliobridge/0EXAMPLE00000001/state").is_empty());
+
+        wire.session.identity.send_replace(Some(identity(Some("72"))));
+        settle().await;
+        wire.drain();
+        wire.session.telemetry.send_replace(Some(frame("-100")));
+        settle().await;
+        assert_eq!(wire.on("heliobridge/0EXAMPLE00000001/state").len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1541,6 +1608,7 @@ mod tests {
     async fn a_reconnecting_broker_is_told_everything_again() {
         let mut wire = link(Generation::default().next(), PublisherOptions::default());
         settle().await;
+        wire.session.identity.send_replace(Some(identity(None)));
         wire.session.telemetry.send_replace(Some(frame("-100")));
         settle().await;
         wire.drain();

@@ -580,6 +580,7 @@ mod tests {
             },
             &crate::homeassistant::state::Fields::of(&Catalogue::default().entities(&Growatt)),
             None,
+            crate::driver::catalogue::PowerFlows::default(),
         );
         assert_eq!(payload.get("grid_faults"), Some(&serde_json::json!(1024)));
     }

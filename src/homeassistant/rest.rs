@@ -26,6 +26,7 @@
 //! nothing in between, because a verdict the chemistry cannot support would be worse than no verdict.
 
 use crate::control::TelemetryView;
+use crate::driver::catalogue::PowerFlows;
 
 use core::time::Duration;
 use tokio::time::Instant;
@@ -83,18 +84,24 @@ impl RestWatch {
     /// The sample survives the pack waking up: a voltage measured at rest half an hour ago is still the
     /// best independent read available, and dropping it the moment a load appears would leave the
     /// diagnostic empty almost always. It is replaced by the next resting measurement.
-    pub fn observe(&mut self, view: &TelemetryView, now: Instant) -> Option<Resting> {
+    ///
+    /// **Rest is decided on measured power where the product measures it.** The controller's own battery
+    /// figure reads zero for anything under 24 W either way (F188), so it would take a pack discharging at
+    /// 20 W for one at rest.
+    pub fn observe(&mut self, view: &TelemetryView, now: Instant, flows: PowerFlows) -> Option<Resting> {
         let reading = |name: &str| {
             view.readings
                 .iter()
                 .find(|reading| reading.name == name)
                 .map(|reading| reading.raw)
         };
-        let watts = view
-            .readings
-            .iter()
-            .find(|reading| reading.name == "battery_charge_power")
-            .and_then(|reading| reading.value.parse::<f64>().ok());
+        let value = |name: &str| {
+            view.readings
+                .iter()
+                .find(|reading| reading.name == name)
+                .and_then(|reading| reading.value.parse::<f64>().ok())
+        };
+        let watts = flows.measure(value).battery.or_else(|| value("battery_charge_power"));
 
         match watts {
             Some(watts) if watts.abs() <= IDLE_WATTS => {

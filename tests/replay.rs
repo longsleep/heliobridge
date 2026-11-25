@@ -171,17 +171,18 @@ fn decodes_the_recorded_conditions() {
 }
 
 #[test]
-fn derived_battery_power_matches_the_reported_register() {
-    // The specification states battery charge power is derived by the vendor cloud as
-    // `solar − |ac|`. Register 11 also reports it. Agreement on every fixture is a cross-check on
-    // the signed encoding: get the -30000 delta wrong on either input and these diverge.
+fn battery_power_is_the_controllers_balance_of_pv_and_output() {
+    // Register 11 is not a battery measurement: outside its dead bands the power controller writes
+    // `PV − output` there, so a balanced picture adds up (F188). That holds on every fixture, which makes it
+    // a cross-check on the signed encoding: get the −30000 delta wrong on either input and these diverge.
     for fixture in FIXTURES {
         let frame = Frame::parse(fixture.wire).expect("parse");
         let telemetry = Telemetry::from_frame(&frame).expect("decode");
 
         let reported = telemetry.value("battery_charge_power").expect("register 11");
-        let derived = telemetry.derived_battery_charge_power().expect("both inputs present");
-        close(derived, reported, "derived battery power", fixture.file);
+        let pv = telemetry.value("pv_power_total").expect("register 7");
+        let ac = telemetry.value("ac_power").expect("register 5");
+        close(pv - ac.abs(), reported, "battery power as PV − output", fixture.file);
     }
 }
 
