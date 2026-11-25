@@ -1220,7 +1220,11 @@ const ACRONYMS: &[&str] = &["ac", "dc", "pv", "usb", "id", "ip"];
 ///
 /// Not in [`ACRONYMS`]: these are written short in the protocol and said long by people, so an entity name
 /// carrying the short form asks the reader to know the field name.
-const SPELLED: &[(&str, &str)] = &[("soc", "state of charge"), ("soh", "state of health")];
+const SPELLED: &[(&str, &str)] = &[
+    ("soc", "state of charge"),
+    ("soh", "state of health"),
+    ("temp", "temperature"),
+];
 
 /// Settings published switched off, because nothing is known to depend on them.
 ///
@@ -1238,41 +1242,35 @@ const NAMED: &[(&str, &str)] = &[
     ("anti_backflow_enabled", "Export limitation"),
     ("anti_backflow_power_percent", "Export limit"),
     ("grid_power_allowed", "Grid charging allowed"),
-    ("ac_couple_enabled", "AC couple enable"),
     ("always_on", "Always on"),
     ("battery_soc_total", "Battery state of charge"),
-    ("battery_soh", "Battery health"),
+    ("battery_soh", "Battery state of health"),
     ("battery_charge_status", "Battery status"),
     ("battery_charge_power", "Battery power"),
-    ("battery_charge_energy_today", "Battery charged today"),
-    ("battery_discharge_energy_today", "Battery discharged today"),
-    ("ac_output_energy_today", "AC output today"),
-    ("energy_today", "Energy today"),
-    ("pv_power_total", "Solar power"),
+    ("pv_power_total", "PV power"),
     ("household_load_total", "Household load"),
     ("household_load_excl_groplug", "Household load, excluding plugs"),
     ("charge_limit_upper", "Charge limit, upper"),
     ("charge_limit_lower", "Charge limit, lower"),
-    // Every power that is an *output* says so, so that the three of them read as one family beside the
-    // slot and default settings that command them. The field names are left alone: they are the
-    // specification's, and appear in the state topic and in every capture.
-    ("ac_power", "AC output power"),
-    ("on_grid_power", "On-grid output power"),
-    ("off_grid_power", "Off-grid output power"),
+    // The settings that command output say so, and read as one family with the slots. The measured powers
+    // do not: AC and on-grid power run both ways — negative while the device charges from the grid — and
+    // the off-grid socket only ever delivers, so "output" would add nothing there. Off-grid is hyphenated, as
+    // the words are written, where the generated label would read "Off grid". The field names are left
+    // alone: they are the specification's, and appear in the state topic and in every capture.
+    ("ac_power", "AC power"),
+    ("on_grid_power", "On-grid power"),
+    ("off_grid_voltage", "Off-grid voltage"),
+    ("off_grid_current", "Off-grid current"),
+    ("off_grid_power", "Off-grid power"),
     ("default_output_power", "Default output power"),
     // "Grid faults: 0" reads as a count of faults. These are words of flags, and the label has to say so.
     ("internal_faults", "Internal fault flags"),
     ("battery_faults", "Battery fault flags"),
     ("grid_faults", "Grid fault flags"),
     ("output_faults", "Output fault flags"),
-    ("device_temp", "Device temperature"),
-    ("battery1_temp", "Battery temperature"),
-    ("inverter_temp", "Inverter temperature"),
     ("wifi_signal", "Wi-Fi signal"),
     ("off_grid_mode_active", "Off-grid mode active"),
     ("battery_heater_state", "Battery heater state"),
-    ("smart_plug_power", "Smart plug load"),
-    ("smart_plug_connected", "Smart plugs connected"),
 ];
 
 #[cfg(test)]
@@ -1579,10 +1577,10 @@ mod tests {
     }
 
     #[test]
-    fn a_switch_with_no_observed_effect_carries_the_vendor_label() {
-        // The vendor's own wording, verbatim, and nothing beyond it. The device behaves identically with
-        // this set and clear (F151), so any name describing an effect would be inventing one.
-        assert_eq!(setting("ac_couple_enabled").name, "AC couple enable");
+    fn a_switch_with_no_observed_effect_is_named_for_its_field_alone() {
+        // The field's own words and nothing beyond them. The device behaves identically with this set and
+        // clear (F151), so any name describing an effect would be inventing one.
+        assert_eq!(setting("ac_couple_enabled").name, "AC couple enabled");
         assert_eq!(setting("ac_couple_enabled").component, Component::Switch);
     }
 
@@ -1730,11 +1728,20 @@ mod tests {
     }
 
     #[test]
-    fn a_power_that_is_an_output_says_so() {
-        // They read as one family beside the slot and default settings that command them.
-        assert_eq!(reading("ac_power").name, "AC output power");
-        assert_eq!(reading("on_grid_power").name, "On-grid output power");
-        assert_eq!(reading("off_grid_power").name, "Off-grid output power");
+    fn a_grid_reading_is_named_after_its_field_with_off_grid_written_as_a_word() {
+        // The generated label would read "Off grid voltage" beside "Off-grid power".
+        for (key, name) in [
+            ("grid_voltage", "Grid voltage"),
+            ("grid_current", "Grid current"),
+            ("on_grid_power", "On-grid power"),
+            ("off_grid_voltage", "Off-grid voltage"),
+            ("off_grid_current", "Off-grid current"),
+            ("off_grid_power", "Off-grid power"),
+        ] {
+            assert_eq!(reading(key).name, name);
+        }
+        // AC power runs both ways, so it does not claim to be an output; the settings that command output do.
+        assert_eq!(reading("ac_power").name, "AC power");
         assert_eq!(setting("default_output_power").name, "Default output power");
         assert_eq!(setting("slot1_output_power").name, "Slot 1 output power");
 
