@@ -193,6 +193,123 @@ pub trait ConfigField: fmt::Debug + Clone + Send + Sync + 'static {
     }
 }
 
+/// One power a device measures as a voltage and a current, both by the driver's own field names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoltAmps {
+    /// The voltage reading.
+    pub volts: &'static str,
+    /// The current reading.
+    pub amps: &'static str,
+}
+
+/// A product's PV inputs, and the voltage below which an input has no panel output behind it.
+///
+/// Without light an MPPT input still reads a few volts of its own bias and a current offset of up to a few
+/// hundred milliamps, which multiplies into watts of PV in the dark. Below `live_volts` an input is
+/// counted as delivering nothing. That is a test of whether the current reading means anything, not a
+/// dead band on power: a panel in any light that can deliver sits well above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Strings {
+    /// Each input.
+    pub inputs: &'static [VoltAmps],
+    /// The voltage from which an input is taken to be delivering.
+    pub live_volts: u16,
+}
+
+/// A measured power, and the reading the device's controller presents in its place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Flow<M> {
+    /// What it is measured from.
+    pub measured: M,
+    /// The reading the controller presents for the same quantity.
+    pub presented: &'static str,
+    /// What the presented reading is called once the measured value has taken its name.
+    pub reported: &'static str,
+    /// Whether the presented reading counts the other way: an output that is negative while delivering.
+    pub inverted: bool,
+}
+
+/// How a product's power flows are measured, as against how its controller presents them.
+///
+/// A controller can report its power flows as a summary for its own app rather than as measurements:
+/// balanced so the figures add up, with small values shown as zero. The measurements those figures are
+/// made from are often in the same frame as voltages and currents. This says which, so a consumer can
+/// publish what was measured under the name people already read, and keep the summary beside it.
+///
+/// Per product rather than per driver, because one protocol can serve products that measure different
+/// things. A flow a product does not measure is `None`, and its presented reading stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PowerFlows {
+    /// PV, summed over its inputs.
+    pub pv: Option<Flow<Strings>>,
+    /// The battery, positive while charging.
+    pub battery: Option<Flow<VoltAmps>>,
+    /// The AC output, summed over the readings that carry it, positive while delivering.
+    pub ac_output: Option<Flow<&'static [&'static str]>>,
+}
+
+/// One frame's measured power flows, in watts, rounded to a tenth.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Measured {
+    /// PV, as delivered by the panels.
+    pub pv: Option<f64>,
+    /// The battery, positive while charging.
+    pub battery: Option<f64>,
+    /// The AC output, positive while delivering and negative while drawing from the grid.
+    pub ac_output: Option<f64>,
+}
+
+impl PowerFlows {
+    /// Measure a frame, given its readings by name.
+    ///
+    /// A flow whose inputs are missing from the frame is `None` rather than zero: a zero would be a
+    /// measurement nobody made.
+    pub fn measure(&self, value: impl Fn(&str) -> Option<f64>) -> Measured {
+        let watts = |pair: &VoltAmps| Some(value(pair.volts)? * value(pair.amps)?);
+        let string = |strings: Strings, pair: &VoltAmps| {
+            let volts = value(pair.volts)?;
+            let live = volts >= f64::from(strings.live_volts);
+            Some(if live { volts * value(pair.amps)? } else { 0.0 })
+        };
+        let pv = self.pv.and_then(|flow| {
+            let strings = flow.measured;
+            strings
+                .inputs
+                .iter()
+                .map(|pair| string(strings, pair))
+                .sum::<Option<f64>>()
+        });
+        let battery = self.battery.and_then(|flow| watts(&flow.measured));
+        let ac_output = self
+            .ac_output
+            .and_then(|flow| flow.measured.iter().map(|name| value(name)).sum::<Option<f64>>());
+        Measured {
+            pv: pv.map(tenths),
+            battery: battery.map(tenths),
+            ac_output: ac_output.map(tenths),
+        }
+    }
+}
+
+impl Measured {
+    /// The power the device itself consumes: what came in from the panels, less what went into the
+    /// battery and out of the AC side.
+    ///
+    /// Only where all three are measured. The inputs come from different components and are not sampled
+    /// at the same instant, so a single frame during a step can stand out; across a steady flow it is the
+    /// conversion loss.
+    pub fn conversion_loss(&self) -> Option<f64> {
+        Some(tenths(self.pv? - self.battery? - self.ac_output?))
+    }
+}
+
+/// Rounded to a tenth of a watt: finer than any of the inputs resolves once multiplied.
+///
+/// Adding zero turns the `-0.0` a small negative value rounds to into `0.0`, which is what it is.
+fn tenths(watts: f64) -> f64 {
+    (watts * 10.0).round() / 10.0 + 0.0
+}
+
 /// What a device holds, reports and can be configured with.
 pub trait Catalogue: Wire {
     /// One setting, in the driver's own type.
@@ -240,6 +357,13 @@ pub trait Catalogue: Wire {
     ///
     /// The allowlist, in full, so a surface can offer exactly what exists and refuse the rest by omission.
     fn writable_config(&self) -> Vec<Self::ConfigField>;
+
+    /// How a product's power flows are measured, for a device reporting `device_type`.
+    ///
+    /// Nothing measured by default: the presented readings stand.
+    fn power_flows(&self, _device_type: Option<&str>) -> PowerFlows {
+        PowerFlows::default()
+    }
 }
 
 /// A catalogue entry for a driver that documents nothing.

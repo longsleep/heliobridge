@@ -13,7 +13,9 @@
 use core::fmt;
 use std::collections::HashSet;
 
-use crate::driver::catalogue::{Catalogue as Registers, Measurement, Setting as SettingInfo, Shape as Control};
+use crate::driver::catalogue::{
+    Catalogue as Registers, Measurement, PowerFlows, Setting as SettingInfo, Shape as Control,
+};
 use crate::homeassistant::command::Permitted;
 use crate::model::{Scaling, Unit};
 
@@ -176,6 +178,9 @@ pub const RESTING_VOLTAGE: &str = "battery_resting_cell_voltage";
 
 /// Whether the reported state of charge is credible against that resting voltage.
 pub const SOC_CREDIBLE: &str = "battery_soc_credible";
+
+/// The power the unit consumes itself, which the device does not report as such.
+pub const CONVERSION_LOSS: &str = "conversion_loss";
 
 /// The reading that says whether the device currently has a meter reporting.
 pub const METER_CONNECTED: &str = "meter_connected";
@@ -760,6 +765,28 @@ impl Entity {
         }
     }
 
+    /// The power the unit consumes itself: PV in, less what went into the battery and out of the AC side.
+    ///
+    /// Only where all three are measured, so the balance closes on measurements rather than on the
+    /// controller's presented figures, which count this very loss as charge. Diagnostic: it describes the
+    /// equipment, not where the energy went.
+    pub fn conversion_loss() -> Self {
+        Self {
+            key: CONVERSION_LOSS,
+            name: "Conversion loss".to_owned(),
+            component: Component::Sensor,
+            device_class: Some("power"),
+            unit: Some("W"),
+            category: Some(Category::Diagnostic),
+            precision: Some(0),
+            shape: Shape::Reading(Some(StateClass::Measurement)),
+            source: Some(Source::Telemetry),
+            presence: Presence::Device,
+            enabled: true,
+            gate: None,
+        }
+    }
+
     /// What accessories the device has been told about, over the network and over its LoRa radio.
     ///
     /// Config registers 122 and 102, both carried in the identity report the device sends on every
@@ -870,9 +897,10 @@ pub const BATTERY_PACKS: u16 = 4;
 
 /// Which entities one device gets.
 ///
-/// The three things that vary between installations, in one place: how much of the schedule is exposed,
-/// whether this bridge is allowed to write, and how much battery is attached. All three are known only at
-/// runtime, so the catalogue is built per device rather than being a constant.
+/// The four things that vary between installations, in one place: how much of the schedule is exposed,
+/// whether this bridge is allowed to write, how much battery is attached, and which power flows the product
+/// measures. All four are known only at runtime, so the catalogue is built per device rather than being a
+/// constant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Catalogue {
     /// How many schedule slots get entities, 1–9. Each adds five.
@@ -889,6 +917,11 @@ pub struct Catalogue {
     /// is deliberately no "unknown" here — it would produce a second catalogue identical to this one, and a
     /// second announcement of it.
     pub packs: u16,
+    /// Which of the device's power flows are measured rather than presented.
+    ///
+    /// From the driver, for the product the device says it is, and nothing until it has said: a measured
+    /// flow takes its presented reading's key, so which entities read what depends on the product.
+    pub flows: PowerFlows,
 }
 
 impl Default for Catalogue {
@@ -897,6 +930,7 @@ impl Default for Catalogue {
             slots: 1,
             permitted: Permitted::default(),
             packs: 1,
+            flows: PowerFlows::default(),
         }
     }
 }
@@ -932,13 +966,18 @@ impl Catalogue {
             .collect();
 
         let claimed: HashSet<&'static str> = settings.iter().map(|entity| entity.key).collect();
-        let readings = measurements
+        let readings: Vec<Entity> = measurements
             .iter()
             .filter_map(Entity::for_reading)
             .filter(|entity| self.includes(entity))
-            .filter(|entity| !claimed.contains(entity.key));
+            .filter(|entity| !claimed.contains(entity.key))
+            .collect();
+        let reported = self.reported(&readings);
 
         readings
+            .into_iter()
+            .chain(reported)
+            .chain(self.measures_loss().then(Entity::conversion_loss))
             .chain(settings)
             .chain([Entity::connected(), Entity::last_update(), Entity::bridge_version()])
             .chain([Entity::wifi_signal(), Entity::data_interval(), Entity::serial_number()])
@@ -957,6 +996,40 @@ impl Catalogue {
             .chain(self.permitted.writes.then(Entity::withdraw_meter_reading))
             .chain(self.permitted.writes.then(Entity::pair_lora_accessory))
             .collect()
+    }
+
+    /// The presented readings a measured flow displaces, each under its reported name.
+    ///
+    /// The measured value takes the presented reading's key, so the entity people already have — its
+    /// history, its place on a dashboard — goes on with the measurement. The presented figure stays
+    /// available beside it, switched off: it is the controller's summary, with dead bands, and someone
+    /// comparing against the vendor's app is the one who wants it.
+    fn reported(self, readings: &[Entity]) -> Vec<Entity> {
+        let flows = self.flows;
+        let displaced = [
+            flows.pv.map(|flow| (flow.presented, flow.reported)),
+            flows.battery.map(|flow| (flow.presented, flow.reported)),
+            flows.ac_output.map(|flow| (flow.presented, flow.reported)),
+        ];
+        displaced
+            .into_iter()
+            .flatten()
+            .filter_map(|(presented, key)| {
+                let entity = readings.iter().find(|entity| entity.key == presented)?;
+                Some(Entity {
+                    key,
+                    name: format!("{} (reported)", entity.name),
+                    category: Some(Category::Diagnostic),
+                    enabled: false,
+                    ..entity.clone()
+                })
+            })
+            .collect()
+    }
+
+    /// Whether every flow the conversion loss needs is measured.
+    const fn measures_loss(self) -> bool {
+        self.flows.pv.is_some() && self.flows.battery.is_some() && self.flows.ac_output.is_some()
     }
 
     /// Entities this program once published and no longer does.
@@ -1009,11 +1082,18 @@ impl Catalogue {
     /// differently. Both forms of every setting are included: refusing writes changes an entity's
     /// *component*, and therefore its discovery topic, so a `switch` that became a `binary_sensor` leaves a
     /// retained message behind under its old name.
+    ///
+    /// **The entities a measured flow adds are left out**, deliberately. The first announcement of a session
+    /// comes before the identity report, so before the product — and therefore its flows — is known.
+    /// Reconciling it against them would withdraw them, which removes them from Home Assistant along with
+    /// anyone's choice to enable one, only for the announcement five seconds later to recreate them. A
+    /// device does not change product, so there is nothing for this sweep to clean up.
     pub fn everything<D: Registers>(driver: &D) -> Vec<Entity> {
         let widest = Self {
             slots: driver.slots(),
             permitted: Permitted::default(),
             packs: BATTERY_PACKS,
+            flows: PowerFlows::default(),
         };
         // Two passes cover every component a setting can be published as: with writes refused, each control
         // becomes a reading, and that includes the one setting whose reachability is configurable on its own.
@@ -1279,6 +1359,7 @@ mod tests {
         Catalogue, Category, Component, Entity, Gate, HEATER_STATE, METER_CONNECTED, OFF_GRID_ACTIVE, Shape, Source,
         StateClass, VERSION_PARTS,
     };
+    use crate::driver::catalogue::Catalogue as _;
     use crate::growatt::driver::Growatt;
     use crate::growatt::v7::registers::{
         Availability, ConfigRegister, HOLDING_REGISTERS, HoldingRegister, INPUT_REGISTERS, InputRegister, Kind,
@@ -1337,6 +1418,71 @@ mod tests {
             .find(|entry| entry.name == name)
             .unwrap_or_else(|| panic!("no reading {name}"));
         Entity::for_reading(register).expect("published")
+    }
+
+    /// The catalogue a product gets once it has said what it is.
+    fn identified(device_type: &str) -> Vec<Entity> {
+        Catalogue {
+            flows: Growatt.power_flows(Some(device_type)),
+            ..Catalogue::default()
+        }
+        .entities(&Growatt)
+    }
+
+    #[test]
+    fn a_presented_reading_a_measurement_displaces_stays_beside_it_switched_off() {
+        let nexa = identified("72");
+        let entity = |key: &str| {
+            nexa.iter()
+                .find(|entity| entity.key == key)
+                .unwrap_or_else(|| panic!("no {key}"))
+        };
+
+        // The measurement keeps the key, so the entity people have goes on with it.
+        assert_eq!(entity("battery_charge_power").name, "Battery power");
+        assert!(entity("battery_charge_power").enabled);
+        for (key, name) in [
+            ("battery_charge_power_reported", "Battery power (reported)"),
+            ("pv_power_total_reported", "PV power (reported)"),
+            ("ac_power_reported", "AC power (reported)"),
+        ] {
+            let reported = entity(key);
+            assert_eq!(reported.name, name);
+            assert!(
+                !reported.enabled,
+                "{key} is the controller's summary, not for a dashboard"
+            );
+            assert_eq!(reported.category, Some(Category::Diagnostic));
+            assert_eq!(reported.device_class, Some("power"));
+        }
+        assert!(entity("conversion_loss").enabled);
+
+        let noah = identified("61");
+        let keys: Vec<&str> = noah.iter().map(|entity| entity.key).collect();
+        assert!(keys.contains(&"pv_power_total_reported"));
+        for absent in ["battery_charge_power_reported", "ac_power_reported", "conversion_loss"] {
+            assert!(
+                !keys.contains(&absent),
+                "a NOAH measures nothing that would displace {absent}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_announcement_of_a_session_does_not_sweep_away_measured_flow_entities() {
+        // It comes before the identity report, and withdrawing these would delete them from Home Assistant
+        // — with anyone's choice to enable one — five seconds before they are announced again.
+        let swept: Vec<&str> = Catalogue::everything(&Growatt)
+            .iter()
+            .map(|entity| entity.key)
+            .collect();
+        for key in identified("72")
+            .iter()
+            .map(|entity| entity.key)
+            .filter(|key| key.ends_with("_reported") || *key == "conversion_loss")
+        {
+            assert!(!swept.contains(&key), "{key} would be withdrawn at every connect");
+        }
     }
 
     #[test]

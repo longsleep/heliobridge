@@ -29,7 +29,8 @@
 //! This type is therefore the hook a per-product telemetry map would hang from. It does not select one
 //! yet: only the NEXA map exists, and inventing a second from a third-party table without hardware to
 //! check it against would be a worse outcome than a wrong label. What it does today is stop the device
-//! page claiming to be something it is not, and make the product visible in a log.
+//! page claiming to be something it is not, make the product visible in a log, and choose which of the
+//! power flows the telemetry carries are measured rather than presented (F188).
 //!
 //! # On unrecognised codes
 //!
@@ -37,6 +38,9 @@
 //! to someone whose product postdates this list, and a code it has not been taught is not a reason to
 //! leave a device unserved — the frames decode the same way regardless. Callers present it as the vendor
 //! name alone.
+
+use crate::driver::catalogue::PowerFlows;
+use crate::growatt::catalogue::{NEXA_FLOWS, NOAH_FLOWS};
 
 /// Declare the product table once, and generate everything that has to agree with it.
 ///
@@ -121,6 +125,22 @@ impl Product {
     /// saying once in a log rather than never.
     pub const fn telemetry_map_matches(self) -> bool {
         matches!(self, Self::Nexa2000)
+    }
+
+    /// What this product measures of its power flows, beyond what its controller presents.
+    ///
+    /// Nothing for a product this bridge has not been taught, or one not yet identified: its presented
+    /// readings stand until it is known which measurements it carries.
+    pub const fn power_flows(self) -> PowerFlows {
+        match self {
+            Self::Nexa2000 => NEXA_FLOWS,
+            Self::Noah2000 => NOAH_FLOWS,
+            Self::Aura5000 | Self::Veta2200 | Self::Unrecognised => PowerFlows {
+                pv: None,
+                battery: None,
+                ac_output: None,
+            },
+        }
     }
 }
 

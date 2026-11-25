@@ -1912,14 +1912,36 @@ where
     /// Emit a decoded telemetry frame: a short line at `info`, every field at `trace`.
     fn log_telemetry(&self, telemetry: &Telemetry<'_>) {
         let field = |name: &str| telemetry.value(name).unwrap_or(f64::NAN);
+        let device_type = self.identity.as_ref().and_then(|held| held.get("device_type"));
+        let flows = self.driver.power_flows(device_type);
+        let measured = flows.measure(|name| telemetry.value(name));
+        // Named and valued as Home Assistant has them, so a log line and a dashboard can be read against each
+        // other: where the product measures a flow, the measurement carries the presented reading's name and
+        // sign, and the presented figure moves to its reported name.
+        let shown = |name: &str, measures: bool, watts: Option<f64>, inverted: bool| {
+            if !measures {
+                return (field(name), f64::NAN);
+            }
+            let watts = watts.map_or(f64::NAN, |watts| if inverted { 0.0 - watts } else { watts });
+            (watts, field(name))
+        };
+        let (pv, pv_reported) = shown("pv_power_total", flows.pv.is_some(), measured.pv, false);
+        let (battery, battery_reported) =
+            shown("battery_charge_power", flows.battery.is_some(), measured.battery, false);
+        let ac_inverted = flows.ac_output.is_some_and(|flow| flow.inverted);
+        let (ac, ac_reported) = shown("ac_power", flows.ac_output.is_some(), measured.ac_output, ac_inverted);
         tracing::info!(
             timestamp = telemetry
                 .at
                 .map_or_else(|| "none".to_owned(), |stamp| stamp.to_string()),
-            pv_w = field("pv_power_total"),
-            ac_w = field("ac_power"),
-            battery_w = field("battery_charge_power"),
-            soc_pct = field("battery_soc_total"),
+            pv_power_total = pv,
+            battery_charge_power = battery,
+            ac_power = ac,
+            conversion_loss = measured.conversion_loss().unwrap_or(f64::NAN),
+            pv_power_total_reported = pv_reported,
+            battery_charge_power_reported = battery_reported,
+            ac_power_reported = ac_reported,
+            battery_soc_total = field("battery_soc_total"),
             relayed = self.relay.is_some(),
             "telemetry"
         );

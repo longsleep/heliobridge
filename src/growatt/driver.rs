@@ -10,7 +10,7 @@
 //! would change.
 
 use crate::driver::arbiter::{Arbiter, Direction, Intent};
-use crate::driver::catalogue::Catalogue;
+use crate::driver::catalogue::{Catalogue, PowerFlows};
 use core::time::Duration;
 
 use crate::driver::accessories::{Enrolled, Enrols};
@@ -90,6 +90,10 @@ impl Catalogue for Growatt {
 
     fn measurements(&self) -> Vec<Self::Measurement> {
         catalogue::measurements()
+    }
+
+    fn power_flows(&self, device_type: Option<&str>) -> PowerFlows {
+        Product::reported(device_type).power_flows()
     }
 
     fn config(&self, register: Register) -> Option<Self::ConfigField> {
