@@ -694,10 +694,12 @@ impl Entity {
     /// a pack that diverges at the top of charge terminates early — which is what makes the BMS's own
     /// health estimate read low. Diagnostic rather than a reading: it says something about the hardware's
     /// condition, not about the energy flowing.
+    ///
+    /// Pack 1's, like the two cell voltages it comes from: on a stack they are the first pack's alone.
     pub fn cell_spread() -> Self {
         Self {
             key: CELL_SPREAD,
-            name: "Battery cell spread".to_owned(),
+            name: "Battery 1 cell spread".to_owned(),
             component: Component::Sensor,
             device_class: Some("voltage"),
             unit: Some("mV"),
@@ -720,10 +722,11 @@ impl Entity {
     ///
     /// Unavailable until the pack has rested that long, which is honest: there is no such measurement
     /// before then, and a live value in its place would invite exactly the comparison it cannot support.
+    /// Pack 1's, as the cell voltages are.
     pub fn resting_voltage() -> Self {
         Self {
             key: RESTING_VOLTAGE,
-            name: "Battery resting cell voltage".to_owned(),
+            name: "Battery 1 resting cell voltage".to_owned(),
             component: Component::Sensor,
             device_class: Some("voltage"),
             unit: Some("mV"),
@@ -747,11 +750,11 @@ impl Entity {
     ///
     /// It reports nothing across most of the range, since lithium iron phosphate rests at almost the same
     /// voltage from a fifth full to four fifths. The chemistry only speaks at the knees, so that is where
-    /// this speaks.
+    /// this speaks. Pack 1's cells against pack 1's own state of charge, which on a single pack is the total.
     pub fn soc_credible() -> Self {
         Self {
             key: SOC_CREDIBLE,
-            name: "State of charge disagrees with cell voltage".to_owned(),
+            name: "Battery 1 state of charge disagrees with cell voltage".to_owned(),
             component: Component::BinarySensor,
             device_class: Some("problem"),
             unit: None,
@@ -1325,6 +1328,10 @@ const NAMED: &[(&str, &str)] = &[
     ("always_on", "Always on"),
     ("battery_soc_total", "Battery state of charge"),
     ("battery_soh", "Battery state of health"),
+    // The BMS reports the cell extremes of the first pack alone, on a stack too: the field says "battery",
+    // and taken for the whole stack it would hide the other packs' cells (F190).
+    ("battery_cell_voltage_max", "Battery 1 cell voltage max"),
+    ("battery_cell_voltage_min", "Battery 1 cell voltage min"),
     ("battery_charge_status", "Battery status"),
     ("battery_charge_power", "Battery power"),
     ("pv_power_total", "PV power"),
