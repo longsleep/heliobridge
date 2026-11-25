@@ -1163,8 +1163,9 @@ fn state_class(device_class: Option<&'static str>) -> StateClass {
 /// By name, as the diagnostics rule is. The register map calls these `*_faults` and the specification
 /// documents them as flags words with a bit table each; nothing else in either map is a bitfield.
 fn is_flags(name: &str) -> bool {
-    // The heater state too: a word with one bit per pack, which reads at a glance in hexadecimal.
-    name.ends_with("_faults") || name == HEATER_STATE
+    // The heater state too: a word with one bit per pack, which reads at a glance in hexadecimal. And each
+    // pack's protection word, one bit per class of protection.
+    name.ends_with("_faults") || name.ends_with("_protection") || name == HEATER_STATE
 }
 
 /// Whether a reading is a 0/1 condition rather than a quantity, and the device class that says which.
@@ -1180,6 +1181,8 @@ fn signal_class(name: &str) -> Option<&'static str> {
     match name {
         METER_CONNECTED => Some("connectivity"),
         OFF_GRID_ACTIVE => Some("running"),
+        // A pack's alarm state: 1 while any of its alarm bits is set, which Home Assistant reads as Problem.
+        _ if name.ends_with("_alarm") => Some("problem"),
         _ => None,
     }
 }
@@ -1223,6 +1226,9 @@ fn diagnostic(name: &str) -> Option<Category> {
         // reading of what the house is doing.
         || name.contains("cell")
         || name.contains("fault")
+        // A pack's alarm and protection words: its condition, for the moment something is wrong.
+        || name.ends_with("_alarm")
+        || name.ends_with("_protection")
         // The vendor's smart plugs, on the same footing as the other accessories: something an
         // installation either has or has not, and zero throughout for one that has not.
         || name.starts_with("smart_plug")
@@ -1355,6 +1361,10 @@ const NAMED: &[(&str, &str)] = &[
     ("battery_faults", "Battery fault flags"),
     ("grid_faults", "Grid fault flags"),
     ("output_faults", "Output fault flags"),
+    ("battery1_protection", "Battery 1 protection flags"),
+    ("battery2_protection", "Battery 2 protection flags"),
+    ("battery3_protection", "Battery 3 protection flags"),
+    ("battery4_protection", "Battery 4 protection flags"),
     ("wifi_signal", "Wi-Fi signal"),
     ("off_grid_mode_active", "Off-grid mode active"),
     ("battery_heater_state", "Battery heater state"),
@@ -1490,6 +1500,34 @@ mod tests {
         {
             assert!(!swept.contains(&key), "{key} would be withdrawn at every connect");
         }
+    }
+
+    #[test]
+    fn each_attached_pack_reports_its_alarm_and_protection_and_no_other_does() {
+        let three = Catalogue {
+            packs: 3,
+            ..Catalogue::default()
+        }
+        .entities(&Growatt);
+        let entity = |key: &str| three.iter().find(|entity| entity.key == key);
+
+        for pack in ["battery1", "battery2", "battery3"] {
+            let alarm = entity(&format!("{pack}_alarm")).unwrap_or_else(|| panic!("no alarm for {pack}"));
+            assert_eq!(alarm.component, Component::BinarySensor);
+            assert_eq!(alarm.device_class, Some("problem"));
+            assert_eq!(alarm.category, Some(Category::Diagnostic));
+
+            let protection =
+                entity(&format!("{pack}_protection")).unwrap_or_else(|| panic!("no protection for {pack}"));
+            assert_eq!(protection.shape, Shape::Flags, "a protection word is one bit per class");
+            assert_eq!(protection.category, Some(Category::Diagnostic));
+            assert!(
+                protection.name.ends_with("protection flags"),
+                "0 is not a count of protections"
+            );
+        }
+        assert!(entity("battery4_alarm").is_none(), "a fourth pack is not attached");
+        assert!(entity("battery4_protection").is_none());
     }
 
     #[test]
