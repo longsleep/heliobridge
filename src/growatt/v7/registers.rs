@@ -306,9 +306,10 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::int(12, "battery_pack_count", Observed),
         Entry::float(13, "battery_soc_total", Percent, Scaling::UNIT, Verified),
         // The BMS's `HeatState`, relayed unchanged: bit n is set while pack n+1's heater relay is on, read
-        // out of the BMS's reply builder. The heater runs only while charging, below 3.1 or 5.1 °C depending
-        // on the hardware variant. Seen 0 → 1 → 0 across a heating cycle that started at 0 °C, in step with
-        // a 120 W drop in what reached the cells.
+        // out of the BMS's reply builder. The heater runs while a charging source is present — solar alone
+        // counts, with the battery idle — below 3.1 or 5.1 °C depending on the hardware variant. Seen 0 → 1 → 0
+        // across a heating cycle that started at 0 °C, in step with a 120 W drop in what reached the cells; and
+        // on weak sun, switching every few seconds for five hours (F193).
         Entry::int(14, "battery_heater_state", Observed),
         // The BMS's `APPGuZhangState`, relayed unchanged: bit n is set while pack n+1's protection word
         // carries a fault — cell or pack under- and overvoltage, over-temperature, overcurrent and its

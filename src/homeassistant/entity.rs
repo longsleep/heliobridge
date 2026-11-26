@@ -783,7 +783,9 @@ impl Entity {
     /// winter morning's slow charge (F184). `running` because Home Assistant then says *Running*, which is
     /// what a heater either is; `heat` would read *Hot*, the opposite of why it is on.
     ///
-    /// Pack 1's bit was seen to follow a heating cycle; the other packs' are read out of the BMS firmware.
+    /// On weak sun with the battery idle it runs from the solar side and switches every few seconds (F193):
+    /// that toggling is the relay, not noise. Pack 1's bit was seen to follow both; the other packs' are read
+    /// out of the BMS firmware.
     pub fn heater(key: &'static str, pack: u16) -> Self {
         Self {
             key,
