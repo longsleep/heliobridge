@@ -440,7 +440,9 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         // biases the pack temperatures. Distinct from `device_temp`: across the capture this runs
         // 11.8 to 74.7 °C while `device_temp` peaks at 51.1 °C, which is a heatsink against a board.
         Entry::float(113, "inverter_temp", Celsius, Scaling::KELVIN_TENTHS, Observed),
-        Entry::float(114, "unknown_114", NoUnit, Scaling::UNIT, Inferred),
+        // The inverter's DC bus, which the power controller calls `GET_INV_BUS_V` (F192). 406.6 to 482.7 V in
+        // every frame where the device fed the grid, and about 14.6 V with the inverter stopped.
+        Entry::float(114, "inverter_bus_voltage", Volt, Scaling::TENTHS, Observed),
         Entry::float(115, "grid_voltage", Volt, Scaling::HUNDREDTHS, Observed),
         // The on-grid half: zero while the device runs off-grid, which is what separates it from
         // register 5. Register 5 reports whichever output is live; this one only the grid.
