@@ -1239,9 +1239,11 @@ fn diagnostic(name: &str) -> Option<Category> {
         // moment the two disagree, not a place on the dashboard beside the switch itself.
         || name == OFF_GRID_ACTIVE
         || name == HEATER_STATE
-        // A voltage inside the unit that is the pack's only while current flows, and floats between 18 and
-        // 58 V when it does not: something to look at while investigating, not beside the readings.
-        || name == "inverter_input_voltage";
+        // Voltages inside the unit: the inverter's input, which is the pack's only while current flows and
+        // floats between 18 and 58 V when it does not, and the inverter's DC bus. Something to look at while
+        // investigating, not beside the readings.
+        || name == "inverter_input_voltage"
+        || name == "inverter_bus_voltage";
     equipment.then_some(Category::Diagnostic)
 }
 
@@ -1834,6 +1836,8 @@ mod tests {
             "smart_plug_connected",
             "smart_plug_power",
             "off_grid_mode_active",
+            "inverter_input_voltage",
+            "inverter_bus_voltage",
         ] {
             assert_eq!(reading(key).category, Some(Category::Diagnostic), "{key}");
         }
