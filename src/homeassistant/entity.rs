@@ -191,6 +191,14 @@ pub const OFF_GRID_ACTIVE: &str = "off_grid_mode_active";
 /// The BMS's heater state: one bit per pack, set while that pack's heater is energised.
 pub const HEATER_STATE: &str = "battery_heater_state";
 
+/// Each pack's heater, decoded from [`HEATER_STATE`]: the entry at index n reads bit n, pack n+1's relay.
+pub const HEATERS: [&str; 4] = [
+    "battery1_heater",
+    "battery2_heater",
+    "battery3_heater",
+    "battery4_heater",
+];
+
 /// The control that supplies a meter reading to the device.
 pub const METER_READING: &str = "supplied_meter_reading";
 
@@ -768,6 +776,31 @@ impl Entity {
         }
     }
 
+    /// Whether one pack's heater is energised, from its bit of [`HEATER_STATE`].
+    ///
+    /// On the dashboard rather than among the diagnostics: a heater draws about 120 W out of what charging
+    /// delivers and runs while the BMS caps the charge current for the cold, so it is the explanation for a
+    /// winter morning's slow charge (F184). `running` because Home Assistant then says *Running*, which is
+    /// what a heater either is; `heat` would read *Hot*, the opposite of why it is on.
+    ///
+    /// Pack 1's bit was seen to follow a heating cycle; the other packs' are read out of the BMS firmware.
+    pub fn heater(key: &'static str, pack: u16) -> Self {
+        Self {
+            key,
+            name: format!("Battery {pack} heater"),
+            component: Component::BinarySensor,
+            device_class: Some("running"),
+            unit: None,
+            category: None,
+            precision: None,
+            shape: Shape::Signal { on: "1", off: "0" },
+            source: Some(Source::Telemetry),
+            presence: Presence::Device,
+            enabled: true,
+            gate: None,
+        }
+    }
+
     /// The power the unit consumes itself: PV in, less what went into the battery and out of the AC side.
     ///
     /// Only where all three are measured, so the balance closes on measurements rather than on the
@@ -975,6 +1008,18 @@ impl Catalogue {
             .filter(|entity| self.includes(entity))
             .filter(|entity| !claimed.contains(entity.key))
             .collect();
+        // One per attached pack, decoded from the word that carries them all, and only where the product's
+        // map has that word.
+        let heaters: Vec<Entity> = if reported.contains(HEATER_STATE) {
+            HEATERS
+                .into_iter()
+                .zip(1_u16..)
+                .map(|(key, pack)| Entity::heater(key, pack))
+                .filter(|entity| self.includes(entity))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let reported = self.reported(&readings);
 
         readings
@@ -990,6 +1035,7 @@ impl Catalogue {
                 Entity::accessory_list("accessory_list_rf", "Accessories on the LoRa radio"),
             ])
             .chain([Entity::cell_spread(), Entity::resting_voltage(), Entity::soc_credible()])
+            .chain(heaters)
             // An action has nothing to publish but a control, so refusing writes withdraws it entirely
             // rather than downgrading it to a reading the way a setting does. The meter controls go the
             // same way: both are write-only, so read-only versions of them would be entities that can
@@ -1536,6 +1582,44 @@ mod tests {
         }
         assert!(entity("battery4_alarm").is_none(), "a fourth pack is not attached");
         assert!(entity("battery4_protection").is_none());
+    }
+
+    #[test]
+    fn each_attached_pack_has_a_heater_on_the_dashboard_and_no_other_does() {
+        let three = Catalogue {
+            packs: 3,
+            ..Catalogue::default()
+        }
+        .entities(&Growatt);
+        let entity = |key: &str| three.iter().find(|entity| entity.key == key);
+
+        for (key, name) in [
+            ("battery1_heater", "Battery 1 heater"),
+            ("battery2_heater", "Battery 2 heater"),
+            ("battery3_heater", "Battery 3 heater"),
+        ] {
+            let heater = entity(key).unwrap_or_else(|| panic!("no {key}"));
+            assert_eq!(heater.name, name);
+            assert_eq!(heater.component, Component::BinarySensor);
+            assert_eq!(heater.device_class, Some("running"), "Running, not Hot");
+            assert_eq!(
+                heater.category, None,
+                "it explains a slow charge, so it sits beside the readings"
+            );
+        }
+        assert!(entity("battery4_heater").is_none(), "a fourth pack is not attached");
+        // The word they come from stays, among the diagnostics.
+        assert_eq!(
+            entity(HEATER_STATE).map(|entity| entity.category),
+            Some(Some(Category::Diagnostic))
+        );
+
+        // A reconciliation has to know the fourth, or a stack that shrank would keep its heater forever.
+        assert!(
+            Catalogue::everything(&Growatt)
+                .iter()
+                .any(|entity| entity.key == "battery4_heater")
+        );
     }
 
     #[test]

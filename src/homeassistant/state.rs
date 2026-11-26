@@ -20,7 +20,7 @@ use crate::driver::catalogue::PowerFlows;
 use crate::homeassistant::broker::Publication;
 use crate::homeassistant::entity::Entity;
 use crate::homeassistant::entity::{
-    CELL_SPREAD, CONVERSION_LOSS, FIRMWARE_VERSION, LAST_UPDATE, RESTING_VOLTAGE, SOC_CREDIBLE,
+    CELL_SPREAD, CONVERSION_LOSS, FIRMWARE_VERSION, HEATER_STATE, HEATERS, LAST_UPDATE, RESTING_VOLTAGE, SOC_CREDIBLE,
 };
 use crate::homeassistant::rest::Resting;
 use crate::homeassistant::topics::{OFFLINE, ONLINE};
@@ -71,6 +71,7 @@ impl StatePayload {
         if let Some(spread) = cell_spread(view).filter(|_| fields.contains(CELL_SPREAD)) {
             object.insert(CELL_SPREAD.to_owned(), json!(spread));
         }
+        heaters(&mut object, view, fields);
         // Both fields are absent until the pack has rested long enough to measure, which leaves their
         // entities unavailable rather than showing a live figure that cannot answer the question.
         if let Some(resting) = resting {
@@ -242,6 +243,28 @@ fn measured(object: &mut Map<String, Value>, view: &TelemetryView, fields: &Fiel
     }
 }
 
+/// Each pack's heater, decoded from the BMS's heater word: bit n is pack n+1's relay (F184).
+///
+/// Only the packs the catalogue publishes are written, so an unattached pack's bit, always clear, never
+/// reaches the broker. Nothing at all while the word is missing from the frame, rather than a row of *Not
+/// running* that nothing measured.
+fn heaters(object: &mut Map<String, Value>, view: &TelemetryView, fields: &Fields) {
+    let Some(word) = view
+        .readings
+        .iter()
+        .find(|reading| reading.name == HEATER_STATE)
+        .map(|reading| reading.raw)
+    else {
+        return;
+    };
+    for (key, bit) in HEATERS.into_iter().zip(0_u32..) {
+        if fields.contains(key) {
+            let on = word.checked_shr(bit).is_some_and(|rest| rest & 1 == 1);
+            object.insert(key.to_owned(), json!(if on { "1" } else { "0" }));
+        }
+    }
+}
+
 /// The spread between the highest and lowest cell, in millivolts.
 ///
 /// Derived rather than reported: the device sends the two extremes and not the difference. It earns its
@@ -346,6 +369,45 @@ mod tests {
 
     fn fields() -> Fields {
         Fields::of(&Catalogue::default().entities(&Growatt))
+    }
+
+    #[test]
+    fn each_published_pack_reads_its_own_bit_of_the_heater_word() {
+        // Packs 1 and 3 heating on a stack of three: bits 0 and 2. Pack 4's bit is set too, as a word with
+        // a stray bit would carry it, and must not reach a pack that is not attached.
+        let view = TelemetryView {
+            timestamp: None,
+            readings: vec![ReadingView {
+                register: 14,
+                name: "battery_heater_state",
+                raw: 0b1101,
+                value: "13".to_owned(),
+                unit: "",
+                confidence: "observed",
+            }],
+        };
+        let three = Fields::of(
+            &Catalogue {
+                packs: 3,
+                ..Catalogue::default()
+            }
+            .entities(&Growatt),
+        );
+        let payload = StatePayload::telemetry(&view, &three, None, PowerFlows::default());
+        assert_eq!(payload.get("battery1_heater"), Some(&json!("1")));
+        assert_eq!(payload.get("battery2_heater"), Some(&json!("0")));
+        assert_eq!(payload.get("battery3_heater"), Some(&json!("1")));
+        assert_eq!(payload.get("battery4_heater"), None);
+
+        // No word, no verdict: a frame without it leaves the heaters unknown rather than off.
+        let empty = TelemetryView {
+            timestamp: None,
+            readings: Vec::new(),
+        };
+        assert_eq!(
+            StatePayload::telemetry(&empty, &three, None, PowerFlows::default()).get("battery1_heater"),
+            None
+        );
     }
 
     #[test]
