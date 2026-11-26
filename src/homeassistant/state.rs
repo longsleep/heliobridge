@@ -439,7 +439,7 @@ mod tests {
                 reading("pv3_current", "6.50"),
                 reading("pv4_voltage", "34.00"),
                 reading("pv4_current", "7.00"),
-                reading("battery_voltage", "53.4"),
+                reading("inverter_input_voltage", "53.4"),
                 reading("battery_current", "0.4"),
                 reading("on_grid_power", "799.6"),
                 reading("off_grid_power", "0.0"),
