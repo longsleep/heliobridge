@@ -237,15 +237,17 @@ const fn pv(inputs: &'static [VoltAmps]) -> Flow<Strings> {
 
 /// What the NEXA 2000 measures: every flow.
 ///
-/// The battery is the pack's own voltage times the BMS's current, registers 112 and 118 — where register 11
-/// is PV − output, counting the conversion loss as charge and zeroed whenever the BMS sees under 24 W or
-/// disagrees on direction. The AC output is the inverter's own figure, registers 116 and 111 at a tenth of
-/// a watt, where register 5 reads zero below 20 W.
+/// The battery is the BMS's current times the inverter's input voltage, registers 118 and 112 — where register
+/// 11 is PV − output, counting the conversion loss as charge and zeroed whenever the BMS sees under 24 W or
+/// disagrees on direction. Register 112 floats while the battery is idle (F191), but it is the pack voltage
+/// whenever a real current flows — no frame carrying 0.5 A or more strayed from the cells — and an idle
+/// battery's current is zero, so the product stays right. The AC output is the inverter's own figure,
+/// registers 116 and 111 at a tenth of a watt, where register 5 reads zero below 20 W.
 pub const NEXA_FLOWS: PowerFlows = PowerFlows {
     pv: Some(pv(NEXA_STRINGS)),
     battery: Some(Flow {
         measured: VoltAmps {
-            volts: "battery_voltage",
+            volts: "inverter_input_voltage",
             amps: "battery_current",
         },
         presented: "battery_charge_power",

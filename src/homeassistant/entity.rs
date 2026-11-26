@@ -1058,6 +1058,9 @@ impl Catalogue {
         // `firmware_version` instead — a dashboard reading of `3596` meant nothing to anyone.
         (Component::Sensor, "sw_version_part_1"),
         (Component::Sensor, "sw_version_part_2"),
+        // Input register 112 was published as `battery_voltage` up to 0.9.x. It is the inverter's input
+        // voltage, which floats while the battery is idle, and is published under that name instead (F191).
+        (Component::Sensor, "battery_voltage"),
     ];
 
     /// Every `(component, key)` a reconciliation has to retract if it finds it, on top of what
@@ -1235,7 +1238,10 @@ fn diagnostic(name: &str) -> Option<Category> {
         // A readback of a setting Home Assistant already offers as a switch. It earns a place for the
         // moment the two disagree, not a place on the dashboard beside the switch itself.
         || name == OFF_GRID_ACTIVE
-        || name == HEATER_STATE;
+        || name == HEATER_STATE
+        // A voltage inside the unit that is the pack's only while current flows, and floats between 18 and
+        // 58 V when it does not: something to look at while investigating, not beside the readings.
+        || name == "inverter_input_voltage";
     equipment.then_some(Category::Diagnostic)
 }
 
@@ -1863,12 +1869,14 @@ mod tests {
         assert_eq!(current.precision, Some(1));
         assert_eq!(current.shape, Shape::Reading(Some(StateClass::Measurement)));
 
-        // Its other half, which makes DC power a multiplication rather than a guess at the cell count.
-        let volts = reading("battery_voltage");
+        // Its partner in the battery power, which is the pack voltage only while current flows (F191). It
+        // floats when the battery is idle, so it is a diagnostic rather than a reading of the battery.
+        let volts = reading("inverter_input_voltage");
+        assert_eq!(volts.name, "Inverter input voltage");
         assert_eq!(volts.device_class, Some("voltage"));
         assert_eq!(volts.unit, Some("V"));
         assert_eq!(volts.precision, Some(1));
-        assert_eq!(volts.category, None, "the pack voltage belongs on the dashboard");
+        assert_eq!(volts.category, Some(Category::Diagnostic));
 
         // The inverter's temperature is a second temperature, not a rename of the device's.
         assert_eq!(reading("inverter_temp").device_class, Some("temperature"));

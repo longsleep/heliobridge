@@ -430,12 +430,12 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::float(109, "off_grid_voltage", Volt, Scaling::TENTHS, Verified),
         Entry::float(110, "off_grid_current", Ampere, Scaling::new(0.01, -300.0), Verified),
         Entry::float(111, "off_grid_power", Watt, Scaling::new(0.1, -3000.0), Verified),
-        // The pack voltage, and the other half of the DC-side measurement `battery_current` begins.
-        // Identified against the cells rather than from the firmware, which does not copy the BMS's
-        // `VoltageSum` anywhere: it holds to 16 × the mean cell voltage in 99.85 % of 408 402 frames,
-        // over a 22.0 to 58.3 V span, which no setpoint would do. The median ratio of 0.9964 is the mean
-        // of the highest and lowest cell overstating the true mean, not an error in the scale.
-        Entry::float(112, "battery_voltage", Volt, Scaling::TENTHS, Observed),
+        // The inverter's DC input voltage, which the power controller calls `GET_INV_INPUT_V` (F191). It is the
+        // pack voltage only while current flows: with the battery idle the input floats, and at the discharge
+        // floor with weak sun it swung between 18 and 58 V every few seconds while the cells sat at 52.6 V.
+        // Across three months it was within 5 % of 16 × the mean cell in every frame carrying at least
+        // 0.5 A, and off in 0.28 % of frames overall, all of them idle.
+        Entry::float(112, "inverter_input_voltage", Volt, Scaling::TENTHS, Observed),
         // The inverter's own temperature, which the sub-MCU calls `INV_TEMP` and biases the same way it
         // biases the pack temperatures. Distinct from `device_temp`: across the capture this runs
         // 11.8 to 74.7 °C while `device_temp` peaks at 51.1 °C, which is a heatsink against a board.
@@ -450,12 +450,12 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         // scale. It carries no information `ac_power` does not — the two correlate at −0.9994 — so it is
         // here to be correct rather than because a dashboard needs it.
         Entry::float(117, "grid_current", Ampere, Scaling::new(0.01, -300.0), Observed),
-        // The battery's own current, and with `battery_voltage` the whole of what this device measures on
-        // the DC side: `battery_charge_power` is taken on the AC side of the converter, and
-        // `battery_soc_total` comes from a gauge that drifts. Positive while charging, and ±17.6 A at the
-        // extremes — which at pack voltage is the 800 to 1000 W the hardware is rated for, and is what
-        // settles the scale as tenths of an amp rather than hundredths or units. Multiplied by 112 it
-        // tracks `battery_charge_power` at 0.9989, the two differing by the converter's losses.
+        // The battery's own current, and the one reading this device takes on the battery's DC side:
+        // `battery_charge_power` is a balance taken past the converter, and `battery_soc_total` comes from
+        // a gauge that drifts. Positive while charging, and ±17.6 A at the extremes — which at pack voltage
+        // is the 800 to 1000 W the hardware is rated for, and is what settles the scale as tenths of an amp
+        // rather than hundredths or units. Multiplied by 112, which is the pack voltage whenever this is not
+        // zero, it tracks `battery_charge_power` at 0.9989, the two differing by the converter's losses.
         Entry::float(118, "battery_current", Ampere, Scaling::new(0.1, -3000.0), Observed),
         // Four component versions in two registers, one per octet. Together with the datalogger's own
         // version they make the six-field string the vendor identifies a release by; see
