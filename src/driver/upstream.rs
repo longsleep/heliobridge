@@ -19,7 +19,11 @@
 //! somewhere to put a frame and somewhere to get one.
 
 use std::future::Future;
+use std::net::SocketAddr;
 
+use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use rustls::pki_types::ServerName;
 
 use crate::mqtt::{ClientTls, QoS};
@@ -62,10 +66,98 @@ impl Endpoint {
     }
 }
 
-/// Everything a relay needs: where to reach the cloud, and whom to trust when doing it.
+/// How a relay finds the cloud's addresses.
 ///
-/// The two travel together because a relay cannot be started without both, and because the TLS
-/// configuration is loaded once for the process — pairing them here is what stops a caller from
+/// The system's resolver unless the operator names others. That matters on a network whose DNS override
+/// points the cloud's name at this program: asking the resolver the device asks would dial this program
+/// back instead of the cloud. Plain DNS is enough, because the certificate the cloud presents is still
+/// checked against its name — a forged answer can fail a connection but cannot make the relay trust anyone
+/// else.
+#[derive(Clone)]
+pub struct Resolver {
+    servers: Vec<SocketAddr>,
+    through: Option<TokioResolver>,
+}
+
+impl Resolver {
+    /// The system's resolver.
+    pub const fn system() -> Self {
+        Self {
+            servers: Vec::new(),
+            through: None,
+        }
+    }
+
+    /// These name servers, asked over UDP with TCP for a truncated answer, in order. None is the system's.
+    ///
+    /// # Errors
+    ///
+    /// The resolver's own refusal to be built, as text.
+    pub fn through(servers: &[SocketAddr]) -> Result<Self, String> {
+        if servers.is_empty() {
+            return Ok(Self::system());
+        }
+        let name_servers = servers
+            .iter()
+            .map(|server| {
+                let mut config = NameServerConfig::udp_and_tcp(server.ip());
+                for connection in &mut config.connections {
+                    connection.port = server.port();
+                }
+                config
+            })
+            .collect();
+        let resolver = TokioResolver::builder_with_config(
+            ResolverConfig::from_name_servers(name_servers),
+            TokioRuntimeProvider::default(),
+        )
+        .build()
+        .map_err(|error| error.to_string())?;
+        Ok(Self {
+            servers: servers.to_vec(),
+            through: Some(resolver),
+        })
+    }
+
+    /// The name servers asked, empty for the system's resolver.
+    pub fn servers(&self) -> &[SocketAddr] {
+        &self.servers
+    }
+
+    /// Every address the endpoint's host resolves to, with its port.
+    ///
+    /// # Errors
+    ///
+    /// The lookup's failure, as text for a log line.
+    pub async fn addresses(&self, endpoint: &Endpoint) -> Result<Vec<SocketAddr>, String> {
+        match &self.through {
+            None => tokio::net::lookup_host(endpoint.address())
+                .await
+                .map(Iterator::collect)
+                .map_err(|error| error.to_string()),
+            Some(resolver) => {
+                let found = resolver
+                    .lookup_ip(endpoint.host.as_str())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(found.iter().map(|ip| SocketAddr::new(ip, endpoint.port)).collect())
+            }
+        }
+    }
+}
+
+impl core::fmt::Debug for Resolver {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Resolver")
+            .field("servers", &self.servers)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Everything a relay needs: where to reach the cloud, how to find it, and whom to trust when doing it.
+///
+/// They travel together because a relay cannot be started without them, and because the TLS configuration
+/// and the resolver are built once for the process — pairing them here is what stops a caller from
 /// accidentally building a second one per device connection.
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -73,6 +165,8 @@ pub struct Target {
     pub endpoint: Endpoint,
     /// The process's one outbound TLS configuration.
     pub tls: ClientTls,
+    /// How the endpoint's host is looked up.
+    pub resolver: Resolver,
 }
 
 /// One publish, moving in either direction through a relay.

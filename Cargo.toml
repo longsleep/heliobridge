@@ -83,6 +83,10 @@ http-body-util = "0.1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12"] }
 sanitize-filename = "0.6"   # a vendor URL decides a file name; this keeps it a file name
 sha2 = "0.10"               # a digest of what was downloaded, so it can be compared with a known image
+# Looking up the cloud through name servers of the operator's choosing rather than the system's, for a network
+# whose DNS override sends the cloud's name to this program. No default features: no system configuration
+# is read, and only plain DNS over UDP and TCP is needed.
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 # `test-util` gives the paused clock, so a test can prove the 4.5-second time push fires without

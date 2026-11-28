@@ -75,6 +75,17 @@ A destination NAT rule works equally well. Heliobridge generates its own certifi
 With `--cloud-relay` it also dials the real endpoint and passes traffic both ways, so the vendor app
 keeps working while everything is decoded locally.
 
+**The relay has to find the real cloud, not this program.** If the DNS override that sends the device here
+also answers heliobridge's own lookups, the relay resolves `mqtt.growatt.com` to its own host. It notices
+when it dials an address of the machine it runs on and logs an error saying so, then keeps retrying as it
+would after any failure; behind a container's port mapping the attempt fails at the cloud's certificate
+instead. Three ways out, best first: point the datalogger at heliobridge directly (its broker address,
+config registers 17–19, writable over Bluetooth with heliobind), so no override is needed; limit the
+override to the device — a destination NAT rule matching its address, or a per-client rule in the DNS
+server; or set `HELIOBRIDGE_CLOUD_RESOLVER` so the relay asks other name servers. The last is the one for
+Home Assistant OS, where apps share the system's DNS. The cloud's certificate is checked either way, so a
+wrong answer from a resolver can fail the connection but never make the relay trust another server.
+
 ## Configuration
 
 One binary, no configuration file. Every option is a flag with a matching `HELIOBRIDGE_*`
@@ -107,6 +118,7 @@ regenerated when missing. Point `HELIOBRIDGE_STATE_DIR` somewhere durable to kee
 | `HELIOBRIDGE_ALLOW_POWER_PLUS` | `true` | `false` does the same for `power_plus` alone |
 | `HELIOBRIDGE_OFFLINE_AFTER` | `30` | Seconds without telemetry before the device is reported absent |
 | `HELIOBRIDGE_CLOUD_RELAY` | off | Relay to the vendor cloud |
+| `HELIOBRIDGE_CLOUD_RESOLVER` | the system's | Name servers to look the cloud up through, e.g. `9.9.9.9,1.1.1.1` |
 | `HELIOBRIDGE_RELAY_MODE` | `controls` | How much authority the cloud keeps |
 | `HELIOBRIDGE_RELAY_ANSWERS` | `cloud-only` | Which answers to earlier commands reach the cloud |
 | `HELIOBRIDGE_RELAY_ACCESSORY_PAIRING` | `false` | Let the cloud write the accessory list, and nothing else in the config space |

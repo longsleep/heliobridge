@@ -267,7 +267,7 @@ mod tests {
     use super::{Devices, Peers, SessionOptions};
     use crate::driver::Unknown;
     use crate::driver::arbiter::Policy;
-    use crate::driver::upstream::{Endpoint, Target};
+    use crate::driver::upstream::{Endpoint, Resolver, Target};
     use crate::mqtt::Trust;
     use std::sync::Arc;
 
@@ -293,6 +293,7 @@ mod tests {
                     port: 7006,
                 },
                 tls: Trust::BuiltIn.client_tls().expect("the shipped roots load"),
+                resolver: Resolver::system(),
             }),
             policy: Policy::OPEN,
             recorder: None,

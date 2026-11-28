@@ -29,6 +29,7 @@
 
 use core::future::Future;
 use core::time::Duration;
+use std::net::SocketAddr;
 
 use rustls::pki_types::ServerName;
 use snafu::Snafu;
@@ -36,7 +37,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::client::TlsStream;
 
-use crate::driver::upstream::{self, Endpoint, Message, Target};
+use crate::driver::upstream::{self, Endpoint, Message, Resolver, Target};
 use crate::mqtt::{ClientTls, Connect, PROTOCOL_LEVEL, Packet, PacketStream, Publish, QoS, Subscribe};
 
 /// Names a certificate presented to the device must carry, common name first.
@@ -165,6 +166,7 @@ struct RelayTask {
     config: Endpoint,
     server_name: ServerName<'static>,
     tls: ClientTls,
+    resolver: Resolver,
 }
 
 /// Why one relay connection ended.
@@ -173,6 +175,22 @@ enum Outcome {
     LocalShutdown,
     /// The cloud connection failed or closed; worth retrying.
     Disconnected(String),
+    /// The cloud's name led back to this host, so the relay reached this program instead of the cloud.
+    Looped(SocketAddr),
+}
+
+/// Why one connection attempt failed.
+enum Failure {
+    /// The address dialled is this host's own.
+    Looped(SocketAddr),
+    /// Anything else, as text for the log.
+    Other(String),
+}
+
+impl From<String> for Failure {
+    fn from(reason: String) -> Self {
+        Self::Other(reason)
+    }
 }
 
 impl RelayTask {
@@ -183,12 +201,15 @@ impl RelayTask {
             config: target.endpoint,
             server_name,
             tls: target.tls,
+            resolver: target.resolver,
         })
     }
 
     /// Connect, pump, reconnect. Returns when the session drops its [`Relay`].
     async fn run(self, mut to_cloud: mpsc::Receiver<Message>, from_cloud: mpsc::Sender<Message>) {
         let mut backoff = BACKOFF_MIN;
+        // Said once as an error and then quietly, since it repeats on every retry until fixed.
+        let mut loop_reported = false;
 
         loop {
             match self.connected(&mut to_cloud, &from_cloud).await {
@@ -197,11 +218,28 @@ impl RelayTask {
                     return;
                 }
                 Outcome::Disconnected(reason) => {
+                    loop_reported = false;
                     tracing::warn!(
                         reason = %reason,
                         retry_in_s = backoff.as_secs(),
                         "cloud relay disconnected; local operation is unaffected"
                     );
+                }
+                Outcome::Looped(address) => {
+                    if loop_reported {
+                        tracing::debug!(%address, "the cloud's name still resolves to this host");
+                    } else {
+                        loop_reported = true;
+                        tracing::error!(
+                            cloud = %self.config.host,
+                            %address,
+                            retry_in_s = backoff.as_secs(),
+                            "the cloud relay reached this host instead of the cloud: the cloud's name resolves to \
+                             it, so the DNS override meant for the device applies to heliobridge too. Point the \
+                             datalogger at heliobridge directly, limit the override to the device, or set \
+                             HELIOBRIDGE_CLOUD_RESOLVER. Local operation is unaffected"
+                        );
+                    }
                 }
             }
 
@@ -214,7 +252,8 @@ impl RelayTask {
     async fn connected(&self, to_cloud: &mut mpsc::Receiver<Message>, from_cloud: &mpsc::Sender<Message>) -> Outcome {
         let mut stream = match self.handshake().await {
             Ok(stream) => stream,
-            Err(reason) => return Outcome::Disconnected(reason),
+            Err(Failure::Looped(address)) => return Outcome::Looped(address),
+            Err(Failure::Other(reason)) => return Outcome::Disconnected(reason),
         };
 
         if let Err(reason) = self.subscribe(&mut stream).await {
@@ -224,14 +263,43 @@ impl RelayTask {
         self.pump(&mut stream, to_cloud, from_cloud).await
     }
 
+    /// The first of the cloud's addresses that accepts a connection.
+    ///
+    /// **An address of this host is refused before anything is sent.** A DNS override that sends the cloud's
+    /// name to this program sends this program's own lookup there too, and the relay would then dial its own
+    /// listener: a connection whose two ends share an address. It is told apart here, where it costs one
+    /// TCP connection, rather than by the certificate it would be shown. Behind a container's port mapping
+    /// the two ends differ, and the attempt fails at the certificate instead, as any other wrong host does.
+    async fn dial(&self) -> Result<TcpStream, Failure> {
+        let addresses = self
+            .resolver
+            .addresses(&self.config)
+            .await
+            .map_err(|error| format!("resolve {}: {error}", self.config.host))?;
+
+        let mut last = format!("{} resolved to no address", self.config.host);
+        for address in addresses {
+            match TcpStream::connect(address).await {
+                Ok(tcp) => {
+                    if let (Ok(local), Ok(peer)) = (tcp.local_addr(), tcp.peer_addr())
+                        && local.ip() == peer.ip()
+                    {
+                        return Err(Failure::Looped(peer));
+                    }
+                    return Ok(tcp);
+                }
+                Err(error) => last = format!("tcp connect {address}: {error}"),
+            }
+        }
+        Err(Failure::Other(last))
+    }
+
     /// TCP, TLS, CONNECT, CONNACK.
-    async fn handshake(&self) -> Result<PacketStream<TlsStream<TcpStream>>, String> {
+    async fn handshake(&self) -> Result<PacketStream<TlsStream<TcpStream>>, Failure> {
         let address = self.config.address();
         tracing::info!(cloud = %address, "connecting the cloud relay");
 
-        let tcp = TcpStream::connect(&address)
-            .await
-            .map_err(|error| format!("tcp connect: {error}"))?;
+        let tcp = self.dial().await?;
         drop(tcp.set_nodelay(true));
 
         let connector = self.tls.connector();
@@ -246,19 +314,20 @@ impl RelayTask {
             .await
             .map_err(|error| format!("connect: {error}"))?;
 
-        match tokio::time::timeout(CONNECT_TIMEOUT, stream.next_packet()).await {
+        let reason = match tokio::time::timeout(CONNECT_TIMEOUT, stream.next_packet()).await {
             Ok(Ok(Some(Packet::ConnAck { code: 0, .. }))) => {
                 tracing::info!(cloud = %address, "cloud relay connected");
-                Ok(stream)
+                return Ok(stream);
             }
-            Ok(Ok(Some(Packet::ConnAck { code, .. }))) => Err(format!("cloud refused the connection, code {code}")),
-            Ok(Ok(other)) => Err(format!(
+            Ok(Ok(Some(Packet::ConnAck { code, .. }))) => format!("cloud refused the connection, code {code}"),
+            Ok(Ok(other)) => format!(
                 "expected CONNACK, got {}",
                 other.map_or("nothing", |packet| packet.kind())
-            )),
-            Ok(Err(error)) => Err(format!("read: {error}")),
-            Err(_) => Err("no CONNACK before the timeout".to_owned()),
-        }
+            ),
+            Ok(Err(error)) => format!("read: {error}"),
+            Err(_) => "no CONNACK before the timeout".to_owned(),
+        };
+        Err(Failure::Other(reason))
     }
 
     /// The CONNECT to send upstream: the device's own identity, not ours.
@@ -416,7 +485,7 @@ impl RelayTask {
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_HOST, DEFAULT_PORT, DEVICE_PASSWORD, KEEPALIVE_SECS, Message, Relay, RelayTask};
-    use crate::driver::upstream::{Endpoint, Relay as _, Target};
+    use crate::driver::upstream::{Endpoint, Relay as _, Resolver, Target};
     use crate::mqtt::{Packet, QoS, Trust};
 
     const SERIAL: &str = "0EXAMPLE00000001";
@@ -434,6 +503,7 @@ mod tests {
         Target {
             endpoint,
             tls: Trust::BuiltIn.client_tls().expect("the shipped roots load"),
+            resolver: Resolver::system(),
         }
     }
 
@@ -534,5 +604,28 @@ mod tests {
 
         assert!(queued <= super::QUEUE_DEPTH.saturating_add(1) as u64, "queued {queued}");
         assert!(relay.dropped() > 0, "some messages should have been dropped");
+    }
+
+    #[tokio::test]
+    async fn a_cloud_name_that_resolves_to_this_host_is_reported_as_a_loop() {
+        // What a DNS override does to the relay when heliobridge shares the device's resolver: the cloud's
+        // name leads to a listener on this host. `localhost` stands in for the overridden name. It has to
+        // be told apart from an ordinary connection failure, which retries quickly and says nothing useful.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        let task = RelayTask::new(
+            SERIAL,
+            relay_to(Endpoint {
+                host: "localhost".to_owned(),
+                port,
+            }),
+        )
+        .expect("valid host name");
+
+        match task.dial().await {
+            Err(super::Failure::Looped(address)) => assert_eq!(address.port(), port),
+            Err(super::Failure::Other(reason)) => panic!("reported as an ordinary failure: {reason}"),
+            Ok(_) => panic!("connected to this host as if it were the cloud"),
+        }
     }
 }

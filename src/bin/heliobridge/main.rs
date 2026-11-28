@@ -11,7 +11,7 @@ use heliobridge::config::{Command, Config, LogFormat};
 use heliobridge::control::{self, Registry};
 use heliobridge::driver::Driver;
 use heliobridge::driver::Enrols;
-use heliobridge::driver::upstream::Target;
+use heliobridge::driver::upstream::{Resolver, Target};
 use heliobridge::growatt::driver::Growatt;
 use heliobridge::homeassistant::broker::{BrokerConfig, BrokerUrl};
 use heliobridge::homeassistant::command;
@@ -165,9 +165,20 @@ impl<'a, D: Driver + Enrols> Bridge<'a, D> {
              Telemetry, identity and settings snapshots are always forwarded"
         );
 
+        let servers = self.config.cloud_resolvers()?;
+        let resolver = Resolver::through(&servers)
+            .map_err(|error| format!("cloud relay misconfigured: the resolver could not be built: {error}"))?;
+        if !servers.is_empty() {
+            tracing::info!(
+                servers = ?servers,
+                "looking the cloud up through these name servers rather than the system's resolver"
+            );
+        }
+
         self.cloud = Some(Target {
             endpoint,
             tls: self.client_tls.clone(),
+            resolver,
         });
         Ok(self)
     }

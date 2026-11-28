@@ -4,7 +4,7 @@
 //! definition. Every variable is prefixed `HELIOBRIDGE_`.
 
 use core::time::Duration;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -94,6 +94,9 @@ pub const DEFAULT_DISCOVERY_PREFIX: &str = "homeassistant";
 
 /// Default tracing filter.
 pub const DEFAULT_LOG: &str = "info";
+
+/// The port a name server is asked on when an entry names none.
+pub const DNS_PORT: u16 = 53;
 
 /// What to do instead of serving.
 ///
@@ -317,6 +320,16 @@ pub struct Config {
     #[arg(long, env = "HELIOBRIDGE_CLOUD_PORT")]
     pub cloud_port: Option<u16>,
 
+    /// Name servers to look the cloud host up through, instead of the system's resolver.
+    ///
+    /// For a network whose DNS override points the cloud's name at this program: the relay would otherwise
+    /// resolve it to this program too. Comma-separated addresses, each with an optional port —
+    /// `9.9.9.9,1.1.1.1` or `[2620:fe::fe]:53` — asked in order, over UDP with TCP for a long answer. Empty
+    /// uses the system's resolver. An entry that cannot be read is a startup failure. Only the relay's
+    /// lookup is affected.
+    #[arg(long, env = "HELIOBRIDGE_CLOUD_RESOLVER", default_value = "")]
+    pub cloud_resolver: String,
+
     /// How much authority the vendor cloud keeps while relaying.
     ///
     /// In every mode the vendor app keeps **displaying** correctly; what differs is what it may change.
@@ -522,6 +535,25 @@ impl Config {
         Devices::parse(&self.allow_devices)
     }
 
+    /// The name servers the relay looks the cloud up through; empty for the system's resolver.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the entry that could not be read.
+    pub fn cloud_resolvers(&self) -> Result<Vec<SocketAddr>, String> {
+        self.cloud_resolver
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                entry
+                    .parse::<SocketAddr>()
+                    .or_else(|_| entry.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, DNS_PORT)))
+                    .map_err(|_| format!("--cloud-resolver: {entry:?} is not an address, or an address and port"))
+            })
+            .collect()
+    }
+
     /// What everything is called on the broker.
     pub fn topics(&self) -> Topics {
         Topics {
@@ -604,6 +636,25 @@ mod tests {
         let mut command_line = vec!["heliobridge"];
         command_line.extend_from_slice(flags);
         Config::try_parse_from(command_line).expect("parse")
+    }
+
+    #[test]
+    fn cloud_resolvers_take_addresses_with_or_without_a_port() {
+        let config = parse(&["--cloud-resolver", "9.9.9.9, 1.1.1.1:5353,[2620:fe::fe]:53"]);
+        let servers: Vec<String> = config
+            .cloud_resolvers()
+            .expect("valid")
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(servers, ["9.9.9.9:53", "1.1.1.1:5353", "[2620:fe::fe]:53"]);
+
+        assert!(
+            parse(&[]).cloud_resolvers().expect("empty").is_empty(),
+            "unset is the system's resolver"
+        );
+        // A name would need a resolver to find the resolver, and a typo must not silently mean "system".
+        assert!(parse(&["--cloud-resolver", "dns.quad9.net"]).cloud_resolvers().is_err());
     }
 
     #[test]
