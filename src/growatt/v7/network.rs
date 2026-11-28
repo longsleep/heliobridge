@@ -377,6 +377,22 @@ impl Entry {
         body.split('&').filter_map(Self::parse_one).collect()
     }
 
+    /// If this entry is unpaired and the list also holds a paired one, the number of that paired entry.
+    ///
+    /// Such an entry stops the device from using the paired accessory's reading. A search over a paired
+    /// accessory creates one: the device keeps the pairing and adds a second, empty entry. A pairing that
+    /// fails part-way leaves one behind as well. The reading stays unused for as long as the extra entry
+    /// exists, and waiting does not help. Deleting only the extra entry brings the reading back and keeps
+    /// the pairing.
+    pub fn blocks(&self, list: &[Self]) -> Option<u16> {
+        if self.mode != 7 || self.state != State::Registered {
+            return None;
+        }
+        list.iter()
+            .find(|other| other.mode == 7 && other.state.is_paired())
+            .map(|paired| paired.number)
+    }
+
     /// One `<type>-<mode>-<state>,<serial>,<address>` row.
     fn parse_one(row: &str) -> Option<Self> {
         let row = row.trim_matches(|character: char| character == '\0' || character.is_whitespace());
@@ -623,6 +639,25 @@ mod tests {
         assert_eq!(entries[0].state, State::Other(9));
         assert_eq!(entries[0].state.code(), 9);
         assert_eq!(entries[0].state.label(), "unknown");
+    }
+
+    #[test]
+    fn an_unpaired_entry_beside_a_paired_one_is_named_as_blocking_it() {
+        // What a search over a paired meter leaves behind, and what a failed pairing does too: while 112
+        // exists the device stops using 111's reading.
+        let list = Entry::parse_list("DEV:111-7-3,187723572702975,192.168.2.212&112-7-0,,");
+        assert_eq!(list[0].blocks(&list), None, "the paired entry blocks nothing");
+        assert_eq!(list[1].blocks(&list), Some(111));
+
+        // Alone, an unpaired entry is a search in progress, and a deleted one blocks nothing.
+        let alone = Entry::parse_list("DEV:111-7-0,,");
+        assert_eq!(alone[0].blocks(&alone), None);
+        let tombstone = Entry::parse_list("DEV:111-7-3,187723572702975,192.168.2.212&112-7-5,,");
+        assert_eq!(tombstone[1].blocks(&tombstone), None);
+
+        // Two pairings side by side are both in use as far as the list can say; neither blocks the other.
+        let both = Entry::parse_list("DEV:111-7-3,187723572702975,192.168.2.212&112-7-3,18838586676582,192.168.2.213");
+        assert!(both.iter().all(|entry| entry.blocks(&both).is_none()));
     }
 
     #[test]

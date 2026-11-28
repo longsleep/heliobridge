@@ -83,6 +83,12 @@ pub struct Identity<'a> {
     pub summary: String,
     /// The fields that parsed, in the order sent.
     pub fields: Vec<Field<'a>>,
+    /// What the report shows is wrong and an operator can fix, each one line, composed by the driver.
+    ///
+    /// Only the driver can tell a state that blocks the device from one that merely looks unusual, and the
+    /// fix is in its vocabulary too. Logged as a warning every time a report shows it, so a condition that
+    /// persists keeps being said.
+    pub warnings: Vec<String>,
 }
 
 impl Identity<'_> {

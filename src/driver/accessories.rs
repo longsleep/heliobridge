@@ -39,6 +39,9 @@ pub struct Enrolled {
     pub serial: Option<u64>,
     /// Where the device found it, absent until it has.
     pub address: Option<String>,
+    /// Set on an unpaired entry when the list also holds a paired one: the number of the paired entry. While
+    /// this entry exists the device does not use that accessory's reading. Deleting this entry fixes it.
+    pub blocks: Option<u16>,
 }
 
 /// A driver that can enrol an accessory reached over the local network.

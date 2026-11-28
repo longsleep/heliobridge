@@ -11,7 +11,8 @@ use crate::growatt::v7::decode::{FromFrame, ReadResponse, SettingsSnapshot};
 use crate::growatt::v7::decode::{Telemetry as DecodedTelemetry, WriteAck as DecodedAck};
 use crate::growatt::v7::frame::{Frame, MessageType};
 use crate::growatt::v7::identity::Identity as DecodedIdentity;
-use crate::growatt::v7::registers::Role;
+use crate::growatt::v7::network::Entry;
+use crate::growatt::v7::registers::{ACCESSORY_LIST, Role};
 
 /// Read one frame and tell `to` what it says.
 pub fn report(frame: &Frame, to: &mut dyn Sink) {
@@ -83,6 +84,7 @@ pub fn report(frame: &Frame, to: &mut dyn Sink) {
                         value: &entry.value,
                     })
                     .collect(),
+                warnings: warnings(&identity),
             }),
             Err(error) => to.unreadable(&kind.to_string(), &error),
         },
@@ -103,6 +105,33 @@ pub fn report(frame: &Frame, to: &mut dyn Sink) {
             frame.wire_len(),
         ),
     }
+}
+
+/// Problems an identity report shows that an operator can fix, one sentence each.
+///
+/// One so far: an unpaired accessory entry next to a paired one. While it exists the device does not use the
+/// paired accessory's reading. A search over a paired accessory creates such an entry, and so does a pairing
+/// in the vendor's app that fails part-way, and nothing else reports it.
+fn warnings(identity: &DecodedIdentity) -> Vec<String> {
+    let Some(list) = identity
+        .entries
+        .iter()
+        .find(|entry| entry.name() == Some(ACCESSORY_LIST))
+    else {
+        return Vec::new();
+    };
+    let entries = Entry::parse_list(&list.value);
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let paired = entry.blocks(&entries)?;
+            Some(format!(
+                "accessory entry {stray} is not paired, and while it exists the device ignores the reading of \
+                 paired entry {paired}; delete entry {stray} to fix this, which keeps the pairing",
+                stray = entry.number
+            ))
+        })
+        .collect()
 }
 
 /// Express a decoded acknowledgement in the driver-neutral shape the sink takes.

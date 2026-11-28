@@ -204,9 +204,12 @@ impl Enrols for Growatt {
     }
 
     fn enrolled(&self, value: &str) -> Vec<Enrolled> {
-        network::Entry::parse_list(value)
+        let entries = network::Entry::parse_list(value);
+        let blocks: Vec<Option<u16>> = entries.iter().map(|entry| entry.blocks(&entries)).collect();
+        entries
             .into_iter()
-            .map(|entry| Enrolled {
+            .zip(blocks)
+            .map(|(entry, blocks)| Enrolled {
                 kind: entry.kind(),
                 entry: entry.number,
                 mode: entry.mode,
@@ -216,6 +219,7 @@ impl Enrols for Growatt {
                 paired: entry.state.is_paired(),
                 serial: entry.serial.map(network::Serial::get),
                 address: entry.address,
+                blocks,
             })
             .collect()
     }

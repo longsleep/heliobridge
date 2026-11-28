@@ -411,7 +411,7 @@ $ curl $SOCK -X DELETE "http://local/devices/$SERIAL/accessories/network/discove
 {"accessories":[{"transport":"network","kind":"discovered","entry":111,"mode":7,
   "name":"187723572702975","state":"deleted","state_code":5,
   "serial":"187723572702975","mac":"aa:bb:cc:dd:ee:ff","address":"192.168.2.212",
-  "in_use":null,"manufacturer":null,"model":null,"access":null,"communicating":null}],
+  "in_use":null,"manufacturer":null,"model":null,"access":null,"communicating":null,"blocks":null}],
  "detail":"a delete tombstones the entry rather than removing it; a later search revives it in place, keeping its number"}
 ```
 
@@ -421,6 +421,12 @@ The serial and the MAC are accepted wherever either appears.
 entry does not restart it: the device makes a *second* entry, whose search finds nothing, and whose presence
 stops the paired accessory being polled until it is deleted. Replacing one is `{"model":…,"replace":true}`,
 which deletes first.
+
+The same second entry can come from outside: a pairing in the vendor's app that fails part-way leaves one
+behind, and the paired meter stops being used with nothing else saying why. heliobridge logs a warning
+whenever the device's report shows an unpaired entry beside a paired one, and the listing marks it with
+`"blocks"`, the number of the paired entry it is blocking. Deleting that entry alone restores the reading;
+the pairing is not touched.
 
 Delete and re-enrol without a restart in between, and keep the gap short: the accessory list rides in the
 connect-time report the vendor's cloud reads, so a reconnect inside that window tells it the accessory is

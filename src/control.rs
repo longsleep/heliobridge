@@ -418,6 +418,10 @@ pub struct AccessoryEntryView {
     pub access: Option<u16>,
     /// Whether the device is managing to read it.
     pub communicating: Option<bool>,
+    /// Set on an unpaired entry when the list also holds a paired one: the number of the paired entry. While
+    /// this entry exists the device does not use that accessory's reading. Deleting this entry fixes it and
+    /// keeps the pairing.
+    pub blocks: Option<u16>,
 }
 
 /// The accessory searches this bridge has open.
@@ -2009,6 +2013,7 @@ impl Api {
                     model: report.map(|report| report.model.clone()),
                     access: report.map(|report| report.access),
                     communicating: report.map(|report| report.communicating),
+                    blocks: entry.blocks,
                 }
             })
             .collect()

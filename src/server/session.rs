@@ -1231,6 +1231,9 @@ where
             );
         }
         tracing::info!(summary = %report.summary, "datalogger identity");
+        for warning in &report.warnings {
+            tracing::warn!(%warning, "the datalogger's report shows a problem");
+        }
 
         // Every field at trace, on the same target as the per-register telemetry values. The summary is one
         // line by design, and one line cannot answer "did all 32 fields decode, and as what" — which is the
