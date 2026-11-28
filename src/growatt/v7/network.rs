@@ -409,13 +409,18 @@ impl Entry {
     }
 }
 
-/// The serial register 123 is reporting, if it is reporting one.
+/// The serials register 123 is reporting, in the order it lists them.
 ///
-/// `0` is the register's way of saying nothing was found, and is not a serial. Anything else is a decimal
-/// MAC. A server **must** read this as an integer: it is not the accessory's printed serial number.
-pub fn found(value: &str) -> Option<Serial> {
-    let value = value.trim_matches(|character: char| character == '\0' || character.is_whitespace());
-    Serial::parse(value).filter(|serial| serial.get() != 0)
+/// `0` is the register's way of saying nothing was found, and is not a serial. Anything else is one decimal MAC
+/// per accessory found, several joined by `&`. A server **must** read each as an integer: it is not the
+/// accessory's printed serial number. An item that does not parse is left out rather than losing the rest.
+pub fn found(value: &str) -> Vec<Serial> {
+    value
+        .trim_matches(|character: char| character == '\0' || character.is_whitespace())
+        .split('&')
+        .filter_map(Serial::parse)
+        .filter(|serial| serial.get() != 0)
+        .collect()
 }
 
 #[cfg(test)]
@@ -622,9 +627,28 @@ mod tests {
 
     #[test]
     fn register_123_reports_nothing_as_zero_rather_than_as_a_serial() {
-        assert_eq!(found("0"), None);
-        assert_eq!(found("0\0"), None);
-        assert_eq!(found(""), None);
-        assert_eq!(found("187723572702975").map(Serial::get), Some(DECIMAL));
+        assert!(found("0").is_empty());
+        assert!(found("0\0").is_empty());
+        assert!(found("").is_empty());
+        assert_eq!(
+            found("187723572702975")
+                .into_iter()
+                .map(Serial::get)
+                .collect::<Vec<_>>(),
+            [DECIMAL]
+        );
+    }
+
+    #[test]
+    fn register_123_lists_every_accessory_a_search_found() {
+        // Two meters answering one search arrive in one value, joined by `&`. Read as a single number it
+        // parses as nothing, and both candidates would be lost.
+        let both = found("187723572702975&18838586676582\0");
+        assert_eq!(
+            both.iter().map(|serial| serial.get()).collect::<Vec<_>>(),
+            [DECIMAL, 0x1122_3344_5566]
+        );
+        // One that does not parse costs only itself.
+        assert_eq!(found("187723572702975&bogus").len(), 1);
     }
 }

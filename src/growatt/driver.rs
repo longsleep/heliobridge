@@ -224,8 +224,8 @@ impl Enrols for Growatt {
         network::forget(entry)
     }
 
-    fn accessory_found(&self, value: &str) -> Option<u64> {
-        network::found(value).map(network::Serial::get)
+    fn accessory_found(&self, value: &str) -> Vec<u64> {
+        network::found(value).into_iter().map(network::Serial::get).collect()
     }
 
     fn accessory_list(&self) -> &'static str {

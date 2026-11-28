@@ -71,8 +71,8 @@ pub trait Enrols {
     /// A report, so an entry that does not parse is left out rather than failing the rest.
     fn enrolled(&self, value: &str) -> Vec<Enrolled>;
 
-    /// The serial a search-result register is reporting, if it is reporting one.
-    fn accessory_found(&self, value: &str) -> Option<u64>;
+    /// The serials a search-result register is reporting, in its order; none when it reports nothing.
+    fn accessory_found(&self, value: &str) -> Vec<u64>;
 
     /// The name of the register holding accessories reached over the local network.
     fn accessory_list(&self) -> &'static str;

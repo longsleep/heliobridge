@@ -2135,24 +2135,24 @@ impl Api {
                                 .map(|entry| entry.value.clone())
                         })
                         .flatten();
-                    if let Some(serial) = value.and_then(|value| driver.accessory_found(&value))
-                        && !found.contains(&serial)
-                    {
-                        {
-                            found.push(serial);
-                            let line = serde_json::json!({
-                                "serial": serial.to_string(),
-                                "mac": driver.accessory_mac(serial),
-                            });
-                            let mut line = line.to_string();
-                            line.push('\n');
-                            if tx.send(Ok(line)).await.is_err() {
-                                // The caller left. The device goes on searching regardless — the window is
-                                // its own, not this request's — so there is nothing to stop, only to stop
-                                // watching.
-                                tracing::debug!(%device, "a caller stopped reading an accessory search");
-                                return;
-                            }
+                    let serials = value.map(|value| driver.accessory_found(&value)).unwrap_or_default();
+                    // One report can carry several accessories, and each is a candidate of its own.
+                    for serial in serials {
+                        if found.contains(&serial) {
+                            continue;
+                        }
+                        found.push(serial);
+                        let line = serde_json::json!({
+                            "serial": serial.to_string(),
+                            "mac": driver.accessory_mac(serial),
+                        });
+                        let mut line = line.to_string();
+                        line.push('\n');
+                        if tx.send(Ok(line)).await.is_err() {
+                            // The caller left. The device goes on searching regardless — the window is its
+                            // own, not this request's — so there is nothing to stop, only to stop watching.
+                            tracing::debug!(%device, "a caller stopped reading an accessory search");
+                            return;
                         }
                     }
                 }
