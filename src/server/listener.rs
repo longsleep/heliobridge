@@ -162,27 +162,30 @@ pub async fn serve<D: Driver>(
                         continue;
                     }
                 };
-                // A liveness probe, before everything else. Loopback only, so nothing here is reachable
-                // from the network the device is on; and ahead of the allowlist, or a deployment that
-                // admits only the device's address would refuse its own healthcheck. A connection that
-                // is not a probe comes back with every octet unread.
-                let mut stream = stream;
-                if peer.ip().is_loopback() && probe::Probe::new(&mut stream).serve().await == probe::Outcome::Answered {
-                    tracing::debug!(%peer, "answered a liveness probe");
-                    continue;
-                }
-
-                // Before the handshake, so an unwanted peer costs a socket and a log line rather than a
-                // certificate exchange — and so nothing it sends is ever parsed.
-                if !peers.admits(peer.ip()) {
-                    tracing::warn!(%peer, allowed = %peers, "refusing a connection from an address that is not allowed");
-                    drop(stream);
-                    continue;
-                }
-
+                let peers = peers.clone();
                 let acceptor = acceptor.clone();
                 let options = options.clone();
+                // In its own task from the first octet: the probe test can wait half a second for a peer
+                // that connects and says nothing, and that wait must not hold up the next accept.
                 tokio::spawn(async move {
+                    // A liveness probe, before everything else, from anywhere: it answers `ok` and reveals
+                    // nothing a port scan would not. Ahead of the allowlist, or a deployment that admits only
+                    // the device's address would refuse its own healthcheck — and a supervisor checking from
+                    // another container, as Home Assistant's does, could not reach it at all. A connection
+                    // that is not a probe comes back with every octet unread.
+                    let mut stream = stream;
+                    if probe::Probe::new(&mut stream).serve().await == probe::Outcome::Answered {
+                        tracing::debug!(%peer, "answered a liveness probe");
+                        return;
+                    }
+
+                    // Before the handshake, so an unwanted peer costs a socket and a log line rather than a
+                    // certificate exchange — and so nothing it sends is ever parsed.
+                    if !peers.admits(peer.ip()) {
+                        tracing::warn!(%peer, allowed = %peers, "refusing a connection from an address that is not allowed");
+                        return;
+                    }
+
                     handle(stream, peer, acceptor, options).await;
                 });
             }

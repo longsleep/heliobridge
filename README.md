@@ -667,8 +667,9 @@ Or from another container that mounts the same volume. There is no shell to `exe
 
 ### Health
 
-`GET /healthz` on the device-facing port answers `ok` when the server is serving, and is accepted only
-from loopback:
+`GET /healthz` on the device-facing port answers `ok` when the server is serving. It is answered from
+anywhere, ahead of `HELIOBRIDGE_ALLOW_FROM`, so a supervisor checking from another container — Home
+Assistant's watchdog, say — reaches it too; it says nothing a port scan would not:
 
 ```sh
 curl http://127.0.0.1:7006/healthz

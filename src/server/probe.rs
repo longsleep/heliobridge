@@ -59,7 +59,7 @@ const TLS_HANDSHAKE: u8 = 0x16;
 /// Longest request line entertained, after which the connection is not worth reading.
 const MAX_REQUEST_LINE: usize = 256;
 
-/// How long the whole exchange may take. Generous for a loopback request already in flight.
+/// How long the whole exchange may take. Generous for a request already in flight on a local network.
 const TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Whether a connection was a probe, and therefore already finished with.
